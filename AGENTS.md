@@ -25,4 +25,4 @@
 - 使用 pathlib；Windows 多进程入口需 main guard。数据、缓存、权重、checkpoint、大型日志、运行输出和密钥不提交普通 Git。
 - 实验只记录必要配置、seed、Git commit、数据标识、最佳 epoch、指标和运行环境。运行目录不静默覆盖，不在运行中的项目目录盲目更新源码；未经授权不修改服务器系统配置或占用共享 GPU。
 - 三机连接遵守用户约定：V100 使用 SSH 密码登录，不要求安装公钥；本机与 RTX 5070 不建立 SSH 连接。三机源码及小型文件经 GitHub HTTPS 同步，RTX 5070 的大文件通过 UU 远程传输。不再建议公钥安装、Deploy Key 或为 RTX 5070 启用 SSH；密码和 GitHub 登录凭据不写入仓库。
-- 环境按 GPU 适配：V100 优先复用 `trifusion_mfp` 的 PyTorch 2.4.1+cu121，不为统一版本升级旧环境；RTX 5070 使用支持 Blackwell 的构建（当前方案 2.8.0+cu128）。尽量保持主要 Python 依赖和实验协议一致，不要求两机使用相同 CUDA/PyTorch 构建。
+- 环境按 GPU 适配：V100 用 Conda `--clone` 从 `trifusion_mfp` 创建独立环境 `MFP-Nova`，保留 PyTorch 2.4.1+cu121，不为统一版本升级原环境；RTX 5070 在 Windows 上单独创建环境，使用支持 Blackwell 的构建（当前方案 2.8.0+cu128）。尽量保持主要 Python 依赖和实验协议一致，不要求两机使用相同 CUDA/PyTorch 构建。

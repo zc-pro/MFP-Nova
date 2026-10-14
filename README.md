@@ -42,7 +42,7 @@ docs/data_summary.json     # 实际读取的必要统计，含完整标签顺序
 
 ## 安装
 
-推荐 Python 3.12。GPU 构建按设备选择：V100 优先复用已存在的 `trifusion_mfp` 环境（PyTorch 2.4.1+cu121），开发机和 RTX 5070 使用 PyTorch 2.8.0 的适用构建。当前代码所需的 PyTorch API 在 2.4 中已有，项目最低依赖调整为 2.4.1；这属于 API 检查结论，服务器上的实际链路仍需测试。安装命令依据 [PyTorch 官方历史版本页](https://pytorch.org/get-started/previous-versions/)，`weights_only` 接口见 [PyTorch 2.4 文档](https://docs.pytorch.org/docs/2.4/generated/torch.load.html)。
+推荐 Python 3.12。GPU 构建按设备选择：V100 从已存在的 `trifusion_mfp` 克隆出独立的 `MFP-Nova` 环境（PyTorch 2.4.1+cu121），开发机和 RTX 5070 使用 PyTorch 2.8.0 的适用构建。当前代码所需的 PyTorch API 在 2.4 中已有，项目最低依赖调整为 2.4.1；这属于 API 检查结论，服务器上的实际链路仍需测试。安装命令依据 [PyTorch 官方历史版本页](https://pytorch.org/get-started/previous-versions/)，`weights_only` 接口见 [PyTorch 2.4 文档](https://docs.pytorch.org/docs/2.4/generated/torch.load.html)。
 
 两训练端建议共用以下主要 Python 依赖版本，PyTorch/CUDA 分别适配硬件：
 
@@ -85,10 +85,11 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -c "import torch; x=torch.ones(8,8,device='cuda'); print('CUDA matmul:', (x@x).sum().item())"
 ```
 
-Ubuntu V100：项目已在 `~/wuzhencheng/projects/MFP-Nova` 克隆成功。用户已确认 `trifusion_mfp` 的上述依赖版本和 `torch.cuda.is_available()=True`；复用该环境，保留其已有 CUDA 12.1 构建。以下命令在登录后的 Ubuntu 终端执行，仅将新项目注册为 editable 包，不安装或升级依赖：
+Ubuntu V100：项目已在 `~/wuzhencheng/projects/MFP-Nova` 克隆成功。用户已确认 `trifusion_mfp` 的上述依赖版本和 `torch.cuda.is_available()=True`。使用 [Conda 官方克隆方式](https://docs.conda.io/projects/conda/en/stable/user-guide/tasks/manage-environments.html#cloning-an-environment) 创建独立的 `MFP-Nova`，保留原环境及 CUDA 12.1 构建；不要直接复制环境目录后改名。以下命令在登录后的 Ubuntu 终端执行；克隆命令只在首次创建环境时运行，后续直接 activate：
 
 ```bash
-conda activate trifusion_mfp
+conda create --name MFP-Nova --clone trifusion_mfp -y
+conda activate MFP-Nova
 cd ~/wuzhencheng/projects/MFP-Nova
 git pull --ff-only
 python -m pip install --no-deps -e .
@@ -104,7 +105,7 @@ RTX 的命令直接调用 `.venv` 中的可执行文件，无需激活；如使�
 
 ```text
 MFP-Nova/
-  .venv/                     # 新环境可放这里；V100 直接复用已有 Conda 环境
+  .venv/                     # Windows venv 可放这里；V100 使用独立 Conda 环境 MFP-Nova
   data/therapeutic_2025/      # 迁移包解压内容，直接包含 records.csv、arrays/、tracks/
   features/                  # 后续本机提取的特征
   runs/                      # 该机器的实验输出
@@ -161,7 +162,7 @@ git push origin main
 
 V100 的 SSH 密码在本机终端提示中输入。私有 GitHub 仓库的 HTTPS 认证在每台机器各自完成：优先使用已有 Git Credential Manager/浏览器登录；终端需要 HTTPS 凭据时使用 GitHub token，不使用 GitHub 账户密码。凭据不放入 clone URL、脚本、配置或 Git 仓库。现有本机 GitHub 登录无需重新设置。
 
-两台服务器的安装命令见上面的安装章节：V100 已确认项目位于 `~/wuzhencheng/projects/MFP-Nova`，复用 `trifusion_mfp`；RTX 5070 建议项目位于 `$env:USERPROFILE/Projects/MFP-Nova`，使用该机器独立的 `.venv` 或 Conda 环境。RTX 目录与环境尚未实际确认；尚未执行正式 GPU 训练。
+两台服务器的安装命令见上面的安装章节：V100 已确认项目位于 `~/wuzhencheng/projects/MFP-Nova`，从 `trifusion_mfp` 克隆创建独立 Conda 环境 `MFP-Nova`；RTX 5070 建议项目位于 `$env:USERPROFILE/Projects/MFP-Nova`，在 Windows 上独立创建 `.venv` 或 Conda 环境。RTX 目录与环境尚未实际确认；尚未执行正式 GPU 训练。
 
 对于 V100，可在本机 PowerShell 登录：
 
