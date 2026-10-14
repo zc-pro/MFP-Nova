@@ -99,7 +99,7 @@ python -m pytest -q
 
 服务器测试使用 CPU 合成输入。数据集尚未传入时，真实数据测试会跳过；这些结果不代表 ESM 特征提取或 GPU 训练性能。如果环境没有 pytest，反馈缺失提示后只补必要测试依赖，不执行会升级整个旧环境的安装命令。
 
-两台训练端都使用各自的 Conda 环境 `MFP-Nova`，每次打开新终端后先激活环境。环境配置文件只用于首次创建 RTX 环境；已有项目目录时先 `git pull --ff-only` 获取该文件。GitHub 是私有仓库，本机与 RTX 使用 HTTPS 认证；V100 的专用 Deploy key 拉取已成功。V100 项目已安装，5 项 CPU 测试通过，1 项因数据未传入跳过。RTX 环境已确认 Python 3.12.15 与 pip 可用，PyTorch 安装与 GPU 检查尚待反馈。RTX 检查应显示 `2.8.0+cu128`、CUDA `12.8`、可用性 `True`、设备名包含 RTX 5070，小矩阵核验证应输出 `512.0`。CPU 测试不代表真实 ESM 特征提取或 GPU 训练验证。
+两台训练端都使用各自的 Conda 环境 `MFP-Nova`，每次打开新终端后先激活环境。环境配置文件只用于首次创建 RTX 环境；已有项目目录时先 `git pull --ff-only` 获取该文件。GitHub 是私有仓库，本机与 RTX 使用 HTTPS 认证；V100 的专用 Deploy key 拉取已成功。V100 项目已安装，5 项 CPU 测试通过，1 项因数据未传入跳过。RTX 环境已完成依赖和项目安装，确认 Python 3.12.15、PyTorch `2.8.0+cu128`、CUDA `12.8`、可用性 `True`、设备为 NVIDIA GeForce RTX 5070，GPU 小矩阵乘法输出 `512.0`。RTX 项目测试尚待执行。CPU 测试不代表真实 ESM 特征提取或 GPU 训练验证。
 
 RTX 项目实际位于 `D:\Data\ChatGPT\mfp\MFP-Nova`。CMD 若提示 `Run 'conda init' before 'conda activate'`，可用以下命令激活已有环境；若完整 YAML 安装中断，单独安装依赖以显示下载进度，无需重新创建环境：
 
@@ -184,7 +184,7 @@ git push origin main
 
 V100 的 SSH 密码在本机终端提示中输入。本机与 RTX 的私有 GitHub 仓库 HTTPS 认证各自完成：优先使用已有 Git Credential Manager/浏览器登录；终端需要 HTTPS 凭据时使用 GitHub token，不使用 GitHub 账户密码。凭据不放入 clone URL、脚本、配置或 Git 仓库。现有本机 GitHub 登录无需重新设置。
 
-两台服务器的安装命令见上面的安装章节：V100 项目位于 `~/wuzhencheng/projects/MFP-Nova`，独立 Conda 环境 `MFP-Nova` 已完成克隆和安装；RTX 项目位于 `D:\Data\ChatGPT\mfp\MFP-Nova`，环境位于 `D:\App\Code\Anaconda\envs\MFP-Nova`，Python/pip 已确认。两台服务器均尚未完成真实 ESM 提取与正式 GPU 训练。
+两台服务器的安装命令见上面的安装章节：V100 项目位于 `~/wuzhencheng/projects/MFP-Nova`，独立 Conda 环境 `MFP-Nova` 已完成克隆和安装；RTX 项目位于 `D:\Data\ChatGPT\mfp\MFP-Nova`，环境位于 `D:\App\Code\Anaconda\envs\MFP-Nova`，依赖和项目已安装，GPU 小矩阵乘法已通过。两台服务器均尚未完成真实 ESM 提取与正式 GPU 训练。
 
 对于 V100，可在本机 PowerShell 登录：
 
