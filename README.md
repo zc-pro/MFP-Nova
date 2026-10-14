@@ -67,7 +67,7 @@ python -m pip install -e ".[dev]"
 python -m pytest -q
 ```
 
-Windows RTX 5070：通过 UU 远程桌面在该机器打开 PowerShell，建议项目放在用户目录的 `Projects/MFP-Nova`。该机器需要已安装 Git 和 Python 3.12。首次安装执行：
+Windows RTX 5070：通过 UU 远程桌面在该机器打开 Anaconda PowerShell Prompt 或已能运行 Conda 的 PowerShell，建议项目放在用户目录的 `Projects/MFP-Nova`。下面代码使用 PowerShell 语法；Git clone 应单独执行，等认证和克隆完成后再执行后续命令。该机器需要已安装 Git 和 Conda。环境配置为 [environment-rtx5070.yaml](configs/environment-rtx5070.yaml)，Conda 创建 Python 3.12 并通过 pip 安装指定 CUDA 12.8 构建；固定 `torch==2.8.0+cu128`，以明确选择 GPU wheel。首次安装执行：
 
 ```powershell
 $taskProjectParent = Join-Path $env:USERPROFILE 'Projects'
@@ -75,14 +75,14 @@ New-Item -ItemType Directory -Path $taskProjectParent -Force | Out-Null
 Set-Location $taskProjectParent
 git clone https://github.com/zc-pro/MFP-Nova.git
 Set-Location MFP-Nova
-py -3.12 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
-.\.venv\Scripts\python.exe -m pip install numpy==1.26.4 transformers==4.44.2 scikit-learn==1.5.2 PyYAML==6.0.2
-.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
-.\.venv\Scripts\python.exe -m pip check
-.\.venv\Scripts\mfp-nova.exe --help
-.\.venv\Scripts\python.exe -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
-.\.venv\Scripts\python.exe -c "import torch; x=torch.ones(8,8,device='cuda'); print('CUDA matmul:', (x@x).sum().item())"
+conda env create -f configs/environment-rtx5070.yaml
+conda activate MFP-Nova
+python -m pip install --no-deps -e .
+python -m pip check
+mfp-nova --help
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available()); print(torch.cuda.get_device_name(0))"
+python -c "import torch; x=torch.ones(8,8,device='cuda'); print('CUDA matmul:', (x@x).sum().item())"
+python -m pytest -q
 ```
 
 Ubuntu V100：项目已在 `~/wuzhencheng/projects/MFP-Nova` 克隆成功。用户已确认 `trifusion_mfp` 的上述依赖版本和 `torch.cuda.is_available()=True`。使用 [Conda 官方克隆方式](https://docs.conda.io/projects/conda/en/stable/user-guide/tasks/manage-environments.html#cloning-an-environment) 创建独立的 `MFP-Nova`，保留原环境及 CUDA 12.1 构建；不要直接复制环境目录后改名。以下命令在登录后的 Ubuntu 终端执行；克隆命令只在首次创建环境时运行，后续直接 activate：
@@ -99,13 +99,13 @@ python -m pytest -q
 
 服务器测试使用 CPU 合成输入。数据集尚未传入时，真实数据测试会跳过；这些结果不代表 ESM 特征提取或 GPU 训练性能。如果环境没有 pytest，反馈缺失提示后只补必要测试依赖，不执行会升级整个旧环境的安装命令。
 
-RTX 的命令直接调用 `.venv` 中的可执行文件，无需激活；如使用 Conda，则在该机器单独创建 Python 3.12 环境并执行同样的 pip 安装步骤。GitHub 是私有仓库，按 Git 提示完成各自的 HTTPS 认证。CUDA 可用性应为 `True`，RTX 的小矩阵核验证应输出 `512.0`。服务器端安装和模型测试尚未实际确认，不把本机 2.8.0 CPU 测试当作 V100 2.4.1 或 RTX 5070 验证。
+两台训练端都使用各自的 Conda 环境 `MFP-Nova`，每次打开新终端后先激活环境。环境配置文件只用于首次创建 RTX 环境；已有项目目录时先 `git pull --ff-only` 获取该文件。GitHub 是私有仓库，按 Git 提示完成各自的 HTTPS 认证。RTX 检查应显示 `2.8.0+cu128`、CUDA `12.8`、可用性 `True`、设备名包含 RTX 5070，小矩阵核验证应输出 `512.0`。服务器端安装和模型测试尚未实际确认，不把本机 2.8.0 CPU 测试当作 V100 2.4.1 或 RTX 5070 验证。
 
 数据经 UU 传到 RTX 5070，经 SFTP/SCP 传到 V100；完整解压后，两端建议目录如下。外部数据盘可以通过 `--data-root` 指定。
 
 ```text
 MFP-Nova/
-  .venv/                     # Windows venv 可放这里；V100 使用独立 Conda 环境 MFP-Nova
+  .venv/                     # 开发机 venv 可放这里；两服务器环境由 Conda 管理
   data/therapeutic_2025/      # 迁移包解压内容，直接包含 records.csv、arrays/、tracks/
   features/                  # 后续本机提取的特征
   runs/                      # 该机器的实验输出
@@ -162,7 +162,7 @@ git push origin main
 
 V100 的 SSH 密码在本机终端提示中输入。私有 GitHub 仓库的 HTTPS 认证在每台机器各自完成：优先使用已有 Git Credential Manager/浏览器登录；终端需要 HTTPS 凭据时使用 GitHub token，不使用 GitHub 账户密码。凭据不放入 clone URL、脚本、配置或 Git 仓库。现有本机 GitHub 登录无需重新设置。
 
-两台服务器的安装命令见上面的安装章节：V100 已确认项目位于 `~/wuzhencheng/projects/MFP-Nova`，从 `trifusion_mfp` 克隆创建独立 Conda 环境 `MFP-Nova`；RTX 5070 建议项目位于 `$env:USERPROFILE/Projects/MFP-Nova`，在 Windows 上独立创建 `.venv` 或 Conda 环境。RTX 目录与环境尚未实际确认；尚未执行正式 GPU 训练。
+两台服务器的安装命令见上面的安装章节：V100 已确认项目位于 `~/wuzhencheng/projects/MFP-Nova`，从 `trifusion_mfp` 克隆创建独立 Conda 环境 `MFP-Nova`；RTX 5070 建议项目位于 `$env:USERPROFILE/Projects/MFP-Nova`，在 Windows 上用专用 YAML 创建 Conda 环境 `MFP-Nova`。RTX 目录与环境尚未实际确认；尚未执行正式 GPU 训练。
 
 对于 V100，可在本机 PowerShell 登录：
 

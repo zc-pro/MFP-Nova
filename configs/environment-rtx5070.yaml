@@ -1,0 +1,15 @@
+# Windows RTX 5070; install PyTorch from the official CUDA 12.8 wheel index.
+name: MFP-Nova
+channels:
+  - defaults
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu128
+      - torch==2.8.0+cu128
+      - numpy==1.26.4
+      - transformers==4.44.2
+      - scikit-learn==1.5.2
+      - PyYAML==6.0.2
+      - pytest==8.4.2
