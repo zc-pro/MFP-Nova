@@ -113,48 +113,46 @@ git commit -m "Describe the research change"
 git push origin main
 ```
 
-服务器先设置各自的 GitHub 只读 Deploy Key，再 `git clone git@github-mfp-nova:zc-pro/MFP-Nova.git`；后续在训练停止后 `git pull --ff-only`，正式实验可 `git checkout <COMMIT>`。用 `ssh <USER>@<HOST>` 登录后，在服务器项目目录运行上述训练命令。共享 V100 需按服务器使用约定取得资源，不自动启动远程实验。
+三机按以下方式协作：
 
-三机连接使用两种独立身份：本机 SSH 公钥用于登录两台服务器；每台服务器自己的 SSH 公钥作为该私有仓库的只读 Deploy Key，用于拉取代码。私钥留在生成它的机器，GitHub 登录凭据不写入项目或复制到服务器。
+| 设备/用途 | 连接与同步方式 |
+|---|---|
+| 本机开发 → GitHub | HTTPS Git，已通过现有 Git Credential Manager 登录并完成推送 |
+| Ubuntu V100 管理 | `ssh MFP-Nova-V100`，使用 `ubuntu@192.168.13.171:22` 的密码登录 |
+| V100 ↔ GitHub | HTTPS Git，在服务器独立完成 GitHub 认证后 clone/pull |
+| RTX 5070 ↔ GitHub | HTTPS Git，在 RTX 5070 上通过 UU 远程操作终端完成 clone/pull |
+| 本机 ↔ RTX 5070 大文件 | 用户指定的 UU 远程文件传输，同步数据、特征、权重和完整运行输出 |
 
-服务器各自在用户目录生成 GitHub 密钥，已有同名文件时直接使用，勿覆盖：
+本机与 RTX 5070 不建立 SSH 连接，也不需要为此配置 sshd、端口或公钥。V100 使用密码登录，不安装公钥。两台训练端的项目目录在首次登录/UU 远程操作后确定。本机已将 `MFP-Nova-V100` 别名调整为交互式密码认证，并移除了 RTX 5070 项目 SSH 别名。
+
+V100 的 SSH 密码在本机终端提示中输入。私有 GitHub 仓库的 HTTPS 认证在每台机器各自完成：优先使用已有 Git Credential Manager/浏览器登录；终端需要 HTTPS 凭据时使用 GitHub token，不使用 GitHub 账户密码。凭据不放入 clone URL、脚本、配置或 Git 仓库。现有本机 GitHub 登录无需重新设置。
+
+在两台服务器各自的终端中，先进入选定的项目父目录，再执行：
 
 ```text
-ssh-keygen -t ed25519 -f <USER_SSH_DIR>/id_ed25519_mfp_github -C mfp-nova-server
+git clone https://github.com/zc-pro/MFP-Nova.git
+cd MFP-Nova
 ```
 
-将对应 `.pub` 的内容添加到仓库 Settings → Deploy keys，关闭 Allow write access。每台服务器在自己的用户 SSH config 中追加以下项目别名，使用各自生成的私钥：
+随后按上面的安装章节创建项目 `.venv`：V100 使用 Ubuntu 命令和 cu126 构建，RTX 5070 使用 Windows 命令和 cu128 构建。安装后用 `python -m pip check`、`mfp-nova --help` 检查环境与入口。GPU 驱动信息在服务器登录后确认，尚未执行远程安装或 GPU 训练。
 
-```text
-Host github-mfp-nova
-  HostName github.com
-  User git
-  IdentityFile ~/.ssh/id_ed25519_mfp_github
-  IdentitiesOnly yes
-```
-
-执行 `ssh -T github-mfp-nova` 验证；成功认证但不提供 shell 时退出码为 1，这是 GitHub 的正常行为。首次连接应核对 [GitHub 公布的主机指纹](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints)。
-
-本机已生成专用登录密钥 `%USERPROFILE%/.ssh/id_ed25519_mfp_nova`，用于本机到服务器的 SSH 连接，不放入 Git 仓库。已在本机用户 SSH config 设置两个项目专用别名，均使用该密钥：
-
-| 训练端 | 本机 SSH 别名 | 连接地址 | 项目目录 |
-|---|---|---|---|
-| Ubuntu V100 | `MFP-Nova-V100` | `ubuntu@192.168.13.171:22` | 登录后确认 |
-| Windows RTX 5070 | `MFP-Nova-RTX5070` | `wuzhencheng@10.1.44.34:22` | 登录后确认 |
-
-Ubuntu 主机已确认，网络可达，但公钥/非交互认证尚未成功。可在本机 PowerShell 执行以下命令，用当前服务器密码登录并追加项目公钥：
+对于 V100，可在本机 PowerShell 登录：
 
 ```powershell
-Get-Content "$env:USERPROFILE\.ssh\id_ed25519_mfp_nova.pub" | ssh MFP-Nova-V100 'umask 077; mkdir -p ~/.ssh; cat >> ~/.ssh/authorized_keys; chmod 700 ~/.ssh; chmod 600 ~/.ssh/authorized_keys'
+ssh MFP-Nova-V100
 ```
 
-密码在 SSH 的终端提示中输入，不写入文件或聊天。可用 `ssh -o BatchMode=yes MFP-Nova-V100 "id -un"` 检查登录。
+对于 RTX 5070，在 UU 远程桌面内打开 PowerShell，执行 Git 和环境安装命令。源码与小型配置通过 GitHub，同一台机器上的 `.venv` 保留在该机器，不通过 UU 复制另一台机器的 Python 环境。
 
-RTX 5070 的 SSH 端口目前从本机连接超时；本机为 `10.1.44.154/23`，与目标地址处于同一网段。需要在该机器确认当前 IP、`Get-Service sshd` 和 `Get-NetTCPConnection -LocalPort 22 -State Listen` 的结果，恢复 SSH 连通后再进行项目搭建。端口恢复后首次连接需确认该服务器主机身份，再为 `wuzhencheng` 设置公钥登录；Windows 管理员账号与普通账号的公钥位置可能不同，应根据实际账号权限和 sshd 配置处理。
+数据迁移包通过 UU 传到 RTX 5070 后，完整解压到项目的 `data/therapeutic_2025/`，或使用 `--data-root` 指定外部数据目录。V100 的数据可通过密码认证的 SFTP/SCP 单独传输。特征、权重、checkpoint 和完整运行输出均已被 Git 忽略；小型实验指标汇总可以单独放到 `results/` 后用 Git 提交，其余产物通过 UU 或 V100 的 SFTP/SCP 回传。
 
-Windows RTX 5070 若尚未提供 SSH 服务，应由该机器管理员按 [Microsoft OpenSSH Server 安装说明](https://learn.microsoft.com/en-us/windows-server/administration/openssh/openssh_install_firstuse) 启用服务与防火墙，再提供用户名、地址、端口。本项目不会自动修改远程系统服务或防火墙。
+日常同步使用标准 Git，在训练停止后更新源码：
 
-Git 只同步源码、小型配置和统计。数据迁移包、特征、权重、checkpoint 和运行输出已忽略；可通过 SFTP/SCP 独立传输原迁移包并完整解压。例如 `scp therapeutic_2025_跨电脑开发迁移包.zip <USER>@<HOST>:<DATA_DIR>/`；结果回传可用 `scp -r <USER>@<HOST>:<PROJECT_DIR>/runs/<RUN_NAME> ./runs/`，本机选择新的运行名避免覆盖。不要在运行中的项目目录更新源码。
+```text
+git pull --ff-only
+```
+
+正式实验可 `git checkout <COMMIT>`。本机提交代码并推送后，两台训练端拉取；共享 V100 按服务器使用约定取得资源。不同运行使用独立名称，不在运行中的目录更新源码，不覆盖既有实验产物。
 
 当前提供数据与框架基础，不宣称模型效果。下一步是 GPU 端特征提取和单 seed 基线，随后针对局部分支/损失做单变量对照；结构、D/PTM 表示和标签专属学习均留待有依据的后续研究。
 
