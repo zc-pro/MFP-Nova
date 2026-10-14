@@ -135,13 +135,22 @@ Host github-mfp-nova
 
 执行 `ssh -T github-mfp-nova` 验证；成功认证但不提供 shell 时退出码为 1，这是 GitHub 的正常行为。首次连接应核对 [GitHub 公布的主机指纹](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints)。
 
-本机已生成专用登录密钥 `%USERPROFILE%/.ssh/id_ed25519_mfp_nova`，用于本机到服务器的 SSH 连接，不放入 Git 仓库。现有 Ubuntu 别名 `DeepServer-8V100` 对应 `ubuntu@192.168.13.171:22`，当前网络可达，但公钥/非交互认证尚未成功。确认该主机后，可在本机 PowerShell 执行以下命令，用当前服务器密码登录并追加项目公钥：
+本机已生成专用登录密钥 `%USERPROFILE%/.ssh/id_ed25519_mfp_nova`，用于本机到服务器的 SSH 连接，不放入 Git 仓库。已在本机用户 SSH config 设置两个项目专用别名，均使用该密钥：
+
+| 训练端 | 本机 SSH 别名 | 连接地址 | 项目目录 |
+|---|---|---|---|
+| Ubuntu V100 | `MFP-Nova-V100` | `ubuntu@192.168.13.171:22` | 登录后确认 |
+| Windows RTX 5070 | `MFP-Nova-RTX5070` | `wuzhencheng@10.1.44.34:22` | 登录后确认 |
+
+Ubuntu 主机已确认，网络可达，但公钥/非交互认证尚未成功。可在本机 PowerShell 执行以下命令，用当前服务器密码登录并追加项目公钥：
 
 ```powershell
-Get-Content "$env:USERPROFILE\.ssh\id_ed25519_mfp_nova.pub" | ssh DeepServer-8V100 'umask 077; mkdir -p ~/.ssh; cat >> ~/.ssh/authorized_keys; chmod 700 ~/.ssh; chmod 600 ~/.ssh/authorized_keys'
+Get-Content "$env:USERPROFILE\.ssh\id_ed25519_mfp_nova.pub" | ssh MFP-Nova-V100 'umask 077; mkdir -p ~/.ssh; cat >> ~/.ssh/authorized_keys; chmod 700 ~/.ssh; chmod 600 ~/.ssh/authorized_keys'
 ```
 
-密码在 SSH 的终端提示中输入，不写入文件或聊天。随后给该 Host 的本机 SSH 配置添加 `IdentityFile ~/.ssh/id_ed25519_mfp_nova`，可用 `ssh -i "$env:USERPROFILE\.ssh\id_ed25519_mfp_nova" -o BatchMode=yes DeepServer-8V100 "id -un"` 检查登录。
+密码在 SSH 的终端提示中输入，不写入文件或聊天。可用 `ssh -o BatchMode=yes MFP-Nova-V100 "id -un"` 检查登录。
+
+RTX 5070 的 SSH 端口目前从本机连接超时；本机为 `10.1.44.154/23`，与目标地址处于同一网段。需要在该机器确认当前 IP、`Get-Service sshd` 和 `Get-NetTCPConnection -LocalPort 22 -State Listen` 的结果，恢复 SSH 连通后再进行项目搭建。端口恢复后首次连接需确认该服务器主机身份，再为 `wuzhencheng` 设置公钥登录；Windows 管理员账号与普通账号的公钥位置可能不同，应根据实际账号权限和 sshd 配置处理。
 
 Windows RTX 5070 若尚未提供 SSH 服务，应由该机器管理员按 [Microsoft OpenSSH Server 安装说明](https://learn.microsoft.com/en-us/windows-server/administration/openssh/openssh_install_firstuse) 启用服务与防火墙，再提供用户名、地址、端口。本项目不会自动修改远程系统服务或防火墙。
 
