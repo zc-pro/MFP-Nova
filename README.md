@@ -113,7 +113,7 @@ git commit -m "Describe the research change"
 git push origin main
 ```
 
-服务器先设置各自的 GitHub 只读 Deploy Key，再 `git clone git@github.com:zc-pro/MFP-Nova.git`；后续在训练停止后 `git pull --ff-only`，正式实验可 `git checkout <COMMIT>`。用 `ssh <USER>@<HOST>` 登录后，在服务器项目目录运行上述训练命令。共享 V100 需按服务器使用约定取得资源，不自动启动远程实验。
+服务器先设置各自的 GitHub 只读 Deploy Key，再 `git clone git@github-mfp-nova:zc-pro/MFP-Nova.git`；后续在训练停止后 `git pull --ff-only`，正式实验可 `git checkout <COMMIT>`。用 `ssh <USER>@<HOST>` 登录后，在服务器项目目录运行上述训练命令。共享 V100 需按服务器使用约定取得资源，不自动启动远程实验。
 
 三机连接使用两种独立身份：本机 SSH 公钥用于登录两台服务器；每台服务器自己的 SSH 公钥作为该私有仓库的只读 Deploy Key，用于拉取代码。私钥留在生成它的机器，GitHub 登录凭据不写入项目或复制到服务器。
 
@@ -123,7 +123,25 @@ git push origin main
 ssh-keygen -t ed25519 -f <USER_SSH_DIR>/id_ed25519_mfp_github -C mfp-nova-server
 ```
 
-将对应 `.pub` 的内容添加到仓库 Settings → Deploy keys，关闭 Allow write access；私钥在服务器的用户 SSH config 中绑定 `Host github.com`，指定 `IdentityFile ~/.ssh/id_ed25519_mfp_github` 和 `IdentitiesOnly yes`。执行 `ssh -T git@github.com` 验证；成功认证但不提供 shell 时退出码为 1，这是 GitHub 的正常行为。首次连接应核对 [GitHub 公布的主机指纹](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints)。
+将对应 `.pub` 的内容添加到仓库 Settings → Deploy keys，关闭 Allow write access。每台服务器在自己的用户 SSH config 中追加以下项目别名，使用各自生成的私钥：
+
+```text
+Host github-mfp-nova
+  HostName github.com
+  User git
+  IdentityFile ~/.ssh/id_ed25519_mfp_github
+  IdentitiesOnly yes
+```
+
+执行 `ssh -T github-mfp-nova` 验证；成功认证但不提供 shell 时退出码为 1，这是 GitHub 的正常行为。首次连接应核对 [GitHub 公布的主机指纹](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints)。
+
+本机已生成专用登录密钥 `%USERPROFILE%/.ssh/id_ed25519_mfp_nova`，用于本机到服务器的 SSH 连接，不放入 Git 仓库。现有 Ubuntu 别名 `DeepServer-8V100` 对应 `ubuntu@192.168.13.171:22`，当前网络可达，但公钥/非交互认证尚未成功。确认该主机后，可在本机 PowerShell 执行以下命令，用当前服务器密码登录并追加项目公钥：
+
+```powershell
+Get-Content "$env:USERPROFILE\.ssh\id_ed25519_mfp_nova.pub" | ssh DeepServer-8V100 'umask 077; mkdir -p ~/.ssh; cat >> ~/.ssh/authorized_keys; chmod 700 ~/.ssh; chmod 600 ~/.ssh/authorized_keys'
+```
+
+密码在 SSH 的终端提示中输入，不写入文件或聊天。随后给该 Host 的本机 SSH 配置添加 `IdentityFile ~/.ssh/id_ed25519_mfp_nova`，可用 `ssh -i "$env:USERPROFILE\.ssh\id_ed25519_mfp_nova" -o BatchMode=yes DeepServer-8V100 "id -un"` 检查登录。
 
 Windows RTX 5070 若尚未提供 SSH 服务，应由该机器管理员按 [Microsoft OpenSSH Server 安装说明](https://learn.microsoft.com/en-us/windows-server/administration/openssh/openssh_install_firstuse) 启用服务与防火墙，再提供用户名、地址、端口。本项目不会自动修改远程系统服务或防火墙。
 
