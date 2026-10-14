@@ -6,22 +6,24 @@
 
 新数据默认 fine39：明确骨架 Train 39,455、Val 8,529、Test 8,180。全监督 Train 标签正例数 57–10,798，长尾明显；序列短，最长 74。major15 可用同一框架独立训练，但不同标签粒度、监督队列和数值不能直接当模型优劣排名。
 
-初版选冻结 `facebook/esm2_t12_35M_UR50D`，12 层、输出维度 480，来自 [官方 ESM 模型表](https://github.com/facebookresearch/esm/blob/main/README.md) 和 [模型配置](https://huggingface.co/facebook/esm2_t12_35M_UR50D/blob/main/config.json)。35M 用于控制双节点特征提取成本，并非已证明保持旧 650M 效果。
+提供两个独立的冻结编码器实验：`configs/sequence.yaml` 使用 `facebook/esm2_t12_35M_UR50D`（12 层、480 维），`configs/sequence_650m.yaml` 使用 `facebook/esm2_t33_650M_UR50D`（33 层、1280 维）。规格见 [35M 官方配置](https://huggingface.co/facebook/esm2_t12_35M_UR50D/blob/main/config.json) 和 [650M 官方配置](https://huggingface.co/facebook/esm2_t33_650M_UR50D/blob/main/config.json)。650M 为主要科研基线候选，35M 为轻量对照；默认 CLI 仍指向 35M 配置以保留现有命令行为。两者是否有性能差异需在新数据上验证。
+
+两套配置使用相同队列、监督标签、下游结构、损失、seed 和训练预算，仅编码器规模、输入维度、缓存目录和提取批大小不同。提取批大小分别为 32/8，不改变分类模型的训练 batch 128；650M 的提取 batch 8 尚待 GPU 显存与吞吐验证。缓存分别放在 `features/esm2_35m` 和 `features/esm2_650m`，不能交叉使用。
 
 ## 计算
 
 去除 BOS/EOS/PAD 的冻结末层残基状态为 R，有效残基 mask 为 M。
 
 ```text
-R [B,L,480]
-→ Linear(480,128) → affine LayerNorm → GELU → 将无效位置置零，得到 X
+R [B,L,D]，D=480（35M）或1280（650M）
+→ Linear(D,128) → affine LayerNorm → GELU → 将无效位置置零，得到 X
 ├─ 按 M 做 mean → global [B,128]
 └─ Conv1d kernels 3/5，每尺度64 channels → GELU → masked max
    → local [B,128]
 concat(global, local) [B,256] → Dropout(0.1) → Linear(256,C) → logits
 ```
 
-紧凑共享投影在卷积之前，减少训练参数；全局/局部拼接采用直接分类，不引入旧模型局部尺度参数。fine39 训练网络 137,511 参数，major15 为 131,343，不含冻结 ESM。全局 mean 使用投影后的残基，属于新的计算定义；不能称为旧 S4 等价复现。卷积前将所有 padding 清零，max 排除 padding；混合长度 batch 不改变短序列的有效特征。
+紧凑共享投影在卷积之前，减少训练参数；全局/局部拼接采用直接分类，不引入旧模型局部尺度参数。35M 输入对应 fine39/major15 可训练参数 137,511/131,343；650M 输入对应 239,911/233,743，差异来自首层投影，不含冻结 ESM。输入维度自动读取缓存。全局 mean 使用投影后的残基，属于新的计算定义；不能称为旧 S4 等价复现。卷积前将所有 padding 清零，max 排除 padding；混合长度 batch 不改变短序列的有效特征。
 
 ASL 令 p=sigmoid(z)，n=min(1,1-p+clip)：
 
@@ -38,8 +40,8 @@ loss = -mean(base * stopgrad(weight))
 | 参数 | 值 | 依据 |
 |---|---|---|
 | token 上限 | 80（含特殊 token） | 最长74；不静默截断 |
-| ESM 提取 batch | 32 | 短肽、小编码器的保守起点；GPU 尚待测量 |
-| 缓存 | FP32 提取，FP16 保存 | 约百万残基时480维缓存约1 GB；数值/性能差异需实验 |
+| ESM 提取 batch | 35M: 32；650M: 8 | 初始配置；GPU 显存与吞吐尚待测量 |
+| 缓存 | FP32 提取，FP16 保存 | 650M 同队列残基数组占用为35M的1280/480≈2.67倍；数值/性能差异需实验 |
 | 投影/卷积 | 128 / 3,5 / 每尺度64 | 短肽与紧凑可训练网络 |
 | Dropout | 0.1 | 小型网络的适度正则化，尚未单因素验证 |
 | AdamW | lr=3e-4, wd=1e-4 | 独立初始学习率，非最优结论 |

@@ -24,7 +24,8 @@
 ## 项目结构
 
 ```text
-configs/sequence.yaml      # 一个初始配置，两任务通过 --track 切换
+configs/sequence.yaml      # 冻结 ESM-2 35M 轻量对照
+configs/sequence_650m.yaml # 冻结 ESM-2 650M 基线候选；两任务均可 --track 切换
 src/mfp_nova/
   analysis.py              # 样本、标签、划分和 Train 共现统计
   data.py                  # 当前数组接口、ID/row_id 对齐、缓存 batch
@@ -131,7 +132,33 @@ mfp-nova train --device cuda:0 --track fine39 --name fine39_seq_seed42
 mfp-nova train --device cuda:0 --track major15 --name major15_seq_seed42
 ```
 
-首次特征提取会下载 ESM-2 35M。默认仅提取 Train/Validation，原样本缓存两任务共用。提取 FP32、存储 FP16，使用 NPY ragged 残基、offsets、row_id、ID 与序列，读取采用 mmap，不重复保存全局向量。模型权重 revision 自动记录；后续推理加载同一 revision。正式实验可将配置 revision 改为已记录的确定 commit。特征目录已经存在时不覆盖，提取中断后使用新缓存目录。
+首次特征提取会下载所选配置的 ESM-2 权重。默认仅提取 Train/Validation；同一编码器的原样本缓存可由两个标签任务共用。提取 FP32、存储 FP16，使用 NPY ragged 残基、offsets、row_id、ID 与序列，读取采用 mmap，不重复保存全局向量。模型权重 revision 自动记录；后续推理加载同一 revision。正式实验可将配置 revision 改为已记录的确定 commit。特征目录已经存在时不覆盖，提取中断后使用新缓存目录。
+
+35M 和 650M 分别运行独立实验，在相同划分、seed 和下游训练协议下比较。无需重建 Conda 环境，配置如下：
+
+| 配置 | 冻结编码器 | 残基维度 | 提取 batch | 特征目录 |
+|---|---|---:|---:|---|
+| `configs/sequence.yaml`（CLI 默认） | ESM-2 35M | 480 | 32 | `features/esm2_35m` |
+| `configs/sequence_650m.yaml` | ESM-2 650M | 1280 | 8 | `features/esm2_650m` |
+
+按顺序提取和训练，使用不同实验名：
+
+```text
+mfp-nova features --config configs/sequence.yaml --device cuda:0 --splits train val
+mfp-nova train --config configs/sequence.yaml --device cuda:0 --name fine39_esm35m_seed42
+mfp-nova features --config configs/sequence_650m.yaml --device cuda:0 --splits train val
+mfp-nova train --config configs/sequence_650m.yaml --device cuda:0 --name fine39_esm650m_seed42
+```
+
+650M 的提取 batch 8 是尚未测量的起点，可通过 `features --batch-size 4` 调小；两套配置均保持训练 batch 128。模型从缓存自动读取输入维度并投影到128维。已有完整 35M 缓存可直接复用，无需重复提取。两种编码器的缓存必须分开放置；650M 的同队列残基数组约为35M的2.67倍，不代表总计算耗时比例。
+
+确定方案后才提取 Test。650M 的评价需显式指定对应缓存，序列预测则自动使用 checkpoint 中记录的编码器：
+
+```text
+mfp-nova features --config configs/sequence_650m.yaml --device cuda:0 --splits test
+mfp-nova evaluate --checkpoint runs/fine39_esm650m_seed42/best.pt --feature-root features/esm2_650m --device cuda:0 --output runs/fine39_esm650m_seed42/test.json
+mfp-nova predict --checkpoint runs/fine39_esm650m_seed42/best.pt --sequences peptides.txt --device cuda:0 --output runs/fine39_esm650m_seed42/predictions.json
+```
 
 训练仅打开 Train/Validation 缓存，按 Validation Macro-AP 选最佳 checkpoint，Micro-AP 打破同分，完全相同则保留更早 epoch。训练后加载最佳模型，在 Validation 上拟合全局 Jaccard 阈值；结果中的 Val F1/Jaccard 为阈值拟合内估计。Test 未参与训练、选模或阈值拟合。输出 `runs/<name>/best.pt`、`history.jsonl`、`metadata.json`、`results.json`，已有运行目录拒绝覆盖。
 

@@ -1,0 +1,32 @@
+# ESM-2 650M; extraction batch 8 is a starting point, not a measured GPU limit.
+data:
+  root: data/therapeutic_2025
+  track: fine39
+  augment: false
+  features: features/esm2_650m
+encoder:
+  name: facebook/esm2_t33_650M_UR50D
+  revision: main
+  max_length: 80
+  batch_size: 8
+model:
+  hidden_dim: 128
+  kernels: [3, 5]
+  channels: 64
+  dropout: 0.1
+  use_local: true
+loss:
+  name: asl
+  gamma_pos: 0
+  gamma_neg: 2
+  clip: 0.03
+train:
+  device: cpu
+  seed: 42
+  epochs: 60
+  batch_size: 128
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  patience: 10
+  num_workers: 0
+  output: runs

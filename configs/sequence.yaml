@@ -1,3 +1,4 @@
+# ESM-2 35M comparison; use sequence_650m.yaml for the 650M experiment.
 data:
   root: data/therapeutic_2025
   track: fine39
