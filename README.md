@@ -54,26 +54,49 @@ python -m pip install -e ".[dev]"
 python -m pytest -q
 ```
 
-Windows RTX 5070：在该设备新建同样的 Python 环境，将 PyTorch 安装命令换为：
+Windows RTX 5070：通过 UU 远程桌面在该机器打开 PowerShell，建议项目放在用户目录的 `Projects/MFP-Nova`。该机器需要已安装 Git 和 Python 3.12。首次安装执行：
 
 ```powershell
-python -m pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
-python -m pip install -e ".[dev]"
+$taskProjectParent = Join-Path $env:USERPROFILE 'Projects'
+New-Item -ItemType Directory -Path $taskProjectParent -Force | Out-Null
+Set-Location $taskProjectParent
+git clone https://github.com/zc-pro/MFP-Nova.git
+Set-Location MFP-Nova
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
+.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+.\.venv\Scripts\python.exe -m pip check
+.\.venv\Scripts\mfp-nova.exe --help
+.\.venv\Scripts\python.exe -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
 ```
 
-Ubuntu V100：使用已有 Python 3.12 或可用的 Python ≥3.10，不修改系统 CUDA。此构建需要服务器驱动支持；当前未检查远程驱动。
+Ubuntu V100：先从本机运行 `ssh MFP-Nova-V100` 并输入服务器密码，以下命令在登录后的 Ubuntu 终端执行。建议项目放在 `~/projects/MFP-Nova`，使用该机器已有的 Python ≥3.10（推荐3.12）；先用 `python3 --version`、`nvidia-smi` 查看 Python 和驱动信息。当前尚未核实服务器驱动，cu126 是初始安装选择，不修改共享服务器的系统 CUDA 或驱动。
 
 ```bash
+mkdir -p ~/projects
+cd ~/projects
+git clone https://github.com/zc-pro/MFP-Nova.git
+cd MFP-Nova
 python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu126
-python -m pip install -e '.[dev]'
+.venv/bin/python -m pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu126
+.venv/bin/python -m pip install -e '.[dev]'
+.venv/bin/python -m pip check
+.venv/bin/mfp-nova --help
+.venv/bin/python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
 ```
 
-两 GPU 端在实际训练前检查设备是否可用（此命令不启动训练）：
+两套命令都直接调用项目环境中的可执行文件，无需激活环境。GitHub 是私有仓库，按 Git 提示完成各自的 HTTPS 认证。已有项目目录时进入该目录执行 `git pull --ff-only`，再执行适用的环境安装命令。
+
+最后一行的 CUDA 可用性应为 `True`。如果 Python 版本不满足、`venv` 不可用或 CUDA 不可用，提供该机器的具体输出，再调整用户环境或 PyTorch 构建。没有在服务器实际执行这些安装命令，不把本机测试当作服务器验证。
+
+数据经 UU 传到 RTX 5070，经 SFTP/SCP 传到 V100；完整解压后，两端建议目录如下。外部数据盘可以通过 `--data-root` 指定。
 
 ```text
-python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available()); print(torch.cuda.get_device_name(0), torch.cuda.get_arch_list())"
+MFP-Nova/
+  .venv/                     # 该机器自己的环境
+  data/therapeutic_2025/      # 迁移包解压内容，直接包含 records.csv、arrays/、tracks/
+  features/                  # 后续本机提取的特征
+  runs/                      # 该机器的实验输出
 ```
 
 ## 使用
@@ -127,14 +150,7 @@ git push origin main
 
 V100 的 SSH 密码在本机终端提示中输入。私有 GitHub 仓库的 HTTPS 认证在每台机器各自完成：优先使用已有 Git Credential Manager/浏览器登录；终端需要 HTTPS 凭据时使用 GitHub token，不使用 GitHub 账户密码。凭据不放入 clone URL、脚本、配置或 Git 仓库。现有本机 GitHub 登录无需重新设置。
 
-在两台服务器各自的终端中，先进入选定的项目父目录，再执行：
-
-```text
-git clone https://github.com/zc-pro/MFP-Nova.git
-cd MFP-Nova
-```
-
-随后按上面的安装章节创建项目 `.venv`：V100 使用 Ubuntu 命令和 cu126 构建，RTX 5070 使用 Windows 命令和 cu128 构建。安装后用 `python -m pip check`、`mfp-nova --help` 检查环境与入口。GPU 驱动信息在服务器登录后确认，尚未执行远程安装或 GPU 训练。
+两台服务器的完整首次安装命令见上面的安装章节：V100 默认 `~/projects/MFP-Nova`，RTX 5070 默认 `$env:USERPROFILE/Projects/MFP-Nova`，均在项目内创建独立 `.venv`。这些是建议目录，尚未在服务器创建；也可以在实际操作时选择数据盘上的项目目录。GPU 驱动信息在服务器登录后确认，尚未执行远程安装或 GPU 训练。
 
 对于 V100，可在本机 PowerShell 登录：
 
