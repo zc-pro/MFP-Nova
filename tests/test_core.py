@@ -73,6 +73,7 @@ def test_frozen_encoder_masks_and_limits(monkeypatch, tmp_path):
 
     class Tokenizer:
         def __call__(self, sequences, **kwargs):
+            assert all(s == s.upper() for s in sequences)
             lengths = [len(s) + 2 for s in sequences]
             width = max(lengths)
             attention = torch.arange(width)[None, :] < torch.tensor(lengths)[:, None]
@@ -94,7 +95,7 @@ def test_frozen_encoder_masks_and_limits(monkeypatch, tmp_path):
     monkeypatch.setattr(transformers.AutoTokenizer, 'from_pretrained', lambda *a, **k: Tokenizer())
     monkeypatch.setattr(transformers.AutoModel, 'from_pretrained', lambda *a, **k: Encoder())
     encoder = FrozenEncoder('test', max_length=8)
-    states, mask = encoder.encode(['AA', 'ACDE'])
+    states, mask = encoder.encode(['Aa', 'AcDE'])
     assert mask.sum(1).tolist() == [2, 4]
     assert not mask[:, 0].any()
     assert not states.requires_grad
@@ -117,20 +118,53 @@ def test_frozen_encoder_masks_and_limits(monkeypatch, tmp_path):
     assert cached.values.dtype == np.float16
     assert cached[0][0].shape == (2, 4)
     assert cached.meta['resolved_revision'] == 'test-revision'
+    assert np.load(tmp_path / 'features/train/sequences.npy').tolist() == ['Aa', 'AC']
+    assert PeptideData(tmp_path / 'data').d_mask[0, 1]
     # Live prediction must match the residue-only FP16 cache, despite BOS/EOS padding.
     head = NovaSequenceModel(4, 2, hidden_dim=8, channels=4, dropout=0).eval()
     checkpoint_path = tmp_path / 'head.pt'
     torch.save({'model_args': {'input_dim': 4, 'num_labels': 2, 'hidden_dim': 8, 'channels': 4, 'dropout': 0},
                 'model_state': head.state_dict(), 'encoder': cached.meta, 'config': config,
                 'labels': ['x', 'y'], 'threshold': .5}, checkpoint_path)
-    sequences = ['AA', 'ACDE']
+    sequences = ['Aa', 'AcDE']
     live = predict_sequences(checkpoint_path, sequences)
+    assert [item['sequence'] for item in live] == sequences
     states, mask = encoder.encode(sequences)
     samples = [(states[i, mask[i]].half().float(), torch.zeros(2)) for i in range(2)]
     x, residue_mask, _ = collate_features(samples)
     with torch.inference_mode():
         expected = head(x, residue_mask).sigmoid().numpy()
     np.testing.assert_allclose([list(item['probabilities'].values()) for item in live], expected, rtol=1e-6)
+
+    # Reproduce a failure after the first batch, using the legacy residues-only cache.
+    original_encode = FrozenEncoder.encode
+    interrupted_root = tmp_path / 'interrupted'
+    feature_args = ['features', '--config', str(config_path), '--feature-root', str(interrupted_root),
+                    '--batch-size', '1', '--splits', 'train', 'val']
+    def fail_second_batch(self, sequences):
+        if sequences == ['AC']:
+            raise RuntimeError('simulated interrupted extraction')
+        return original_encode(self, sequences)
+    with monkeypatch.context() as patch:
+        patch.setattr(FrozenEncoder, 'encode', fail_second_batch)
+        with pytest.raises(RuntimeError, match='simulated interrupted'):
+            main(feature_args)
+    prefix = np.load(interrupted_root / 'train/residues.npy')[:2].copy()
+    assert not (interrupted_root / 'train/metadata.json').exists()
+    resumed_batches = []
+    def record_resume(self, sequences):
+        resumed_batches.extend(sequences)
+        return original_encode(self, sequences)
+    with monkeypatch.context() as patch:
+        patch.setattr(FrozenEncoder, 'encode', record_resume)
+        main(feature_args + ['--resume-from', '1'])
+    assert 'Aa' not in resumed_batches
+    np.testing.assert_array_equal(np.load(interrupted_root / 'train/residues.npy')[:2], prefix)
+    recovered = CachedPeptides(PeptideData(tmp_path / 'data'), interrupted_root, 'train')
+    assert len(recovered) == 2
+    assert (interrupted_root / 'val/metadata.json').exists()
+    with pytest.raises(FileExistsError, match='already complete'):
+        main(feature_args + ['--resume-from', '1'])
 
 
 def make_fixture(root):
@@ -139,9 +173,10 @@ def make_fixture(root):
     (root / 'manifest.json').write_text(json.dumps({'version_date': 'fixture'}), encoding='utf-8')
     rows = np.array([10, 20, 30, 40, 50, 60])
     ids = np.array(['a', 'b', 'c', 'd', 'e', 'f'])
-    seqs = np.array(['AA', 'AC', 'AG', 'AD', 'ZZ', 'AE'])
+    seqs = np.array(['Aa', 'AC', 'Ag', 'AD', 'ZZ', 'AE'])
+    d_mask = np.array([[c.islower() for c in s] for s in seqs], dtype=bool)
     np.savez(root / 'arrays/sequences.npz', row_id=rows, ID=ids, canonical_backbone=seqs,
-             canonical_available=np.array([1, 1, 1, 1, 0, 1], bool), D_annotation_mask=np.zeros((6, 2), bool), raw_sequence=seqs)
+             canonical_available=np.array([1, 1, 1, 1, 0, 1], bool), D_annotation_mask=d_mask, raw_sequence=seqs)
     np.savez(root / 'tracks/fine39/dataset.npz', row_id=rows, Y=[[1, 0], [0, 1], [1, 1], [0, 1], [1, 0], [1, 0]],
              label_names=['x', 'y'], split=['train', 'train', 'val', 'test', 'train', 'val'], cluster_id=rows,
              is_augmented=np.zeros(6, bool), row_in_scope=np.ones(6, bool),
@@ -232,9 +267,12 @@ def test_real_data_contract():
         data = PeptideData(root, track)
         assert len(data.rows) == 59231
         assert len(data.labels) == nlabels
+        assert all(s and not set(s.upper()) - set('ACDEFGHIKLMNPQRSTVWY') for s in data.sequences[data.available])
         indices = data.indices('train')
         assert data.available[indices].all()
         assert not data.augmented[indices].any()
         assert data.y[indices].sum(1).min() > 0
         groups = [set(data.clusters[data.indices(split)]) for split in ('train', 'val', 'test')]
         assert not (groups[0] & groups[1] or groups[0] & groups[2] or groups[1] & groups[2])
+        backbones = [{s.upper() for s in data.sequences[data.indices(split)]} for split in ('train', 'val', 'test')]
+        assert not (backbones[0] & backbones[1] or backbones[0] & backbones[2] or backbones[1] & backbones[2])

@@ -13,6 +13,8 @@
   },
   "original_canonical_available": 56199,
   "original_canonical_unresolved": 2384,
+  "original_canonical_lowercase_rows": 1173,
+  "encoder_view": "Uppercase resolved backbone for ESM; original case and D annotations retained. Canonical isolation/duplicates ignore case.",
   "original_d_annotated_rows": 1173,
   "raw_non_20aa_rows": 2526,
   "canonical_length": {
@@ -27,7 +29,7 @@
     ]
   },
   "raw_exact_duplicate_groups": 7,
-  "canonical_exact_duplicate_groups": 261,
+  "canonical_exact_duplicate_groups": 696,
   "cross_split_clusters": 0,
   "cross_split_exact_canonical_sequences": 0,
   "similarity_protocol": "Retain supplied repaired connected components; 90% global edit relation plus verified MMseqs candidates. No exhaustive similarity recomputation in this scaffold.",

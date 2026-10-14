@@ -21,6 +21,8 @@ def main(argv=None):
         sub.add_argument("--batch-size", type=int, help="Encoder batch for features; head batch for train")
         if command == "features":
             sub.add_argument("--splits", nargs="+", choices=("train", "val", "test"), default=["train", "val"])
+            sub.add_argument("--resume-from", type=int, default=0,
+                             help="Completed rows in the first split, from the interrupted extraction log")
         else:
             sub.add_argument("--name", required=True)
             sub.add_argument("--seed", type=int)
@@ -38,7 +40,7 @@ def main(argv=None):
     evaluate.add_argument("--predictions", help="Optional aligned sample probabilities in NPZ format")
     predict = commands.add_parser("predict")
     predict.add_argument("--checkpoint", required=True)
-    predict.add_argument("--sequences", required=True, help="One resolved uppercase 20-AA backbone per line")
+    predict.add_argument("--sequences", required=True, help="One resolved 20-AA backbone per line; ESM uses uppercase")
     predict.add_argument("--device", default="cpu")
     predict.add_argument("--output", required=True)
     args = parser.parse_args(argv)
@@ -61,7 +63,7 @@ def main(argv=None):
             config[section]["batch_size"] = args.batch_size
         if args.command == "features":
             from .encoder import prepare_features
-            prepare_features(config, args.splits, config["train"]["device"])
+            prepare_features(config, args.splits, config["train"]["device"], resume_from=args.resume_from)
         else:
             from .trainer import train
             for key in ("seed", "epochs"):

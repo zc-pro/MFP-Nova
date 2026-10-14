@@ -22,9 +22,9 @@ def analyze_data(root):
     for i in np.flatnonzero(original):
         cluster_splits[int(cluster[i])].add(str(split[i]))
         if available[i]:
-            canonical_splits[str(sequence[i])].add(str(split[i]))
+            canonical_splits[str(sequence[i]).upper()].add(str(split[i]))
     lengths = np.array([len(s) for s in sequence[original & available]])
-    canonical_counts = Counter(sequence[original & available].tolist())
+    canonical_counts = Counter(s.upper() for s in sequence[original & available])
     raw_counts = Counter(raw[original].tolist())
     annotations = Counter()
     with (root / "records.csv").open(encoding="utf-8-sig", newline="") as f:
@@ -42,6 +42,8 @@ def analyze_data(root):
         "original_split_counts": {s: int((original & (split == s)).sum()) for s in ("train", "val", "test")},
         "original_canonical_available": int((original & available).sum()),
         "original_canonical_unresolved": int((original & ~available).sum()),
+        "original_canonical_lowercase_rows": int(sum(s != s.upper() for s in sequence[original & available])),
+        "encoder_view": "Uppercase resolved backbone for ESM; original case and D annotations retained. Canonical isolation/duplicates ignore case.",
         "original_d_annotated_rows": int((original & d_mask.any(1)).sum()),
         "raw_non_20aa_rows": sum(bool(set(s.upper()) - set("ACDEFGHIKLMNPQRSTVWY")) for s in raw[original]),
         "canonical_length": {"min": int(lengths.min()), "max": int(lengths.max()),
