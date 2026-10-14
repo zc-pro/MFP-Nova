@@ -7,7 +7,7 @@ name = "mfp-nova"
 version = "0.1.0"
 description = "Lightweight research framework for multilabel therapeutic peptide prediction"
 requires-python = ">=3.10"
-dependencies = ["numpy>=1.26,<3", "torch>=2.5,<3", "transformers>=4.44,<5", "scikit-learn>=1.4,<2", "PyYAML>=6,<7"]
+dependencies = ["numpy>=1.26,<3", "torch>=2.4.1,<3", "transformers>=4.44,<5", "scikit-learn>=1.4,<2", "PyYAML>=6,<7"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<9"]

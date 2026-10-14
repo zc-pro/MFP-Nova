@@ -42,7 +42,20 @@ docs/data_summary.json     # 实际读取的必要统计，含完整标签顺序
 
 ## 安装
 
-推荐 Python 3.12。先在独立环境安装适合设备的 PyTorch，再安装项目。以下选择固定 2.8.0，避免两种 GPU 默认安装到不适合的 CUDA 构建；不是要求所有机器使用完全一致的环境。安装命令依据 [PyTorch 官方历史版本页](https://pytorch.org/get-started/previous-versions/)。
+推荐 Python 3.12。GPU 构建按设备选择：V100 优先复用已存在的 `trifusion_mfp` 环境（PyTorch 2.4.1+cu121），开发机和 RTX 5070 使用 PyTorch 2.8.0 的适用构建。当前代码所需的 PyTorch API 在 2.4 中已有，项目最低依赖调整为 2.4.1；这属于 API 检查结论，服务器上的实际链路仍需测试。安装命令依据 [PyTorch 官方历史版本页](https://pytorch.org/get-started/previous-versions/)，`weights_only` 接口见 [PyTorch 2.4 文档](https://docs.pytorch.org/docs/2.4/generated/torch.load.html)。
+
+两训练端建议共用以下主要 Python 依赖版本，PyTorch/CUDA 分别适配硬件：
+
+| 组件 | V100 已有环境 | RTX 5070 目标配置 |
+|---|---|---|
+| Python | 3.12.14 | 3.12 |
+| PyTorch / CUDA 构建 | 2.4.1+cu121 | 2.8.0+cu128 |
+| Transformers | 4.44.2 | 4.44.2 |
+| NumPy | 1.26.4 | 1.26.4 |
+| scikit-learn | 1.5.2 | 1.5.2 |
+| PyYAML | 6.0.2 | 6.0.2 |
+
+RTX 5070 属于 Blackwell 架构；不能照搬 V100 的 2.4.1+cu121 构建。PyTorch 2.7 开始提供 Blackwell/CUDA 12.8 支持，当前 RTX 安装方案使用 2.8.0+cu128，见 [官方发布说明](https://pytorch.org/blog/pytorch-2-7/)。两台机器可以使用同一份代码、数据划分和实验配置，但不承诺跨设备逐位一致；运行记录会保存各自的 Torch/CUDA 版本。无需复制 Linux 的完整 Conda 导出配置到 Windows。
 
 Windows 开发机（CPU）：
 
@@ -64,36 +77,34 @@ git clone https://github.com/zc-pro/MFP-Nova.git
 Set-Location MFP-Nova
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
+.\.venv\Scripts\python.exe -m pip install numpy==1.26.4 transformers==4.44.2 scikit-learn==1.5.2 PyYAML==6.0.2
 .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
 .\.venv\Scripts\python.exe -m pip check
 .\.venv\Scripts\mfp-nova.exe --help
 .\.venv\Scripts\python.exe -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+.\.venv\Scripts\python.exe -c "import torch; x=torch.ones(8,8,device='cuda'); print('CUDA matmul:', (x@x).sum().item())"
 ```
 
-Ubuntu V100：先从本机运行 `ssh MFP-Nova-V100` 并输入服务器密码，以下命令在登录后的 Ubuntu 终端执行。建议项目放在 `~/projects/MFP-Nova`，使用该机器已有的 Python ≥3.10（推荐3.12）；先用 `python3 --version`、`nvidia-smi` 查看 Python 和驱动信息。当前尚未核实服务器驱动，cu126 是初始安装选择，不修改共享服务器的系统 CUDA 或驱动。
+Ubuntu V100：项目已在 `~/wuzhencheng/projects/MFP-Nova` 克隆成功。用户已确认 `trifusion_mfp` 的上述依赖版本和 `torch.cuda.is_available()=True`；复用该环境，保留其已有 CUDA 12.1 构建。以下命令在登录后的 Ubuntu 终端执行，仅将新项目注册为 editable 包，不安装或升级依赖：
 
 ```bash
-mkdir -p ~/projects
-cd ~/projects
-git clone https://github.com/zc-pro/MFP-Nova.git
-cd MFP-Nova
-python3 -m venv .venv
-.venv/bin/python -m pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu126
-.venv/bin/python -m pip install -e '.[dev]'
-.venv/bin/python -m pip check
-.venv/bin/mfp-nova --help
-.venv/bin/python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+conda activate trifusion_mfp
+cd ~/wuzhencheng/projects/MFP-Nova
+git pull --ff-only
+python -m pip install --no-deps -e .
+mfp-nova --help
+python -m pytest -q
 ```
 
-两套命令都直接调用项目环境中的可执行文件，无需激活环境。GitHub 是私有仓库，按 Git 提示完成各自的 HTTPS 认证。已有项目目录时进入该目录执行 `git pull --ff-only`，再执行适用的环境安装命令。
+服务器测试使用 CPU 合成输入。数据集尚未传入时，真实数据测试会跳过；这些结果不代表 ESM 特征提取或 GPU 训练性能。如果环境没有 pytest，反馈缺失提示后只补必要测试依赖，不执行会升级整个旧环境的安装命令。
 
-最后一行的 CUDA 可用性应为 `True`。如果 Python 版本不满足、`venv` 不可用或 CUDA 不可用，提供该机器的具体输出，再调整用户环境或 PyTorch 构建。没有在服务器实际执行这些安装命令，不把本机测试当作服务器验证。
+RTX 的命令直接调用 `.venv` 中的可执行文件，无需激活；如使用 Conda，则在该机器单独创建 Python 3.12 环境并执行同样的 pip 安装步骤。GitHub 是私有仓库，按 Git 提示完成各自的 HTTPS 认证。CUDA 可用性应为 `True`，RTX 的小矩阵核验证应输出 `512.0`。服务器端安装和模型测试尚未实际确认，不把本机 2.8.0 CPU 测试当作 V100 2.4.1 或 RTX 5070 验证。
 
 数据经 UU 传到 RTX 5070，经 SFTP/SCP 传到 V100；完整解压后，两端建议目录如下。外部数据盘可以通过 `--data-root` 指定。
 
 ```text
 MFP-Nova/
-  .venv/                     # 该机器自己的环境
+  .venv/                     # 新环境可放这里；V100 直接复用已有 Conda 环境
   data/therapeutic_2025/      # 迁移包解压内容，直接包含 records.csv、arrays/、tracks/
   features/                  # 后续本机提取的特征
   runs/                      # 该机器的实验输出
@@ -150,7 +161,7 @@ git push origin main
 
 V100 的 SSH 密码在本机终端提示中输入。私有 GitHub 仓库的 HTTPS 认证在每台机器各自完成：优先使用已有 Git Credential Manager/浏览器登录；终端需要 HTTPS 凭据时使用 GitHub token，不使用 GitHub 账户密码。凭据不放入 clone URL、脚本、配置或 Git 仓库。现有本机 GitHub 登录无需重新设置。
 
-两台服务器的完整首次安装命令见上面的安装章节：V100 默认 `~/projects/MFP-Nova`，RTX 5070 默认 `$env:USERPROFILE/Projects/MFP-Nova`，均在项目内创建独立 `.venv`。这些是建议目录，尚未在服务器创建；也可以在实际操作时选择数据盘上的项目目录。GPU 驱动信息在服务器登录后确认，尚未执行远程安装或 GPU 训练。
+两台服务器的安装命令见上面的安装章节：V100 已确认项目位于 `~/wuzhencheng/projects/MFP-Nova`，复用 `trifusion_mfp`；RTX 5070 建议项目位于 `$env:USERPROFILE/Projects/MFP-Nova`，使用该机器独立的 `.venv` 或 Conda 环境。RTX 目录与环境尚未实际确认；尚未执行正式 GPU 训练。
 
 对于 V100，可在本机 PowerShell 登录：
 
