@@ -99,7 +99,7 @@ python -m pytest -q
 
 服务器测试使用 CPU 合成输入。数据集尚未传入时，真实数据测试会跳过；这些结果不代表 ESM 特征提取或 GPU 训练性能。如果环境没有 pytest，反馈缺失提示后只补必要测试依赖，不执行会升级整个旧环境的安装命令。
 
-两台训练端都使用各自的 Conda 环境 `MFP-Nova`，每次打开新终端后先激活环境。环境配置文件只用于首次创建 RTX 环境；已有项目目录时先 `git pull --ff-only` 获取该文件。GitHub 是私有仓库，按 Git 提示完成各自的 HTTPS 认证。RTX 检查应显示 `2.8.0+cu128`、CUDA `12.8`、可用性 `True`、设备名包含 RTX 5070，小矩阵核验证应输出 `512.0`。服务器端安装和模型测试尚未实际确认，不把本机 2.8.0 CPU 测试当作 V100 2.4.1 或 RTX 5070 验证。
+两台训练端都使用各自的 Conda 环境 `MFP-Nova`，每次打开新终端后先激活环境。环境配置文件只用于首次创建 RTX 环境；已有项目目录时先 `git pull --ff-only` 获取该文件。GitHub 是私有仓库，本机与 RTX 使用 HTTPS 认证；V100 改用专用 Deploy key。RTX 检查应显示 `2.8.0+cu128`、CUDA `12.8`、可用性 `True`、设备名包含 RTX 5070，小矩阵核验证应输出 `512.0`。服务器端安装和模型测试尚未实际确认，不把本机 2.8.0 CPU 测试当作 V100 2.4.1 或 RTX 5070 验证。
 
 数据经 UU 传到 RTX 5070，经 SFTP/SCP 传到 V100；完整解压后，两端建议目录如下。外部数据盘可以通过 `--data-root` 指定。
 
@@ -154,11 +154,11 @@ git push origin main
 |---|---|
 | 本机开发 → GitHub | HTTPS Git，已通过现有 Git Credential Manager 登录并完成推送 |
 | Ubuntu V100 管理 | `ssh MFP-Nova-V100`，使用 `ubuntu@192.168.13.171:22` 的密码登录 |
-| V100 ↔ GitHub | HTTPS Git，在服务器独立完成 GitHub 认证后 clone/pull |
+| V100 ↔ GitHub | SSH Git，使用 MFP-Nova 专用 Deploy key（允许写入以支持 push），待服务器生成公钥并在仓库添加 |
 | RTX 5070 ↔ GitHub | HTTPS Git，在 RTX 5070 上通过 UU 远程操作终端完成 clone/pull |
 | 本机 ↔ RTX 5070 大文件 | 用户指定的 UU 远程文件传输，同步数据、特征、权重和完整运行输出 |
 
-本机与 RTX 5070 不建立 SSH 连接，也不需要为此配置 sshd、端口或公钥。V100 使用密码登录，不安装公钥。两台训练端的项目目录在首次登录/UU 远程操作后确定。本机已将 `MFP-Nova-V100` 别名调整为交互式密码认证，并移除了 RTX 5070 项目 SSH 别名。
+本机与 RTX 5070 不建立 SSH 连接，也不需要为此配置 sshd、端口或公钥。本机登录 V100 使用密码；V100 访问 GitHub 使用独立的项目 Deploy key。两台训练端的项目目录在首次登录/UU 远程操作后确定。本机已将 `MFP-Nova-V100` 别名调整为交互式密码认证，并移除了 RTX 5070 项目 SSH 别名。
 
 V100 的 SSH 密码在本机终端提示中输入。私有 GitHub 仓库的 HTTPS 认证在每台机器各自完成：优先使用已有 Git Credential Manager/浏览器登录；终端需要 HTTPS 凭据时使用 GitHub token，不使用 GitHub 账户密码。凭据不放入 clone URL、脚本、配置或 Git 仓库。现有本机 GitHub 登录无需重新设置。
 
