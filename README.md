@@ -42,7 +42,7 @@ docs/data_summary.json     # 实际读取的必要统计，含完整标签顺序
 
 ## 安装
 
-推荐 Python 3.12。GPU 构建按设备选择：V100 从已存在的 `trifusion_mfp` 克隆出独立的 `MFP-Nova` 环境（PyTorch 2.4.1+cu121），开发机和 RTX 5070 使用 PyTorch 2.8.0 的适用构建。当前代码所需的 PyTorch API 在 2.4 中已有，项目最低依赖调整为 2.4.1；这属于 API 检查结论，服务器上的实际链路仍需测试。安装命令依据 [PyTorch 官方历史版本页](https://pytorch.org/get-started/previous-versions/)，`weights_only` 接口见 [PyTorch 2.4 文档](https://docs.pytorch.org/docs/2.4/generated/torch.load.html)。
+推荐 Python 3.12。GPU 构建按设备选择：V100 从已存在的 `trifusion_mfp` 克隆出独立的 `MFP-Nova` 环境（PyTorch 2.4.1+cu121），开发机和 RTX 5070 使用 PyTorch 2.8.0 的适用构建。当前代码所需的 PyTorch API 在 2.4 中已有，项目最低依赖调整为 2.4.1；V100 的 CPU 合成训练与评价测试已通过，真实 ESM/GPU 链路尚待验证。安装命令依据 [PyTorch 官方历史版本页](https://pytorch.org/get-started/previous-versions/)，`weights_only` 接口见 [PyTorch 2.4 文档](https://docs.pytorch.org/docs/2.4/generated/torch.load.html)。
 
 两训练端建议共用以下主要 Python 依赖版本，PyTorch/CUDA 分别适配硬件：
 
@@ -99,7 +99,16 @@ python -m pytest -q
 
 服务器测试使用 CPU 合成输入。数据集尚未传入时，真实数据测试会跳过；这些结果不代表 ESM 特征提取或 GPU 训练性能。如果环境没有 pytest，反馈缺失提示后只补必要测试依赖，不执行会升级整个旧环境的安装命令。
 
-两台训练端都使用各自的 Conda 环境 `MFP-Nova`，每次打开新终端后先激活环境。环境配置文件只用于首次创建 RTX 环境；已有项目目录时先 `git pull --ff-only` 获取该文件。GitHub 是私有仓库，本机与 RTX 使用 HTTPS 认证；V100 改用专用 Deploy key。RTX 检查应显示 `2.8.0+cu128`、CUDA `12.8`、可用性 `True`、设备名包含 RTX 5070，小矩阵核验证应输出 `512.0`。服务器端安装和模型测试尚未实际确认，不把本机 2.8.0 CPU 测试当作 V100 2.4.1 或 RTX 5070 验证。
+两台训练端都使用各自的 Conda 环境 `MFP-Nova`，每次打开新终端后先激活环境。环境配置文件只用于首次创建 RTX 环境；已有项目目录时先 `git pull --ff-only` 获取该文件。GitHub 是私有仓库，本机与 RTX 使用 HTTPS 认证；V100 的专用 Deploy key 拉取已成功。V100 项目已安装，5 项 CPU 测试通过，1 项因数据未传入跳过。RTX 环境已确认 Python 3.12.15 与 pip 可用，PyTorch 安装与 GPU 检查尚待反馈。RTX 检查应显示 `2.8.0+cu128`、CUDA `12.8`、可用性 `True`、设备名包含 RTX 5070，小矩阵核验证应输出 `512.0`。CPU 测试不代表真实 ESM 特征提取或 GPU 训练验证。
+
+RTX 项目实际位于 `D:\Data\ChatGPT\mfp\MFP-Nova`。CMD 若提示 `Run 'conda init' before 'conda activate'`，可用以下命令激活已有环境；若完整 YAML 安装中断，单独安装依赖以显示下载进度，无需重新创建环境：
+
+```cmd
+call D:\App\Code\Anaconda\Scripts\activate.bat MFP-Nova
+python -m pip install torch==2.8.0+cu128 --index-url https://download.pytorch.org/whl/cu128
+python -m pip install numpy==1.26.4 transformers==4.44.2 scikit-learn==1.5.2 PyYAML==6.0.2 pytest==8.4.2
+python -m pip install --no-deps -e .
+```
 
 数据经 UU 传到 RTX 5070，经 SFTP/SCP 传到 V100；完整解压后，两端建议目录如下。外部数据盘可以通过 `--data-root` 指定。
 
@@ -117,7 +126,7 @@ MFP-Nova/
 
 ```text
 mfp-nova analyze --data-root data/therapeutic_2025 --output docs/data_summary.json
-mfp-nova features --device cuda:0 --splits train val
+mfp-nova features --device cuda:0 --batch-size 32 --splits train val
 mfp-nova train --device cuda:0 --track fine39 --name fine39_seq_seed42
 mfp-nova train --device cuda:0 --track major15 --name major15_seq_seed42
 ```
@@ -126,17 +135,30 @@ mfp-nova train --device cuda:0 --track major15 --name major15_seq_seed42
 
 训练仅打开 Train/Validation 缓存，按 Validation Macro-AP 选最佳 checkpoint，Micro-AP 打破同分，完全相同则保留更早 epoch。训练后加载最佳模型，在 Validation 上拟合全局 Jaccard 阈值；结果中的 Val F1/Jaccard 为阈值拟合内估计。Test 未参与训练、选模或阈值拟合。输出 `runs/<name>/best.pt`、`history.jsonl`、`metadata.json`、`results.json`，已有运行目录拒绝覆盖。
 
+可用 `--epochs`、`--batch-size`、`--seed`、`--loss` 和 `--global-only` 覆盖当前配置，实际生效配置写入 checkpoint 与 metadata，不需要复制配置文件。特征提取的 `--batch-size` 控制 ESM 批次，训练/评价的该选项控制分类模型批次。以下示例共用已提取的 Train/Val 缓存，各次运行只更改一个研究因素：
+
+```text
+mfp-nova train --device cpu --epochs 2 --name fine39_smoke_seed42
+mfp-nova train --device cuda:0 --seed 42 --name fine39_seq_seed42
+mfp-nova train --device cuda:0 --seed 42 --global-only --name fine39_global_seed42
+mfp-nova train --device cuda:0 --seed 42 --loss bce --name fine39_bce_seed42
+```
+
+两轮短训练用于检查完整队列的运行链路，不用于报告最终模型成绩。`history.jsonl` 记录每轮训练与验证耗时，`results.json` 记录完成轮数和训练至阈值拟合结束的总耗时；`metadata.json` 记录可训练参数量（不含冻结 ESM）、主要依赖版本和设备。
+
 确定方案后，独立提取并评价 Test：
 
 ```text
 mfp-nova features --device cuda:0 --splits test
-mfp-nova evaluate --checkpoint runs/fine39_seq_seed42/best.pt --device cuda:0 --output runs/fine39_seq_seed42/test.json
+mfp-nova evaluate --checkpoint runs/fine39_seq_seed42/best.pt --device cuda:0 --output runs/fine39_seq_seed42/test.json --predictions runs/fine39_seq_seed42/test_predictions.npz
 mfp-nova predict --checkpoint runs/fine39_seq_seed42/best.pt --sequences peptides.txt --device cuda:0 --output predictions.json
 ```
 
 `peptides.txt` 每行一个明确、非空、大写 20-AA 骨架；非标准化学表示不进行猜测转换，超过 token 上限明确报错，不静默截断。推理返回所有标签概率和阈值通过的标签，可全部为阴性。原始修饰肽的化学身份需要独立处理。
 
-消融直接修改配置并使用新实验名：`model.use_local: false` 为全局特征对照，`loss.name: bce` 为损失对照。增强 `data.augment: true` 仅使用当前任务提供的训练候选，需要新的含增强特征目录；fine39 为 648 条，major15 为 60 条。暂未实现 CV/增强 CV，不将固定划分增强用于开发折。
+评价 JSON 中的 `label_ap` 和 `label_positive_support` 按 `labels` 顺序对应。可选 `--predictions` 导出 NPZ：`row_id`、`ID`、`canonical_backbone`、`label_names`、`targets`、`probabilities`、`threshold` 及划分、任务、编码器版本信息。行顺序与当前任务监督队列一致，独立于缓存保存顺序，便于后续错误分析；用 `np.load(path, allow_pickle=False)` 读取。结果与概率文件拒绝覆盖已有文件，大型概率文件放在被 Git 忽略的 `runs/` 中。
+
+消融通过上述 CLI 选项或修改 `model.use_local`、`loss.name` 实现，使用新实验名。增强 `data.augment: true` 仅使用当前任务提供的训练候选，需要新的含增强特征目录；fine39 为 648 条，major15 为 60 条。暂未实现 CV/增强 CV，不将固定划分增强用于开发折。
 
 ## GitHub 与服务器
 
@@ -154,15 +176,15 @@ git push origin main
 |---|---|
 | 本机开发 → GitHub | HTTPS Git，已通过现有 Git Credential Manager 登录并完成推送 |
 | Ubuntu V100 管理 | `ssh MFP-Nova-V100`，使用 `ubuntu@192.168.13.171:22` 的密码登录 |
-| V100 ↔ GitHub | SSH Git，使用 MFP-Nova 专用 Deploy key（允许写入以支持 push），待服务器生成公钥并在仓库添加 |
+| V100 ↔ GitHub | SSH Git，专用 Deploy key 已成功免密拉取；写入权限勾选 Allow write access 后可 push |
 | RTX 5070 ↔ GitHub | HTTPS Git，在 RTX 5070 上通过 UU 远程操作终端完成 clone/pull |
 | 本机 ↔ RTX 5070 大文件 | 用户指定的 UU 远程文件传输，同步数据、特征、权重和完整运行输出 |
 
-本机与 RTX 5070 不建立 SSH 连接，也不需要为此配置 sshd、端口或公钥。本机登录 V100 使用密码；V100 访问 GitHub 使用独立的项目 Deploy key。两台训练端的项目目录在首次登录/UU 远程操作后确定。本机已将 `MFP-Nova-V100` 别名调整为交互式密码认证，并移除了 RTX 5070 项目 SSH 别名。
+本机与 RTX 5070 不建立 SSH 连接，也不需要为此配置 sshd、端口或公钥。本机登录 V100 使用密码；V100 访问 GitHub 使用独立的项目 Deploy key。本机已将 `MFP-Nova-V100` 别名调整为交互式密码认证，并移除了 RTX 5070 项目 SSH 别名。
 
-V100 的 SSH 密码在本机终端提示中输入。私有 GitHub 仓库的 HTTPS 认证在每台机器各自完成：优先使用已有 Git Credential Manager/浏览器登录；终端需要 HTTPS 凭据时使用 GitHub token，不使用 GitHub 账户密码。凭据不放入 clone URL、脚本、配置或 Git 仓库。现有本机 GitHub 登录无需重新设置。
+V100 的 SSH 密码在本机终端提示中输入。本机与 RTX 的私有 GitHub 仓库 HTTPS 认证各自完成：优先使用已有 Git Credential Manager/浏览器登录；终端需要 HTTPS 凭据时使用 GitHub token，不使用 GitHub 账户密码。凭据不放入 clone URL、脚本、配置或 Git 仓库。现有本机 GitHub 登录无需重新设置。
 
-两台服务器的安装命令见上面的安装章节：V100 已确认项目位于 `~/wuzhencheng/projects/MFP-Nova`，从 `trifusion_mfp` 克隆创建独立 Conda 环境 `MFP-Nova`；RTX 5070 建议项目位于 `$env:USERPROFILE/Projects/MFP-Nova`，在 Windows 上用专用 YAML 创建 Conda 环境 `MFP-Nova`。RTX 目录与环境尚未实际确认；尚未执行正式 GPU 训练。
+两台服务器的安装命令见上面的安装章节：V100 项目位于 `~/wuzhencheng/projects/MFP-Nova`，独立 Conda 环境 `MFP-Nova` 已完成克隆和安装；RTX 项目位于 `D:\Data\ChatGPT\mfp\MFP-Nova`，环境位于 `D:\App\Code\Anaconda\envs\MFP-Nova`，Python/pip 已确认。两台服务器均尚未完成真实 ESM 提取与正式 GPU 训练。
 
 对于 V100，可在本机 PowerShell 登录：
 

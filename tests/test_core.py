@@ -4,12 +4,14 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+import yaml
 from sklearn.metrics import average_precision_score
 from torch.utils.data import DataLoader
 
 from mfp_nova.data import CachedPeptides, PeptideData, collate_features
-from mfp_nova.encoder import FrozenEncoder, prepare_features
-from mfp_nova.inference import evaluate, load_model
+from mfp_nova.cli import main
+from mfp_nova.encoder import FrozenEncoder
+from mfp_nova.inference import evaluate, load_model, predict_sequences
 from mfp_nova.losses import asymmetric_loss
 from mfp_nova.metrics import evaluate_metrics, fit_global_threshold
 from mfp_nova.model import NovaSequenceModel
@@ -53,6 +55,7 @@ def test_metric_semantics_and_threshold():
     metrics = evaluate_metrics(y, p)
     assert metrics['label_ap'][0] == pytest.approx(average_precision_score(y[:, 0], p[:, 0]))
     assert metrics['label_ap'][2] is None
+    assert metrics['label_positive_support'] == [2, 1, 0]
     assert metrics['macro_ap'] == pytest.approx((2/3 + 1) / 2)
     assert metrics['macro_f1'] == pytest.approx((.8 + 1 + 0) / 3)
     threshold = fit_global_threshold(y, p)
@@ -105,28 +108,45 @@ def test_frozen_encoder_masks_and_limits(monkeypatch, tmp_path):
     config = {'encoder': {'name': 'test', 'revision': 'main', 'max_length': 8, 'batch_size': 2},
               'data': {'root': str(tmp_path / 'data'), 'track': 'fine39', 'augment': False,
                        'features': str(tmp_path / 'features')}}
-    prepare_features(config, ['train', 'val'], 'cpu')
+    config_path = tmp_path / 'config.yaml'
+    config['train'] = {'device': 'cpu'}
+    config_path.write_text(yaml.safe_dump(config), encoding='utf-8')
+    main(['features', '--config', str(config_path), '--batch-size', '1', '--splits', 'train', 'val'])
     cached = CachedPeptides(PeptideData(tmp_path / 'data'), tmp_path / 'features', 'train')
     assert len(cached) == 2
     assert cached.values.dtype == np.float16
     assert cached[0][0].shape == (2, 4)
     assert cached.meta['resolved_revision'] == 'test-revision'
+    # Live prediction must match the residue-only FP16 cache, despite BOS/EOS padding.
+    head = NovaSequenceModel(4, 2, hidden_dim=8, channels=4, dropout=0).eval()
+    checkpoint_path = tmp_path / 'head.pt'
+    torch.save({'model_args': {'input_dim': 4, 'num_labels': 2, 'hidden_dim': 8, 'channels': 4, 'dropout': 0},
+                'model_state': head.state_dict(), 'encoder': cached.meta, 'config': config,
+                'labels': ['x', 'y'], 'threshold': .5}, checkpoint_path)
+    sequences = ['AA', 'ACDE']
+    live = predict_sequences(checkpoint_path, sequences)
+    states, mask = encoder.encode(sequences)
+    samples = [(states[i, mask[i]].half().float(), torch.zeros(2)) for i in range(2)]
+    x, residue_mask, _ = collate_features(samples)
+    with torch.inference_mode():
+        expected = head(x, residue_mask).sigmoid().numpy()
+    np.testing.assert_allclose([list(item['probabilities'].values()) for item in live], expected, rtol=1e-6)
 
 
 def make_fixture(root):
     (root / 'arrays').mkdir(parents=True)
     (root / 'tracks/fine39').mkdir(parents=True)
     (root / 'manifest.json').write_text(json.dumps({'version_date': 'fixture'}), encoding='utf-8')
-    rows = np.array([10, 20, 30, 40, 50])
-    ids = np.array(['a', 'b', 'c', 'd', 'e'])
-    seqs = np.array(['AA', 'AC', 'AG', 'AD', 'ZZ'])
+    rows = np.array([10, 20, 30, 40, 50, 60])
+    ids = np.array(['a', 'b', 'c', 'd', 'e', 'f'])
+    seqs = np.array(['AA', 'AC', 'AG', 'AD', 'ZZ', 'AE'])
     np.savez(root / 'arrays/sequences.npz', row_id=rows, ID=ids, canonical_backbone=seqs,
-             canonical_available=np.array([1, 1, 1, 1, 0], bool), D_annotation_mask=np.zeros((5, 2), bool), raw_sequence=seqs)
-    np.savez(root / 'tracks/fine39/dataset.npz', row_id=rows, Y=[[1, 0], [0, 1], [1, 1], [0, 1], [1, 0]],
-             label_names=['x', 'y'], split=['train', 'train', 'val', 'test', 'train'], cluster_id=rows,
-             is_augmented=np.zeros(5, bool), row_in_scope=np.ones(5, bool),
-             train_original_mask=np.array([1, 1, 0, 0, 1], bool), val_original_mask=np.array([0, 0, 1, 0, 0], bool),
-             test_original_mask=np.array([0, 0, 0, 1, 0], bool), train_aug_mask=np.array([1, 1, 0, 0, 1], bool))
+             canonical_available=np.array([1, 1, 1, 1, 0, 1], bool), D_annotation_mask=np.zeros((6, 2), bool), raw_sequence=seqs)
+    np.savez(root / 'tracks/fine39/dataset.npz', row_id=rows, Y=[[1, 0], [0, 1], [1, 1], [0, 1], [1, 0], [1, 0]],
+             label_names=['x', 'y'], split=['train', 'train', 'val', 'test', 'train', 'val'], cluster_id=rows,
+             is_augmented=np.zeros(6, bool), row_in_scope=np.ones(6, bool),
+             train_original_mask=np.array([1, 1, 0, 0, 1, 0], bool), val_original_mask=np.array([0, 0, 1, 0, 0, 1], bool),
+             test_original_mask=np.array([0, 0, 0, 1, 0, 0], bool), train_aug_mask=np.array([1, 1, 0, 0, 1, 0], bool))
     return rows, ids
 
 
@@ -137,7 +157,7 @@ def test_cache_alignment_and_short_training(tmp_path):
     with pytest.raises(ValueError, match='train-only'):
         data.indices('val', augment=True)
     datasets = []
-    for split, positions in [('train', [1, 0]), ('val', [2])]:
+    for split, positions in [('train', [1, 0]), ('val', [5, 2])]:
         cache = tmp_path / 'features' / split
         cache.mkdir(parents=True)
         np.save(cache / 'row_ids.npy', rows[positions])
@@ -160,17 +180,44 @@ def test_cache_alignment_and_short_training(tmp_path):
               'encoder': {'name': 'test', 'revision': 'main', 'max_length': 80},
               'model': {'hidden_dim': 8, 'channels': 4, 'dropout': 0}}
     run = tmp_path / 'run'
-    result = train(config, 'run')
+    config_path = tmp_path / 'config.yaml'
+    config['train']['epochs'] = 60
+    config_path.write_text(yaml.safe_dump(config), encoding='utf-8')
+    main(['train', '--config', str(config_path), '--name', 'run', '--epochs', '2',
+          '--batch-size', '1', '--loss', 'bce', '--global-only', '--seed', '7'])
+    result = json.loads((run / 'results.json').read_text())
     assert result['best_epoch'] in [1, 2]
+    assert result['epochs_completed'] == 2
+    assert result['elapsed_seconds'] > 0
     checkpoint = torch.load(run / 'best.pt', weights_only=True)
+    assert checkpoint['config']['train']['seed'] == 7
+    assert checkpoint['config']['train']['batch_size'] == 1
+    assert checkpoint['config']['loss']['name'] == 'bce'
+    assert not checkpoint['model_args']['use_local']
     restored = NovaSequenceModel(**checkpoint['model_args']).eval()
     restored.load_state_dict(checkpoint['model_state'])
     model, _ = load_model(run / 'best.pt', 'cpu')
     x, mask, _ = next(iter(loaders[1]))
     torch.testing.assert_close(model(x, mask), restored(x, mask))
     assert len((run / 'history.jsonl').read_text().splitlines()) == 2
-    evaluate(run / 'best.pt', tmp_path / 'data', tmp_path / 'features', 'val', 'cpu', run / 'val.json')
-    assert json.loads((run / 'val.json').read_text())['split'] == 'val'
+    metadata = json.loads((run / 'metadata.json').read_text())
+    assert metadata['trainable_parameters'] == sum(p.numel() for p in restored.parameters())
+    assert 'transformers' in metadata['packages']
+    main(['evaluate', '--checkpoint', str(run / 'best.pt'), '--data-root', str(tmp_path / 'data'),
+          '--feature-root', str(tmp_path / 'features'), '--split', 'val', '--batch-size', '1',
+          '--output', str(run / 'evaluation/val.json'), '--predictions', str(run / 'evaluation/val.npz')])
+    report = json.loads((run / 'evaluation/val.json').read_text())
+    assert report['split'] == 'val'
+    with np.load(run / 'evaluation/val.npz', allow_pickle=False) as predictions:
+        assert predictions['row_id'].tolist() == [30, 60]
+        assert predictions['ID'].tolist() == ['c', 'f']
+        assert predictions['label_names'].tolist() == ['x', 'y']
+        np.testing.assert_array_equal(predictions['targets'], [[1, 1], [1, 0]])
+        np.testing.assert_allclose(predictions['probabilities'], model(x, mask).sigmoid().detach().numpy())
+        assert predictions['threshold'].item() == report['threshold']
+        assert evaluate_metrics(predictions['targets'], predictions['probabilities'], report['threshold']) == report['metrics']
+    with pytest.raises(FileExistsError):
+        evaluate(run / 'best.pt', tmp_path / 'data', tmp_path / 'features', 'val', 'cpu', run / 'evaluation/val.json')
     with pytest.raises(FileExistsError):
         train(config, 'run')
     # Training succeeds with no Test cache, making accidental Test access visible.

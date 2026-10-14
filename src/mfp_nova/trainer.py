@@ -2,6 +2,8 @@ import json
 import random
 import subprocess
 import sys
+import time
+from importlib.metadata import version
 from pathlib import Path
 
 import numpy as np
@@ -37,6 +39,7 @@ def write_json(path, value):
 
 
 def fit(model, train_loader, val_loader, config, run, checkpoint_info):
+    started = time.perf_counter()
     settings = config["train"]
     device = torch.device(settings["device"])
     model.to(device)
@@ -48,6 +51,7 @@ def fit(model, train_loader, val_loader, config, run, checkpoint_info):
         raise ValueError(f"Unknown loss: {loss_name}")
     best_key, stale = (-float("inf"), -float("inf")), 0
     for epoch in range(1, settings["epochs"] + 1):
+        epoch_started = time.perf_counter()
         model.train()
         total, count = 0.0, 0
         for residues, mask, y in train_loader:
@@ -63,7 +67,8 @@ def fit(model, train_loader, val_loader, config, run, checkpoint_info):
         metrics = evaluate_metrics(y, probabilities)
         if metrics["macro_ap"] is None:
             raise ValueError("Validation has no positive labels; Macro-AP model selection is undefined")
-        record = {"epoch": epoch, "train_loss": total / count, "validation": metrics}
+        record = {"epoch": epoch, "train_loss": total / count, "validation": metrics,
+                  "seconds": time.perf_counter() - epoch_started}
         with (run / "history.jsonl").open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, allow_nan=False) + "\n")
         key = (metrics["macro_ap"], metrics["micro_ap"])
@@ -83,6 +88,7 @@ def fit(model, train_loader, val_loader, config, run, checkpoint_info):
     checkpoint["threshold"] = threshold
     torch.save(checkpoint, run / "best.pt")
     result = {"best_epoch": checkpoint["best_epoch"], "threshold": threshold,
+              "epochs_completed": epoch, "elapsed_seconds": time.perf_counter() - started,
               "threshold_fit_split": "val", "checkpoint": str(run / "best.pt"),
               "validation": evaluate_metrics(y, probabilities, threshold)}
     write_json(run / "results.json", result)
@@ -117,6 +123,8 @@ def train(config, name):
                 "config": config, "labels": data.labels, "encoder": train_data.meta,
                 "cohort": "resolved_backbone", "train_rows": len(train_data), "val_rows": len(val_data),
                 "seed": settings["seed"], "python": sys.version, "torch": str(torch.__version__),
+                "packages": {package: version(package) for package in ("numpy", "transformers", "scikit-learn", "PyYAML")},
+                "trainable_parameters": sum(p.numel() for p in model.parameters() if p.requires_grad),
                 "cuda": torch.version.cuda, "device": settings["device"],
                 "gpu": torch.cuda.get_device_name(torch.device(settings["device"])) if str(settings["device"]).startswith("cuda") else None}
     write_json(run / "metadata.json", metadata)

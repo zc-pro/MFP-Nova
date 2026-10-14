@@ -11,6 +11,7 @@ def evaluate_metrics(targets, probabilities, threshold=0.5):
         "macro_ap": float(np.mean([v for v in ap if v is not None])) if active.any() else None,
         "micro_ap": float(average_precision_score(targets.ravel(), probabilities.ravel())) if active.any() else None,
         "label_ap": ap,
+        "label_positive_support": targets.sum(0).astype(int).tolist(),
         "ap_labels_with_positives": int(active.sum()),
         "macro_f1": float(f1_score(targets, predicted, average="macro", zero_division=0)),
         "micro_f1": float(f1_score(targets, predicted, average="micro", zero_division=0)),
