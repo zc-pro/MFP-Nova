@@ -103,7 +103,7 @@ class ProtoRoute(nn.Module):
                 "label_expert_available": label_available, "cosine": cosine, "assignments": assignments,
                 "prototypes": prototypes, "reconstruction": self.reconstruction(cooperative[0][:, :-1], cooperative[2])}
 
-    def compute_loss(self, batch, settings):
+    def compute_loss(self, batch, settings, return_output=False):
         view, hidden = training_views(batch, settings.get("modality_dropout", .1), settings.get("mask_ratio", .15))
         output = self(view)
         loss = lambda logits, mask=None: observed_label_loss(logits, batch["y"], self.statistics, settings.get("unlabeled_weight", .3), mask)
@@ -127,4 +127,4 @@ class ProtoRoute(nn.Module):
         total = terms["classification"]
         for key, default in [("direct", .2), ("branch", .1), ("prototype", .1), ("diversity", .01), ("balance", .01), ("reconstruction", .05)]:
             total = total+settings.get(key, default)*terms[key]
-        return total, terms
+        return (total, terms, output) if return_output else (total, terms)

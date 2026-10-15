@@ -44,12 +44,45 @@ def evaluate_metrics(targets, probabilities, threshold=0.5, train_support=None, 
         "macro_auroc": float(np.mean([a for a in auc if a is not None])) if any(a is not None for a in auc) else None,
         "micro_auroc": float(roc_auc_score(actual.ravel(), probabilities.ravel())) if actual.any() and not actual.all() else None,
     })
+    result.update({
+        "accuracy": result["sample_jaccard"], "precision": result["sample_precision"],
+        "coverage": result["sample_recall"], "absolute_true": result["exact_match"],
+        "absolute_false": result["hamming_loss"],
+        "sample_f1": float(ratio(2*(actual & predicted).sum(1), actual.sum(1)+predicted.sum(1)).mean()),
+    })
+    for name, values in (("macro_mcc", result["label_mcc"]),
+                         ("macro_sensitivity", result["label_sensitivity"]),
+                         ("macro_specificity", result["label_specificity"])):
+        valid = [v for v in values if v is not None]
+        result[name] = float(np.mean(valid)) if valid else None
+    t, f, n, z = tp.sum(), fp.sum(), fn.sum(), tn.sum()
+    micro_denominator = np.sqrt((t+f)*(t+n)*(z+f)*(z+n))
+    result["micro_mcc"] = float((t*z-f*n)/micro_denominator) if micro_denominator else None
+    result["micro_sensitivity"] = float(t/(t+n)) if t+n else None
+    result["micro_specificity"] = float(z/(z+f)) if z+f else None
+    # Keep the existing sklearn zero_division=0 convention, and expose why a
+    # denominator or ranking statistic is unavailable rather than inventing it.
+    undefined = {
+        "label_ap": {str(i): "no_positive_targets" for i in range(len(tp)) if not active[i]},
+        "label_auroc": {str(i): "requires_positive_and_negative_targets" for i, a in enumerate(auc) if a is None},
+        "label_mcc": {str(i): "zero_mcc_denominator" for i, d in enumerate(denominator) if not d},
+        "label_sensitivity": {str(i): "no_positive_targets" for i in range(len(tp)) if not tp[i]+fn[i]},
+        "label_specificity": {str(i): "no_negative_targets" for i in range(len(tp)) if not tn[i]+fp[i]},
+        "label_precision": {str(i): "no_positive_predictions; zero_division=0" for i in range(len(tp)) if not tp[i]+fp[i]},
+        "label_recall": {str(i): "no_positive_targets; zero_division=0" for i in range(len(tp)) if not tp[i]+fn[i]},
+        "label_f1": {str(i): "no_positive_targets_or_predictions; zero_division=0" for i in range(len(tp)) if not 2*tp[i]+fp[i]+fn[i]},
+    }
+    for name, value in result.items():
+        if value is None:
+            undefined[name] = "no_valid_labels" if name.startswith("macro_") else "missing_class_or_zero_denominator"
     if train_support is not None:
         support = np.asarray(train_support)
         for name, mask in [("head", support>=1000), ("medium", (support>=200)&(support<1000)), ("tail", support<200)]:
             values = [a for a, selected in zip(ap, mask) if selected and a is not None]
             result[f"{name}_macro_ap"] = float(np.mean(values)) if values else None
             result[f"{name}_ap_labels"] = len(values)
+            if not values:
+                undefined[f"{name}_macro_ap"] = "no_labels_in_train_stratum" if not mask.any() else "no_positive_targets_in_stratum"
     if function_projection is not None:
         from .multimodal import independent_functions
         truth = independent_functions(actual, function_projection)
@@ -59,12 +92,66 @@ def evaluate_metrics(targets, probabilities, threshold=0.5, train_support=None, 
             "precision": float(precision_score(mfp_true, mfp_pred, zero_division=0)),
             "recall": float(recall_score(mfp_true, mfp_pred, zero_division=0)),
             "f1": float(f1_score(mfp_true, mfp_pred, zero_division=0)),
-            "support": int(mfp_true.sum()), "predicted": int(mfp_pred.sum())}
+            "support": int(mfp_true.sum()), "predicted": int(mfp_pred.sum()),
+            "true_positive": int((mfp_true & mfp_pred).sum()),
+            "false_positive": int((~mfp_true & mfp_pred).sum()),
+            "false_negative": int((mfp_true & ~mfp_pred).sum())}
         result["mfp_function_prediction"] = {
             "precision": float(precision_score(truth[mfp_true], guessed[mfp_true], average="samples", zero_division=0)),
             "recall": float(recall_score(truth[mfp_true], guessed[mfp_true], average="samples", zero_division=0)),
             "f1": float(f1_score(truth[mfp_true], guessed[mfp_true], average="samples", zero_division=0))} if mfp_true.any() else None
+        if not mfp_true.any():
+            undefined["mfp_function_prediction"] = "no_multifunction_targets"
+            undefined["mfp_detection.recall"] = "no_multifunction_targets; zero_division=0"
+        if not mfp_pred.any():
+            undefined["mfp_detection.precision"] = "no_multifunction_predictions; zero_division=0"
+    result["undefined_metrics"] = {k: v for k, v in undefined.items() if v}
+    result["zero_division"] = 0
     return result
+
+
+def evaluate_groups(targets, probabilities, groups, threshold, train_support, function_projection):
+    """CPU summaries of the same predictions; no additional model forward."""
+    output = {}
+    for name, mask in groups.items():
+        rows = int(mask.sum())
+        if not rows:
+            output[name] = {"rows": 0, "metrics": None, "reason": "no_samples"}
+            continue
+        score = evaluate_metrics(targets[mask], probabilities[mask], threshold, train_support, function_projection)
+        # Global per-label arrays live once in history; group summaries retain
+        # scalars, MFP counts, and explicit undefined-statistic explanations.
+        score = {k: v for k, v in score.items() if not isinstance(v, list)}
+        output[name] = {"rows": rows, "metrics": score}
+    return output
+
+
+def format_epoch(model, task, seed, maximum_epochs, record, patience):
+    """Four console lines; the JSONL remains the complete metric record."""
+    def number(value):
+        return "NA" if value is None else f"{value:.4f}"
+
+    def line(name, report, loss):
+        fields = [("Acc", "accuracy"), ("Prec", "precision"), ("Cov", "coverage"),
+                  ("AT", "absolute_true"), ("AF", "absolute_false"),
+                  ("MacroAP", "macro_ap"), ("MicroAP", "micro_ap"),
+                  ("MacroF1", "macro_f1"), ("MicroF1", "micro_f1")]
+        text = " ".join(f"{label}={number(report[key])}" for label, key in fields)
+        return f"{name:5} | Loss={number(loss)} | {text} MFP-F1={number(report.get('mfp_detection', {}).get('f1'))}"
+
+    validation = record["validation"]
+    peak = record["peak_cuda_memory_bytes"]
+    memory = "NA" if peak is None else f"{peak/2**30:.2f}GiB"
+    return "\n".join([
+        f"Epoch {record['epoch']}/{maximum_epochs} | Model={model} Task={task} Seed={seed} | MonitorThreshold={record['monitor_threshold']:.2f}",
+        line("Train", record["train"], record["losses"]["total"]),
+        line("Val", validation, record["validation_loss"]),
+        f"Extra | HeadAP={number(validation.get('head_macro_ap'))} MediumAP={number(validation.get('medium_macro_ap'))} "
+        f"TailAP={number(validation.get('tail_macro_ap'))} | LR={record['lr']:.3g} Time={record['seconds']:.1f}s "
+        f"Elapsed={record['elapsed_seconds']/60:.1f}min Peak={memory} "
+        f"Best={number(record['best_macro_ap'])}@{record['best_epoch']} Patience={record['early_stopping_count']}/{patience} "
+        f"AMP-skipped={record['skipped_amp_updates']}",
+    ])
 
 
 def fit_label_thresholds(targets, probabilities):

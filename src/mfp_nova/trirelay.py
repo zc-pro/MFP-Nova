@@ -59,7 +59,7 @@ class TriRelay(nn.Module):
                 "available": torch.stack([m.any(1) for m in masks], 1),
                 "reconstruction": self.reconstruction(streams[0][:, :-1], streams[2])}
 
-    def compute_loss(self, batch, settings):
+    def compute_loss(self, batch, settings, return_output=False):
         view, hidden = training_views(batch, settings.get("modality_dropout", .1), settings.get("mask_ratio", .15))
         output = self(view)
         loss = lambda logits, target: observed_label_loss(logits, target, self.statistics, settings.get("unlabeled_weight", .3))
@@ -69,4 +69,4 @@ class TriRelay(nn.Module):
         terms["branch"] = torch.stack(branches).mean()
         terms["reconstruction"] = reconstruction_loss(output["reconstruction"], batch, hidden)
         total = terms["classification"]+settings.get("direct", .2)*terms["direct"]+settings.get("branch", .1)*terms["branch"]+settings.get("reconstruction", .05)*terms["reconstruction"]
-        return total, terms
+        return (total, terms, output) if return_output else (total, terms)

@@ -158,7 +158,7 @@ class GeoFactor(nn.Module):
         return {"logits": logits, "direct": unary, "pair": pair, "factor": factor,
                 "reconstruction": self.reconstruction(residue, properties)}
 
-    def compute_loss(self, batch, settings):
+    def compute_loss(self, batch, settings, return_output=False):
         view, hidden = training_views(batch, settings.get("modality_dropout", .1), settings.get("mask_ratio", .15))
         output = self(view)
         loss = lambda x: observed_label_loss(x, batch["y"], self.statistics, settings.get("unlabeled_weight", .3))
@@ -166,4 +166,4 @@ class GeoFactor(nn.Module):
                  "reconstruction": reconstruction_loss(output["reconstruction"], batch, hidden),
                  "factor": output["pair"].square().mean()+output["factor"].square().sum()/max(1, output["factor"].numel())}
         total = terms["classification"]+settings.get("direct", .2)*terms["direct"]+settings.get("reconstruction", .05)*terms["reconstruction"]+settings.get("factor", .001)*terms["factor"]
-        return total, terms
+        return (total, terms, output) if return_output else (total, terms)

@@ -13,8 +13,9 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from .metrics import evaluate_metrics, fit_global_threshold, fit_label_thresholds
+from .metrics import evaluate_metrics, evaluate_groups, format_epoch, fit_global_threshold, fit_label_thresholds
 from .multimodal import MultimodalData, MultimodalPeptides, collate_multimodal
+from .research_layers import observed_label_loss
 from .trainer import seed_everything, write_json
 
 
@@ -47,15 +48,23 @@ def autocast_context(device, precision="fp32"):
 
 
 @torch.inference_mode()
-def predict_loader(model, loader, device, precision="fp32"):
+def predict_loader(model, loader, device, precision="fp32", loss_settings=None):
     model.eval()
     targets, probabilities = [], []
+    loss_total, rows = 0., 0
     for batch in loader:
+        moved = to_device(batch, device)
         with autocast_context(device, precision):
-            output = model(to_device(batch, device))
+            output = model(moved)
+            if loss_settings is not None:
+                loss = observed_label_loss(output["logits"], moved["y"], model.statistics,
+                                           loss_settings.get("unlabeled_weight", .3))
+                loss_total += float(loss)*len(batch["y"])
+                rows += len(batch["y"])
         targets.append(batch["y"].numpy())
         probabilities.append(output["logits"].float().sigmoid().cpu().numpy())
-    return np.concatenate(targets), np.concatenate(probabilities)
+    result = np.concatenate(targets), np.concatenate(probabilities)
+    return (*result, loss_total/rows) if loss_settings is not None else result
 
 
 def metrics(y, probabilities, statistics, threshold=.5):
@@ -143,8 +152,6 @@ def train(config, name, resume=None):
         generator.set_state(checkpoint["loader_rng"])
         if device.type == "cuda" and checkpoint["cuda_rng"] is not None:
             torch.cuda.set_rng_state(checkpoint["cuda_rng"], device)
-        if start>settings["epochs"]:
-            raise ValueError("--epochs must exceed the resumed epoch")
     git = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True)
     status = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True)
     params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -158,7 +165,9 @@ def train(config, name, resume=None):
                 "dataset": source.statistics["dataset"], "cohort": source.statistics["cohort"],
                 "label_semantics": "Observed annotations; 0 is unannotated, not experimentally confirmed negative",
                 "statistics_train_rows": source.statistics["train_rows"],
-                "resume": str(resume) if resume else None, "diagnostic_subset": diagnostic}
+                "resume": str(resume) if resume else None, "diagnostic_subset": diagnostic,
+                "monitor_threshold": .5, "train_metrics_scope": "online_augmented_changing_weights",
+                "validation_loss_scope": "main_classification_clean_eval; no stochastic auxiliary reconstruction"}
     write_json(run/"metadata.json", metadata)
     static = {"model_name": config["model_name"], "model_args": args, "config": config, "statistics": source.statistics,
               "labels": source.data.labels, "track": source.data.track, "encoder": datasets[0].meta, "planned_epochs": planned_epochs}
@@ -166,10 +175,20 @@ def train(config, name, resume=None):
         torch.cuda.reset_peak_memory_stats(device)
     started = time.perf_counter()
     elapsed_before = checkpoint.get("elapsed_seconds", 0) if checkpoint else 0
-    for epoch in range(start, settings["epochs"]+1):
+    peak_memory = (checkpoint.get("peak_cuda_memory_bytes", 0) or 0) if checkpoint else 0
+    validation_groups = source.groups(datasets[1].indices, source.data.y[datasets[1].indices])
+    epoch = checkpoint["epoch"] if checkpoint else 0
+    # A crash after the final last.pt but before results.json needs finalization,
+    # not an extra optimizer epoch or a restarted early-stopping counter.
+    terminal_resume = checkpoint is not None and (start>settings["epochs"] or
+                        (settings["patience"] and stale>=settings["patience"]))
+    for epoch in (() if terminal_resume else range(start, settings["epochs"]+1)):
         model.train()
         totals, count, skipped = {}, 0, 0
         epoch_start = time.perf_counter()
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
+        online_targets, online_probabilities = [], []
         loss_settings = dict(config["loss"])
         ramp = min(1, epoch/max(1, settings.get("aux_warmup_epochs", 5)))
         for key in ("direct", "branch", "reconstruction", "prototype", "diversity", "balance", "factor"):
@@ -179,7 +198,7 @@ def train(config, name, resume=None):
         for batch_index, batch in enumerate(loaders[0]):
             batch = to_device(batch, device)
             with autocast_context(device, precision):
-                loss, components = model.compute_loss(batch, loss_settings)
+                loss, components, output = model.compute_loss(batch, loss_settings, return_output=True)
             if not torch.isfinite(loss):
                 raise FloatingPointError("Nonfinite research loss")
             group_size = min(accumulation, len(loaders[0])-(batch_index//accumulation)*accumulation)
@@ -195,13 +214,20 @@ def train(config, name, resume=None):
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
             n = len(batch["y"])
+            online_targets.append(batch["y"].detach().cpu().numpy())
+            online_probabilities.append(output["logits"].detach().float().sigmoid().cpu().numpy())
+            del output
             for key, value in {"total": loss, **components}.items():
                 totals[key] = totals.get(key, 0)+float(value.detach())*n
             count += n
             if settings.get("max_steps") and global_step>=settings["max_steps"]:
                 break
-        y, probabilities = predict_loader(model, loaders[1], device, precision)
+        train_report = metrics(np.concatenate(online_targets), np.concatenate(online_probabilities), source.statistics)
+        del online_targets, online_probabilities
+        y, probabilities, validation_loss = predict_loader(model, loaders[1], device, precision, config["loss"])
         report = metrics(y, probabilities, source.statistics)
+        groups = evaluate_groups(y, probabilities, validation_groups, .5, source.statistics["labels"]["support"],
+                                 source.statistics["function_projection"])
         if report["macro_ap"] is None:
             raise ValueError("No positive Validation labels for checkpoint selection")
         key = (report["macro_ap"], report["micro_ap"])
@@ -211,11 +237,17 @@ def train(config, name, resume=None):
             torch.save({**static, "model_state": best_state, "best_epoch": best_epoch}, run/"best.pt")
         else:
             stale += 1
-        history = {"epoch": epoch, "losses": {k: v/count for k, v in totals.items()}, "lr": optimizer.param_groups[0]["lr"],
+        epoch_peak = torch.cuda.max_memory_allocated(device) if device.type=="cuda" else None
+        peak_memory = max(peak_memory, epoch_peak or 0)
+        history = {"epoch": epoch, "losses": {k: v/count for k, v in totals.items()}, "loss_settings": loss_settings,
+                   "lr": optimizer.param_groups[0]["lr"],
                    "global_step": global_step, "skipped_amp_updates": skipped,
-                   "validation": report, "seconds": time.perf_counter()-epoch_start}
-        with (run/"history.jsonl").open("a", encoding="utf-8") as f:
-            f.write(json.dumps(history, allow_nan=False)+"\n")
+                   "train": train_report, "train_rows": count, "train_metrics_scope": "online_augmented_changing_weights",
+                   "validation": report, "validation_loss": validation_loss,
+                   "validation_loss_scope": "main_classification_clean_eval; no stochastic auxiliary reconstruction",
+                   "validation_rows": len(y), "validation_groups": groups, "monitor_threshold": .5,
+                   "best_macro_ap": best_key[0], "best_micro_ap": best_key[1], "best_epoch": best_epoch,
+                   "early_stopping_count": stale, "peak_cuda_memory_bytes": epoch_peak}
         scheduler.step()
         numpy_rng = np.random.get_state()
         torch.save({**static, "model_state": model.state_dict(), "optimizer_state": optimizer.state_dict(),
@@ -225,23 +257,36 @@ def train(config, name, resume=None):
                     "python_rng": random.getstate(), "numpy_rng": (numpy_rng[0], numpy_rng[1].tolist(), *numpy_rng[2:]),
                     "torch_rng": torch.get_rng_state(), "loader_rng": generator.get_state(),
                     "cuda_rng": torch.cuda.get_rng_state(device) if device.type=="cuda" else None,
-                    "elapsed_seconds": elapsed_before+time.perf_counter()-started}, run/"last.pt")
-        print(f"{config['model_name']} epoch={epoch} loss={totals['total']/count:.6f} val_macro_ap={key[0]:.6f}", flush=True)
+                    "elapsed_seconds": elapsed_before+time.perf_counter()-started,
+                    "peak_cuda_memory_bytes": peak_memory if device.type=="cuda" else None}, run/"last.pt")
+        history.update(seconds=time.perf_counter()-epoch_start, elapsed_seconds=elapsed_before+time.perf_counter()-started)
+        with (run/"history.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps(history, allow_nan=False)+"\n")
+        print(format_epoch(config["model_name"], source.data.track, settings["seed"], settings["epochs"], history, settings["patience"]), flush=True)
         if settings["patience"] and stale>=settings["patience"]:
             break
         if settings.get("max_steps") and global_step>=settings["max_steps"]:
             break
     model.load_state_dict(best_state)
-    y, probabilities = predict_loader(model, loaders[1], device, precision)
+    y, probabilities, validation_loss = predict_loader(model, loaders[1], device, precision, config["loss"])
     threshold = fit_label_thresholds(y, probabilities) if settings.get("threshold_strategy", "global")=="per_label" else fit_global_threshold(y, probabilities)
     torch.save({**static, "model_state": best_state, "best_epoch": best_epoch, "threshold": threshold}, run/"best.pt")
+    if device.type=="cuda":
+        peak_memory = max(peak_memory, torch.cuda.max_memory_allocated(device))
+    if terminal_resume:
+        torch.save({**checkpoint, **static, "elapsed_seconds": elapsed_before+time.perf_counter()-started}, run/"last.pt")
     result = {"model": config["model_name"], "task": source.data.track, "seed": settings["seed"],
               "best_epoch": best_epoch, "epochs_completed": epoch, "threshold": threshold, "threshold_fit_split": "val",
               "global_step": global_step, "precision": precision, "accumulation_steps": accumulation,
               "threshold_strategy": settings.get("threshold_strategy", "global"), "trainable_parameters": params,
               "elapsed_seconds": elapsed_before+time.perf_counter()-started,
-              "peak_cuda_memory_bytes": torch.cuda.max_memory_allocated(device) if device.type=="cuda" else None,
+              "peak_cuda_memory_bytes": peak_memory if device.type=="cuda" else None,
               "diagnostic_subset": diagnostic, "validation": metrics(y, probabilities, source.statistics, threshold),
+              "validation_loss": validation_loss, "validation_loss_scope": "main_classification_clean_eval",
+              "validation_groups": evaluate_groups(y, probabilities, validation_groups, threshold,
+                  source.statistics["labels"]["support"], source.statistics["function_projection"]),
+              "labels": source.data.labels, "monitor_threshold": .5,
+              "final_metrics_scope": "best_checkpoint_with_validation_fitted_threshold",
               "annotation_based_metrics": True,
               "checkpoint": str(run/"best.pt")}
     write_json(run/"results.json", result)
@@ -350,6 +395,7 @@ def predict_sequences(checkpoint_path, sequences, device="cpu"):
 def summarize_results(runs, split="val"):
     """Plain JSON comparison. Never selects a model or threshold from Test."""
     from collections import defaultdict
+    from .experiments import scalar_metrics, aggregate, metric_aliases
     buckets = defaultdict(list)
     for directory in runs:
         directory = Path(directory)
@@ -357,7 +403,7 @@ def summarize_results(runs, split="val"):
         result = json.loads((directory/"results.json").read_text(encoding="utf-8"))
         if result.get("diagnostic_subset"):
             raise ValueError(f"Diagnostic subset is not a formal comparison: {directory}")
-        score = result["validation"] if split=="val" else json.loads((directory/"test.json").read_text(encoding="utf-8"))["metrics"]
+        score = metric_aliases(result["validation"] if split=="val" else json.loads((directory/"test.json").read_text(encoding="utf-8"))["metrics"])
         config = metadata["config"]
         protocol = {"model": metadata["model"], "task": metadata["task"], "encoder": {key: metadata["encoder"][key] for key in ("name", "resolved_revision")},
                     "dataset": metadata["dataset"], "cohort": metadata["cohort"], "model_settings": config["model"],
@@ -366,19 +412,6 @@ def summarize_results(runs, split="val"):
         buckets[json.dumps(protocol, sort_keys=True)].append({"run": str(directory), "seed": metadata["seed"], "metrics": score,
             "trainable_parameters": result["trainable_parameters"], "elapsed_seconds": result["elapsed_seconds"],
             "peak_cuda_memory_bytes": result["peak_cuda_memory_bytes"]})
-    def scalar_metrics(mapping, prefix=""):
-        values = {}
-        for key, value in mapping.items():
-            name = prefix+key
-            if isinstance(value, dict):
-                values.update(scalar_metrics(value, name+"."))
-            elif isinstance(value, (int, float)):
-                values[name] = value
-        return values
-    def aggregate(values):
-        present = [v for v in values if v is not None]
-        return {"mean": float(np.mean(present)), "std": float(np.std(present, ddof=1)) if len(present)>1 else 0.,
-                "available_seeds": len(present)} if present else None
     summary = []
     for protocol, records in buckets.items():
         if len({r["seed"] for r in records}) != len(records):
@@ -387,7 +420,8 @@ def summarize_results(runs, split="val"):
         names = sorted(set().union(*(s.keys() for s in scalars)))
         score_summary = {name: aggregate([s.get(name) for s in scalars]) for name in names}
         per_label = {key: [aggregate([record["metrics"][key][j] for record in records]) for j in range(len(records[0]["metrics"][key]))]
-                     for key in ("label_ap", "label_f1", "label_mcc", "label_auroc", "label_positive_support")}
+                     for key in ("label_ap", "label_f1", "label_mcc", "label_auroc", "label_positive_support",
+                                 "label_precision", "label_recall", "label_sensitivity", "label_specificity")}
         summary.append({"protocol": json.loads(protocol), "split": split, "seeds": [r["seed"] for r in records],
                         "metrics": score_summary, "per_label": per_label,
                         "resources": {key: aggregate([r[key] for r in records]) for key in ("trainable_parameters", "elapsed_seconds", "peak_cuda_memory_bytes")},

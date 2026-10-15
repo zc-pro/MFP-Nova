@@ -1,6 +1,6 @@
 # MFP-Nova
 
-独立、轻量的治疗肽多标签识别科研框架。当前完成数据接入和最小训练链路，尚未开展真实 GPU 性能实验。技术蓝图用于参考已验证的算法思想；所有核心代码独立编写。
+独立的治疗肽多标签识别科研项目。已实现序列对照与 TriRelay、GeoFactor、ProtoRoute 三套多模态模型，并完成 RTX 5070 上六组 seed=42 正式训练。当前完善逐轮指标和分批五 Seed 实验；所有核心代码独立编写。
 
 ## 本地数据与任务
 
@@ -220,7 +220,7 @@ git push origin main
 
 V100 的 SSH 密码在本机终端提示中输入。本机与 RTX 的私有 GitHub 仓库 HTTPS 认证各自完成：优先使用已有 Git Credential Manager/浏览器登录；终端需要 HTTPS 凭据时使用 GitHub token，不使用 GitHub 账户密码。凭据不放入 clone URL、脚本、配置或 Git 仓库。现有本机 GitHub 登录无需重新设置。
 
-两台服务器的安装命令见上面的安装章节：V100 项目位于 `~/wuzhencheng/projects/MFP-Nova`，独立 Conda 环境 `MFP-Nova` 已完成克隆和安装；RTX 项目位于 `D:\Data\ChatGPT\mfp\MFP-Nova`，环境位于 `D:\App\Code\Anaconda\envs\MFP-Nova`。RTX 已完成 ESM-35M/650M 特征提取及 major15/fine39 单 seed 序列模型训练。三套新模型本轮在本地实现，没有自动部署到服务器或启动正式 GPU 训练。
+两台服务器的安装命令见上面的安装章节。RTX 项目位于 `D:\Data\ChatGPT\mfp\MFP-Nova`，环境位于 `D:\App\Code\Anaconda\envs\MFP-Nova`，已完成 ESM-35M/650M 特征提取、序列模型及三套多模态模型的 seed=42 正式训练。当前继续在本机开发、RTX 执行分批五 Seed 训练；暂不操作 V100。
 
 对于 V100，可在本机 PowerShell 登录：
 
@@ -246,6 +246,104 @@ git pull --ff-only
 
 ## 三套完整研究模型
 
+### 快速使用：RTX 5070 分批五 Seed
+
+固定 Seed 为 **42、101、202、303、404**，三模型 × 两任务共 30 组。已有 seed=42 六组正式结果直接复用，新增 24 组保持 **ESM-650M、FP32、batch 64、无梯度累积**，沿用现有架构、Loss、学习率计划、100 epoch 上限和 patience=15。仅使用 Train/Validation，不启动 Test；不根据阶段性排名修改 Seed 或协议。
+
+在 RTX 无 MFP 训练进程运行时执行 `git pull --ff-only`，然后在项目根目录 `D:\Data\ChatGPT\mfp\MFP-Nova` 的已激活 `MFP-Nova` PowerShell 中使用以下命令。已有 editable 安装无需重装依赖。本机用于开发与整理结果，不执行正式 GPU 训练。
+
+```powershell
+# A. 直接训练一组；完成后会被批量脚本识别并跳过
+python -m mfp_nova.cli train --model trirelay --task major15 --esm 650m --seed 101 --device cuda:0 --precision fp32 --batch-size 64 --name trirelay_major15_esm650m_seed101_rtx5070_fp32_b64
+
+# B. 查看 30 组的状态与剩余计划；不加载 checkpoint、不启动训练
+.\scripts\run_multiseed.ps1 -DryRun
+
+# C. 每次只执行下一组（默认就是 MaxRuns=1），完成后返回终端
+.\scripts\run_multiseed.ps1 -MaxRuns 1
+
+# D. 本次最多连续执行三组
+.\scripts\run_multiseed.ps1 -MaxRuns 3
+
+# E. 仅处理某个模型
+.\scripts\run_multiseed.ps1 -Model trirelay -MaxRuns 1
+
+# F. 仅处理指定模型、任务和固定清单中的 Seed
+.\scripts\run_multiseed.ps1 -Model protoroute -Task fine39 -Seeds "101,202" -MaxRuns 1
+
+# G. 用户明确选择时才连续执行全部剩余任务；不能与 MaxRuns 同时指定
+.\scripts\run_multiseed.ps1 -All
+
+# H. 中断后重新执行相同命令：有 last.pt 自动恢复，无 checkpoint 从新运行目录重做
+.\scripts\run_multiseed.ps1 -Model trirelay -Task major15 -Seeds "101" -MaxRuns 1
+
+# I. 查看完成数、当前剩余、实际检测到的运行进程、最佳 Epoch 和主要指标
+python -m mfp_nova.experiments plan
+
+# J. 随时查看阶段性 mean ± 样本 std；30 组完成后同命令给出五 Seed 对比
+python -m mfp_nova.experiments summary --task major15
+python -m mfp_nova.experiments summary --task fine39
+
+# 同一个 Seed 的三模型对比
+python -m mfp_nova.experiments summary --seeds "42"
+
+# 逐标签、可靠分组查询，以及完整机器可读汇总
+python -m mfp_nova.experiments summary --task fine39 --label antiinflammatory
+python -m mfp_nova.experiments summary --task fine39 --group structure_missing
+python -m mfp_nova.experiments summary --json
+```
+
+需要直接指定 checkpoint 时，使用新名称，保留原运行目录：
+
+```powershell
+$resumeName = "trirelay_major15_esm650m_seed101_rtx5070_fp32_b64_resume_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+python -m mfp_nova.cli train --model trirelay --task major15 --esm 650m --seed 101 --device cuda:0 --precision fp32 --batch-size 64 --resume runs/trirelay_major15_esm650m_seed101_rtx5070_fp32_b64/last.pt --name $resumeName
+```
+
+脚本兼容 Windows PowerShell 5.1 / PowerShell 7，Seed 用逗号分隔字符串。若当前执行策略阻止 ps1，可单次启动，不需要管理员权限或永久修改系统策略：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\run_multiseed.ps1 -DryRun
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\run_multiseed.ps1 -MaxRuns 1
+```
+
+使用已有 Python 环境，脚本也支持 `-Python "D:\App\Code\Anaconda\envs\MFP-Nova\python.exe"` 和 `-Device cuda:0`。默认前台、单 GPU 串行；不创建后台服务、计划任务或开机启动，不关闭程序或更改驱动、电源设置。办公/游戏时间由用户安排，建议训练与大型 3D 游戏错开；一组结束后脚本默认退出。Ctrl+C 中断后从最近完成 epoch 的 last.pt 继续，当前 epoch 可能重做；不伪装为精确 batch 中途续接。
+
+状态来自 results.json、metadata.json、last.pt 和当前进程命令：`completed` 已完成，`running` 是检测到对应 --name 的存活进程，`unfinished_checkpoint` / `unfinished_no_checkpoint` 表示未观察到对应运行进程但存在未完成目录，`not_started` 尚未开始，`incompatible` 与固定协议不符。没有 --name 或无法识别的外部进程不作猜测。恢复损坏的 checkpoint 时 Trainer 明确报错，脚本停止，不悄悄从头覆盖；无 checkpoint 的旧尝试保留，新尝试使用 retry 名称。一次脚本串行运行；不提供跨多个终端抢启动的调度/锁服务。
+
+汇总仅纳入已完成且属于本协议的结果，每个 Seed 只计一次，不按 Validation 分数挑选重复运行。阶段性显示实际 n/5；n=1 时 std=NA/null，只有五个固定 Seed 都完成才标记 five-seed。缺失或不可计算指标单独报告有效 Seed 数。旧 seed=42 原始结果不回写：传统五项可从已记录的同义指标精确映射，旧文件没有的 Sample-F1、历史 Train 指标和分组不会补造。本机只有其 results.json 时显示 results-only 说明，不能声称已经核对未回传的完整 metadata/checkpoint。
+
+### 每 Epoch 指标与记录口径
+
+三套研究模型的终端每轮输出四行：身份与固定监控阈值、Train、Val、Extra。Train/Val 都显示 Loss、Acc、Prec、Cov、AT、AF、Macro/Micro-AP、Macro/Micro-F1、MFP-F1；Extra 显示 Val Head/Medium/Tail AP、LR、epoch/累计耗时、显存峰值、当前最佳 epoch 与早停计数。
+
+传统五项定义为样本均值，设真实标签集合为 Y、预测集合为 P：
+
+| 终端名 | JSON 字段 | 定义 |
+|---|---|---|
+| Acc | accuracy / sample_jaccard | 平均 \|Y∩P\| / \|Y∪P\| |
+| Prec | precision / sample_precision | 平均 \|Y∩P\| / \|P\| |
+| Cov | coverage / sample_recall | 平均 \|Y∩P\| / \|Y\| |
+| AT | absolute_true / exact_match | 平均 1[Y=P] |
+| AF | absolute_false / hamming_loss | 平均标签位错误率；越低越好 |
+
+Acc 不等于 Exact Match，Cov 不等于 Coverage Error 或 Micro-Recall。零分母沿用 sklearn 的 zero_division=0；不可用 AP/AUROC/MCC 等为 null，原因放在 `undefined_metrics`，其中标签索引对应 metadata.labels。各组无样本时 metrics=null、reason=no_samples；未知结构置信度不归为低质量，置信度区间也不等价于跨来源校准后的结构可靠性。
+
+`history.jsonl` 每行保存 `train`、`validation` 的全部全局/逐标签指标，包含 AP/AUROC、Macro/Micro P/R/F1、Sample-F1、MCC、Sensitivity/Specificity、固定 Train 分层 AP，以及独立功能映射下的 MFP P/R/F1、真实/预测数、TP/FP/FN、真实多功能样本的功能集合指标。`validation_groups` 保存有无结构、D/L、长度、独立单/多功能、已知来源/置信度分组的样本数和指标；全局逐标签数组按 metadata.labels 顺序，不在每组重复保存。Head/Medium/Tail 是 Train 支持度定义的标签分层，并记录参与 AP 的标签数，不伪装成互斥的样本分组。
+
+`losses` / `loss_settings` 记录 Train 总/分项 Loss 和实际 warmup 后权重；另有 `validation_loss`、LR、epoch/累计秒数、每轮峰值 GPU 显存、best_epoch / best_macro_ap / best_micro_ap、early_stopping_count 和 AMP 跳步。JSONL 可以按 epoch 直接读取绘图，无需另建日志系统：
+
+```powershell
+Get-Content runs/trirelay_major15_esm650m_seed101_rtx5070_fp32_b64/history.jsonl |
+    ForEach-Object { $_ | ConvertFrom-Json } |
+    Select-Object epoch, @{Name='TrainLoss';Expression={$_.losses.total}}, validation_loss,
+        @{Name='ValMacroAP';Expression={$_.validation.macro_ap}}, best_epoch, early_stopping_count
+```
+
+Train 在线指标复用当轮带增强、Dropout、持续更新权重的前向预测，不额外完整前向，不能当成某个固定模型的完整 Train 评估。Val 每轮在 eval 模式完整前向一次，同一批预测供全局和 CPU 分组统计使用。Val Loss 是相同主分类准则在干净输入下的均值，**不包含随机遮蔽重建等辅助目标**，不能与 Train 总 Loss 直接做数值高低比较。
+
+Epoch 阈值固定 0.5，不逐轮调阈值；checkpoint 仍按 Val Macro-AP → Micro-AP → 更早 epoch。训练结束才对最佳模型按现有 Val Jaccard 策略拟合最终阈值，results.json / best.pt 保持兼容，新增最终 `validation_groups`。固定阈值的历史指标与最终拟合阈值指标明确区分；旧 seed=42 不补造历史，Test 不参与本轮。
+
 实现与数学口径集中在 [下一代模型技术说明](docs/MFP-Next-Generation-Architecture.md#8-已实现架构与统一实验协议)。三模型共享原始明确骨架数据、固定标签顺序、Train-only 统计和评价协议，保持独立架构。默认 ESM-650M、隐藏维 256、8 heads；major15/fine39 的下游参数分别约为 TriRelay 35.20/35.21M、GeoFactor 31.00/31.01M、ProtoRoute 32.33/32.45M，不含冻结 ESM。
 
 在项目根目录、已激活环境中运行：
@@ -264,6 +362,10 @@ mfp-nova train --model protoroute --task major15 --seed 42 --device cuda:0
 mfp-nova train --model trirelay --task fine39 --esm 35m --seed 42 --device cuda:0 --name trirelay_fine39_esm35m_seed42
 mfp-nova train --model trirelay --task fine39 --esm 650m --seed 42 --device cuda:0 --name trirelay_fine39_esm650m_seed42
 ```
+
+RTX 5070 已完成三模型 × major15/fine39 的 ESM-650M、seed 42 全量训练，统一使用 `--batch-size 64 --precision fp32`。Validation Macro-AP 分别为 TriRelay 0.540361/0.518048、GeoFactor 0.528925/0.506050、ProtoRoute 0.537225/0.514995。完整指标和资源成本见 [实际验证与训练记录](docs/MFP-Real-Data-GPU-Validation.md#7-rtx-5070-首轮全量训练与下一步对照)。目前尚无三模型的 35M 全量结果。
+
+下一步按下面的五 Seed 协议验证稳定性，35M 架构对照暂后置；不因中途排名改变模型、Loss、数据、Seed 或优化设置。
 
 不修改迁移包、划分或已有缓存。运行新模型需要同一编码器的 Train/Val 残基缓存。训练仅读取 Train/Val，Test 独立执行；只有尚无 Test 缓存时才执行对应提取：
 
@@ -295,22 +397,16 @@ mfp-nova predict --checkpoint runs/trirelay_major15_seed42/best.pt --inputs samp
 
 已有 `collate_multimodal` 导出的 checkpoint 标准化张量 NPZ 也可直接输入。只有序列时可用 `--sequences peptides.txt`，会在线调用冻结 ESM，并将结构/理化标为缺失；输出明确标记 `sequence_and_stereochemistry_only`，不假装已利用完整模态，也不自动推断末端修饰。
 
-每个 run 记录配置、seed、Git commit/dirty、数据和编码器标识、参数量、最佳 epoch、Loss 分项、LR、耗时及 CUDA 峰值分配显存。正式多 seed 可在训练端依次运行，例如 PowerShell：
-
-```powershell
-foreach ($experimentSeed in 42, 123, 456) {
-    mfp-nova train --model trirelay --task major15 --seed $experimentSeed --device cuda:0
-}
-```
+每个 run 记录配置、seed、Git commit/dirty、数据和编码器标识、参数量、最佳 epoch、完整指标、Loss 分项、LR、耗时及 CUDA 峰值分配显存。分批多 Seed 运行方式见下方快速使用，不自动占用整晚或全天。
 
 汇总不启动训练、不按 Test 选模型。各 run 的 Test 文件统一命名 `test.json`：
 
 ```bash
-mfp-nova summarize --runs runs/trirelay_major15_seed42 runs/trirelay_major15_seed123 runs/trirelay_major15_seed456 --split val --output results/trirelay_major15_val.json
+mfp-nova summarize --runs runs/trirelay_major15_seed42 runs/trirelay_major15_seed101 runs/trirelay_major15_seed202 --split val --output results/trirelay_major15_val.json
 mfp-nova summarize --runs runs/trirelay_major15_seed42 runs/geofactor_major15_seed42 runs/protoroute_major15_seed42 --split test --output results/major15_test_comparison.json
 ```
 
-同任务/编码器/数据队列/配置协议的 seed 汇总 mean ± 样本 std；不同模型、任务、消融、Loss、阈值协议分别列出，不混合平均。只有一个 seed 时 std=0，并记录有效 seed 数。支持传统指标、核心指标、逐标签指标及参数/显存/时间；诊断子集不进入正式汇总。
+同任务/编码器/数据队列/配置协议的 seed 汇总 mean ± 样本 std；不同模型、任务、消融、Loss、阈值协议分别列出，不混合平均。只有一个 seed 时 std=NA/null，并记录有效 seed 数。支持传统指标、核心指标、逐标签指标及参数/显存/时间；诊断子集不进入正式汇总。
 
 必要的 CPU 流程检查可用 `--device cpu --limit-samples 16 --epochs 1 --name <unique_name>`，需要实际缓存；结果标记为 diagnostic subset，不能报告为正式性能。本轮相关检查见 `tests/test_research.py`：两标签空间、缺结构、D 输入、padding、多原型、关键模块梯度、训练恢复、输入预处理和独立推理。未自动占用服务器 GPU，正式多 seed、GPU 资源与模型增益尚待实验。
 
