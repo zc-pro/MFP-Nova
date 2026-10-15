@@ -1,0 +1,45 @@
+model_name: trirelay
+data:
+  root: data/therapeutic_2025
+  track: major15
+  features: features/esm2_650m
+  augment: false
+encoder:
+  name: facebook/esm2_t33_650M_UR50D
+  revision: main
+  max_length: 80
+  batch_size: 8
+model:
+  dim: 256
+  heads: 8
+  dropout: 0.15
+  sequence_depth: 4
+  geometry_depth: 4
+  property_depth: 2
+  interaction_depth: 3
+  feedback: true
+  relations: true
+  high_order: true
+  quality_aware: true
+  property_geometry: true
+loss:
+  unlabeled_weight: 0.3
+  direct: 0.2
+  branch: 0.1
+  reconstruction: 0.05
+  modality_dropout: 0.1
+  mask_ratio: 0.15
+train:
+  device: cpu
+  seed: 42
+  epochs: 100
+  batch_size: 32
+  learning_rate: 0.0002
+  weight_decay: 0.001
+  patience: 15
+  warmup_epochs: 5
+  aux_warmup_epochs: 5
+  gradient_clip: 5
+  num_workers: 0
+  threshold_strategy: global
+  output: runs

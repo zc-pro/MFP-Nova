@@ -220,7 +220,7 @@ git push origin main
 
 V100 的 SSH 密码在本机终端提示中输入。本机与 RTX 的私有 GitHub 仓库 HTTPS 认证各自完成：优先使用已有 Git Credential Manager/浏览器登录；终端需要 HTTPS 凭据时使用 GitHub token，不使用 GitHub 账户密码。凭据不放入 clone URL、脚本、配置或 Git 仓库。现有本机 GitHub 登录无需重新设置。
 
-两台服务器的安装命令见上面的安装章节：V100 项目位于 `~/wuzhencheng/projects/MFP-Nova`，独立 Conda 环境 `MFP-Nova` 已完成克隆和安装；RTX 项目位于 `D:\Data\ChatGPT\mfp\MFP-Nova`，环境位于 `D:\App\Code\Anaconda\envs\MFP-Nova`，依赖和项目已安装，GPU 小矩阵乘法已通过。两台服务器均尚未完成真实 ESM 提取与正式 GPU 训练。
+两台服务器的安装命令见上面的安装章节：V100 项目位于 `~/wuzhencheng/projects/MFP-Nova`，独立 Conda 环境 `MFP-Nova` 已完成克隆和安装；RTX 项目位于 `D:\Data\ChatGPT\mfp\MFP-Nova`，环境位于 `D:\App\Code\Anaconda\envs\MFP-Nova`。RTX 已完成 ESM-35M/650M 特征提取及 major15/fine39 单 seed 序列模型训练。三套新模型本轮在本地实现，没有自动部署到服务器或启动正式 GPU 训练。
 
 对于 V100，可在本机 PowerShell 登录：
 
@@ -240,6 +240,116 @@ git pull --ff-only
 
 正式实验可 `git checkout <COMMIT>`。本机提交代码并推送后，两台训练端拉取；共享 V100 按服务器使用约定取得资源。不同运行使用独立名称，不在运行中的目录更新源码，不覆盖既有实验产物。
 
-当前提供数据与框架基础，不宣称模型效果。下一步是 GPU 端特征提取和单 seed 基线，随后针对局部分支/损失做单变量对照；结构、D/PTM 表示和标签专属学习均留待有依据的后续研究。
+当前保留序列对照，并实现 TriRelay、GeoFactor、ProtoRoute 三套完整多模态模型；结构、D/PTM、标签关系和长尾机制均有实际代码。下一步在现有明确骨架队列上正式训练和消融，模型性能以独立 Test 和多 seed 实验为准。
 
 本地已用 Python 3.12、PyTorch 2.8.0 CPU 完成 6 项针对性测试：真实数据对齐/划分、padding 不变性、ASL 数值和梯度、指标语义、冻结编码器接口与缓存写入、两 epoch 合成训练和 checkpoint/评价加载。编码器接口测试使用替身，不下载预训练权重；这些检查不代表真实 ESM 特征或 GPU 性能验证。pytest 临时文件配置在 `.pytest_tmp`，避免本机系统临时目录的权限问题。
+
+## 三套完整研究模型
+
+实现与数学口径集中在 [下一代模型技术说明](docs/MFP-Next-Generation-Architecture.md#8-已实现架构与统一实验协议)。三模型共享原始明确骨架数据、固定标签顺序、Train-only 统计和评价协议，保持独立架构。默认 ESM-650M、隐藏维 256、8 heads；major15/fine39 的下游参数分别约为 TriRelay 35.20/35.21M、GeoFactor 31.00/31.01M、ProtoRoute 32.33/32.45M，不含冻结 ESM。
+
+在项目根目录、已激活环境中运行：
+
+```bash
+mfp-nova train --model trirelay --task major15 --seed 42 --device cuda:0
+mfp-nova train --model geofactor --task major15 --seed 42 --device cuda:0
+mfp-nova train --model protoroute --task major15 --seed 42 --device cuda:0
+```
+
+把 `--task` 改为 `fine39` 即可切换任务。也可使用 `python -m mfp_nova.cli`。模型独立配置分别为 `configs/trirelay.yaml`、`configs/geofactor.yaml`、`configs/protoroute.yaml`；默认输出 `runs/<model>_<task>_seed<seed>/`，已存在时明确拒绝覆盖。
+
+`--esm 35m` 同时选择 35M 编码器和其缓存；`--feature-root` 可覆盖缓存路径。两种编码器比较请使用不同 `--name`：
+
+```bash
+mfp-nova train --model trirelay --task fine39 --esm 35m --seed 42 --device cuda:0 --name trirelay_fine39_esm35m_seed42
+mfp-nova train --model trirelay --task fine39 --esm 650m --seed 42 --device cuda:0 --name trirelay_fine39_esm650m_seed42
+```
+
+不修改迁移包、划分或已有缓存。运行新模型需要同一编码器的 Train/Val 残基缓存。训练仅读取 Train/Val，Test 独立执行；只有尚无 Test 缓存时才执行对应提取：
+
+```bash
+mfp-nova features --esm 650m --device cuda:0 --splits test
+mfp-nova evaluate --checkpoint runs/trirelay_major15_seed42/best.pt --split test --device cuda:0 --output runs/trirelay_major15_seed42/test.json --predictions runs/trirelay_major15_seed42/test_predictions.npz
+```
+
+评价默认使用 checkpoint 的缓存路径和 batch，可用 `--feature-root`、`--data-root`、`--batch-size` 覆盖。输出完整指标与结构/来源/置信度/D/长度/单多功能分组。缺可信实验结构来源时不生成虚假实验结构指标。
+
+恢复使用 `last.pt`，输出到新目录；`best.pt` 含最佳模型和 Validation 固定阈值，供评价/推理：
+
+```bash
+mfp-nova train --model trirelay --task major15 --resume runs/trirelay_major15_seed42/last.pt --epochs 100 --device cuda:0 --name trirelay_major15_seed42_continued
+mfp-nova train --model trirelay --task major15 --ablate feedback high_order --device cuda:0 --name trirelay_major15_no_feedback_no_high_order_seed42
+mfp-nova train --model geofactor --task major15 --ablate high_order --device cuda:0 --name geofactor_major15_pairwise_seed42
+mfp-nova train --model protoroute --task major15 --ablate shared_prototypes --device cuda:0 --name protoroute_major15_no_shared_prototypes_seed42
+```
+
+恢复保留原模型、统计、Loss、seed 和训练协议，仅调整执行位置、设备、总 epoch 与 worker；它继续原来的学习率计划，不偷偷重启计划。其他消融开关见各模型配置；Loss 权重可在现有配置直接修改并用不同实验名称识别。`--threshold-strategy per_label` 是单独的 Val 逐标签阈值实验，主协议保持 global。
+
+完整多模态独立推理使用 NPZ 原始数值输入，预处理从 checkpoint 自动加载：
+
+```bash
+mfp-nova predict --checkpoint runs/trirelay_major15_seed42/best.pt --inputs samples.npz --device cuda:0 --output predictions.json
+```
+
+`samples.npz` 的必需字段：`esm[B,L,D]`、`aa[B,L]`、`d[B,L]`、`mask[B,L]`、`phys_raw[B,515]`。AA 的 1–20 顺序为 `ACDEFGHIKLMNPQRSTVWY`，0 为 padding；未观察描述符用 NaN。可选字段：`coords[B,L,3]`（Å）、`struct_mask`、`angles_degrees[B,L,3]`、`dssp`（0–8，未知 -1）、`ASA_A2`、`RSA_unclipped`、`confidence_verified`（仅已识别来源的 0–100 置信度）、`struct_global_raw[B,25]`、字符串 `chemical_tokens[B,T]`/`residue_chem_tokens[B,L]`、`structure_source_known[B]`。列顺序遵循迁移包 schema；缺结构必须不设置有效结构 mask。接口为 `multimodal.prepare_inputs` → 模型 `forward`，不需要目标标签。
+
+已有 `collate_multimodal` 导出的 checkpoint 标准化张量 NPZ 也可直接输入。只有序列时可用 `--sequences peptides.txt`，会在线调用冻结 ESM，并将结构/理化标为缺失；输出明确标记 `sequence_and_stereochemistry_only`，不假装已利用完整模态，也不自动推断末端修饰。
+
+每个 run 记录配置、seed、Git commit/dirty、数据和编码器标识、参数量、最佳 epoch、Loss 分项、LR、耗时及 CUDA 峰值分配显存。正式多 seed 可在训练端依次运行，例如 PowerShell：
+
+```powershell
+foreach ($experimentSeed in 42, 123, 456) {
+    mfp-nova train --model trirelay --task major15 --seed $experimentSeed --device cuda:0
+}
+```
+
+汇总不启动训练、不按 Test 选模型。各 run 的 Test 文件统一命名 `test.json`：
+
+```bash
+mfp-nova summarize --runs runs/trirelay_major15_seed42 runs/trirelay_major15_seed123 runs/trirelay_major15_seed456 --split val --output results/trirelay_major15_val.json
+mfp-nova summarize --runs runs/trirelay_major15_seed42 runs/geofactor_major15_seed42 runs/protoroute_major15_seed42 --split test --output results/major15_test_comparison.json
+```
+
+同任务/编码器/数据队列/配置协议的 seed 汇总 mean ± 样本 std；不同模型、任务、消融、Loss、阈值协议分别列出，不混合平均。只有一个 seed 时 std=0，并记录有效 seed 数。支持传统指标、核心指标、逐标签指标及参数/显存/时间；诊断子集不进入正式汇总。
+
+必要的 CPU 流程检查可用 `--device cpu --limit-samples 16 --epochs 1 --name <unique_name>`，需要实际缓存；结果标记为 diagnostic subset，不能报告为正式性能。本轮相关检查见 `tests/test_research.py`：两标签空间、缺结构、D 输入、padding、多原型、关键模块梯度、训练恢复、输入预处理和独立推理。未自动占用服务器 GPU，正式多 seed、GPU 资源与模型增益尚待实验。
+
+## 两台服务器的真实缓存 GPU 短训练
+
+实际训练在 RTX 5070 和 V100 上运行，本机只做开发与 CPU 检查。先查看 `nvidia-smi`，确认当前项目没有运行中的训练后再 `git pull --ff-only`；仅使用已分配且空闲的 GPU。更新代码后 `python -m pip install --no-deps -e .`，不升级服务器 Torch/CUDA。
+
+先检查所选 GPU 和缓存元数据，不训练、不下载、不重建特征：
+
+```bash
+mfp-nova gpu-check --esm 650m --device cuda:0 --inspect-only
+```
+
+RTX 5070（已激活 `MFP-Nova`，项目 `D:\Data\ChatGPT\mfp\MFP-Nova`）：
+
+```bash
+mfp-nova gpu-check --esm 650m --device cuda:0 --tasks major15 fine39 --batch-sizes 2 4 8 16 --precisions fp32 fp16 --steps 32 --samples 128 --output runs/gpucheck_rtx5070_20261015
+```
+
+V100（密码 SSH 登录后，`conda activate MFP-Nova`，项目 `~/wuzhencheng/projects/MFP-Nova`）：
+
+```bash
+mfp-nova gpu-check --esm 650m --device cuda:0 --tasks major15 fine39 --batch-sizes 2 4 8 16 --precisions fp32 fp16 --steps 32 --samples 128 --output runs/gpucheck_v100_20261015
+```
+
+V100 不用 BF16。若空闲且已分配的 GPU 不是 0，替换 `--device`；设置了 `CUDA_VISIBLE_DEVICES` 时遵循其映射。该命令检查其他计算进程，遇到占用时退出，不抢占、不终止他人任务。RTX 不使用 SSH。
+
+默认依次执行 TriRelay → GeoFactor → ProtoRoute，每模型完成 major15/fine39。复用服务器已有真实缓存，读出 ID/骨架与缓存 row_id 对齐；选取结构存在/缺失、非甘氨酸 D、不同长度及标签覆盖的少量原始样本。模型深度、专家、反馈及因子全部保留。诊断优化子集不会重拟合缩小标签先验：标准化、长尾分层、高阶关系和原型容量继续来自完整原始 Train。
+
+每个 batch/精度先 warmup，再计时 3 step，记录参数量、峰值 allocated/reserved 显存、前向/反向/optimizer 时间、含数据准备的 step 时间与吞吐、按代表 batch 粗估的训练 epoch 时间、padding/缺结构输出和关键模块梯度/更新。OOM 只记录失败批量并停止继续增大该精度，不删模块。Profiler 的代表 batch 和计时开销会影响估计，不能替代正式整轮吞吐。
+
+随后使用成功且关键模块有梯度更新的实测配置，运行 32 个 optimizer step、Diagnostic Validation、checkpoint，再恢复 2 step，并从恢复的最佳模型独立计算 Diagnostic Validation。小样本指标不用于性能结论。`summary.json`、各模型任务的 `*_profile.json`、`history.jsonl` 和 checkpoint 都保存在指定的新目录；目录存在则拒绝覆盖。不会读取 Test 缓存或启动正式多 seed。
+
+若 V100 尚无当前 MFP 数据包/ESM 缓存，先通过 UU 回传到本机，再用密码认证 SFTP/SCP 转移现有文件；也可指定 `--data-root`、`--feature-root` 指向当前项目的数据和缓存。不能把旧项目缓存、随机特征当成这次真实验证。35M 可用 `--esm 35m` 单独执行，使用不同输出目录。
+
+正式训练入口另支持：
+
+```bash
+mfp-nova train --model trirelay --task major15 --precision fp16 --batch-size 8 --accumulation-steps 2 --device cuda:0 --name trirelay_major15_esm650m_fp16_seed42
+```
+
+`--max-steps` 是诊断上限，按 optimizer 尝试步计数，AMP 跳过的更新单独记录；含此参数的 run 不进入正式比较。恢复诊断运行可增大 `--max-steps`，从下一轮开始继续，不承诺部分 epoch 内逐样本精确续接。最终 batch/精度应依据两台服务器各自实测选择，不把另一台或本机的结果代入。
