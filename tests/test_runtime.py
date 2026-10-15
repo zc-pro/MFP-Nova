@@ -46,3 +46,15 @@ def test_bounded_accumulated_training_retains_train_priors(tmp_path):
     assert continued["global_step"]==3
     with pytest.raises(ValueError, match="CUDA"):
         autocast_context("cpu", "fp16")
+
+
+def test_busy_gpu_returns_before_cuda_context(tmp_path, monkeypatch):
+    from mfp_nova import runtime_check
+    environment = {"gpu": {"other_compute_processes": [["uuid", "99999", "python", "4000"]]},
+                   "cuda_available": True, "caches": {"train": {}, "val": {}}}
+    monkeypatch.setattr(runtime_check, "inspect", lambda *args: environment)
+    selected = []
+    monkeypatch.setattr(torch.cuda, "set_device", lambda device: selected.append(device))
+    with pytest.raises(RuntimeError, match="other compute jobs"):
+        runtime_check.run(["trirelay"], ["major15"], "features", "cuda:3", tmp_path/"gpu")
+    assert selected==[] and not (tmp_path/"gpu").exists()

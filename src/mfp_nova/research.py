@@ -75,8 +75,10 @@ def validate_cache(dataset, config, reference=None):
 
 def train(config, name, resume=None):
     settings = config["train"]
-    seed_everything(settings["seed"])
     device = torch.device(settings["device"])
+    if device.type=="cuda":
+        torch.cuda.set_device(device)
+    seed_everything(settings["seed"])
     checkpoint = torch.load(resume, map_location="cpu", weights_only=True) if resume else None
     if checkpoint is not None:
         # Resume preserves the trained model/priors/protocol; only execution controls change.

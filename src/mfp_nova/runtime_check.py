@@ -81,6 +81,7 @@ def check_inputs(model, samples, device, precision):
 
 
 def profile(config, source, dataset, device, batches, precisions, measured_steps=3):
+    torch.cuda.set_device(torch.device(device))
     seed_everything(config["train"]["seed"])
     arguments = {"input_dim": dataset.meta["input_dim"], "num_labels": len(source.data.labels),
                  "vocab_size": len(source.statistics["chemical_vocab"])+2, "statistics": source.statistics["labels"], **config["model"]}
@@ -172,6 +173,7 @@ def run(models, tasks, feature_root, device, output, esm="650m", batches=(2, 4, 
         raise RuntimeError("Current Python has no usable CUDA; activate the server MFP-Nova environment")
     if any(value is None for value in environment["caches"].values()):
         raise FileNotFoundError("Real Train/Val ESM cache missing; transfer the existing cache, do not substitute random features")
+    torch.cuda.set_device(torch.device(device))
     root = Path(output)
     root.mkdir(parents=True, exist_ok=False)
     write_json(root/"environment.json", environment)
