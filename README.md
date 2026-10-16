@@ -315,6 +315,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\run_multiseed.
 
 ### 每 Epoch 指标与记录口径
 
+完整定义、计算公式、取值范围、零分母处理及指标间联系见 [指标说明书](docs/MFP-Metrics-Guide.md)。
+
 三套研究模型的终端每轮输出四行：身份与固定监控阈值、Train、Val、Extra。Train/Val 都显示 Loss、Acc、Prec、Cov、AT、AF、Macro/Micro-AP、Macro/Micro-F1、MFP-F1；Extra 显示 Val Head/Medium/Tail AP、LR、epoch/累计耗时、显存峰值、当前最佳 epoch 与早停计数。
 
 传统五项定义为样本均值，设真实标签集合为 Y、预测集合为 P：
