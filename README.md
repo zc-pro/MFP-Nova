@@ -490,3 +490,20 @@ $candidate = "trirelay_major15_reconstruction_decay_seed42_$tag"
 保持原最大 epoch 与学习率日程，以便和既有 seed42 比较。新日程单列协议，不进入原固定五 Seed 汇总。必须同时观察 Macro-AP、MFP P/R/F1、五指标及逐标签变化；单 Seed 的小幅上涨不能宣称稳定提升。本轮旧 Test 已被分析，不作为候选选择依据。
 
 修改前原文件保存在仓库外 `D:\Data\Code\MFP-Nova-originals\20261018-generalization`：`src/mfp_nova/{research,metrics,cli}.py`，原 commit 为 `8c7eac346b4ba6f23a24701e58941941b06b0e48`。需要恢复时，在无运行任务且保存后续工作后，将对应原文件复制回同名路径；其余正常开发历史由 Git 管理。本轮未修改三个模型架构文件。
+
+2026-10-18 已完成真实 Val 决策实验：TriRelay / major15 / seed42，共 8,534 条，输入为 `val_predictions_seed42_20261018_114244.zip`。本地输出位于 `runs/analysis/decision_major15_seed42_20261018/study`，完整候选在 `candidates.csv`，原阈值与默认权衡候选在 `results.json`，零 Jaccard 下降预算的补充诊断在 `strict_jaccard_crossfit.json`。
+
+| 指标 | 原阈值 0.68 | 全局阈值 0.61 | 主阈值 0.68 / 其他独立功能阈值 0.69 |
+| --- | ---: | ---: | ---: |
+| Macro-AP | 0.540361 | 0.540361 | 0.540361 |
+| MFP Precision | 0.471551 | 0.442645 | 0.480932 |
+| MFP Recall | 0.543909 | 0.619452 | 0.535883 |
+| MFP-F1 | 0.505152 | 0.516332 | 0.506923 |
+| Accuracy / Jaccard | 0.616967 | 0.612756 | 0.617346 |
+| Precision | 0.665093 | 0.655133 | 0.666171 |
+| Coverage | 0.690116 | 0.712635 | 0.687749 |
+| Absolute True | 0.498242 | 0.474807 | 0.500469 |
+| Absolute False（低为好） | 0.064065 | 0.067659 | 0.063604 |
+| Micro-F1 | 0.643729 | 0.639770 | 0.644454 |
+
+默认 0.005 Jaccard 预算选择全局 0.61；MFP 真阳性增加 160、假阳性增加 361，AT 下降 2.34 个百分点，不建议直接替换主协议。零下降预算选择功能阈值 0.69；减少 66 个假阳性，同时损失 17 个真阳性，MFP-F1 仅提高 0.177 个百分点，保留为低成本候选，不能宣称稳定提升。后者另存 `decision_balanced.json`，未修改默认阈值或已有权重。两种预算各自的两个簇分组拟合均选择相同参数，因此各自交叉拟合汇总恰好等于全 Val 拟合结果；这不消除既有 checkpoint / 原阈值全 Val 选择的偏差。此结果仅涉及单模型、单任务、单 Seed；重建日程的真实训练比较仍未执行，下一步只运行上方一个候选训练，先不扩展到 30 组。
