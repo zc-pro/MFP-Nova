@@ -34,6 +34,9 @@ def main(argv=None):
             sub.add_argument("--precision", choices=("fp32", "fp16", "bf16"))
             sub.add_argument("--accumulation-steps", type=int)
             sub.add_argument("--max-steps", type=int, help="Bounded diagnostic optimizer steps; no Test access")
+            sub.add_argument("--reconstruction-decay", nargs=2, type=int, metavar=("START", "END"),
+                             help="Research models: cosine-decay reconstruction weight after warmup")
+            sub.add_argument("--reconstruction-floor", type=float, help="Fraction of initial reconstruction weight retained after decay (default 0.2)")
             sub.add_argument("--name")
             sub.add_argument("--seed", type=int)
             sub.add_argument("--epochs", type=int)
@@ -48,6 +51,7 @@ def main(argv=None):
     evaluate.add_argument("--output", required=True)
     evaluate.add_argument("--batch-size", type=int)
     evaluate.add_argument("--predictions", help="Optional aligned sample probabilities in NPZ format")
+    evaluate.add_argument("--decision", help="Validation-fitted research-model decision.json; raw ranking scores stay unchanged")
     predict = commands.add_parser("predict")
     predict.add_argument("--checkpoint", required=True)
     prediction_input = predict.add_mutually_exclusive_group(required=True)
@@ -55,6 +59,7 @@ def main(argv=None):
     prediction_input.add_argument("--inputs", help="Research model: preprocessed multimodal NPZ")
     predict.add_argument("--device", default="cpu")
     predict.add_argument("--output", required=True)
+    predict.add_argument("--decision", help="Validation-fitted research-model decision.json")
     summarize = commands.add_parser("summarize")
     summarize.add_argument("--runs", nargs="+", required=True, help="Research run directories")
     summarize.add_argument("--split", choices=("val", "test"), default="val")
@@ -115,11 +120,13 @@ def main(argv=None):
                     config["train"]["threshold_strategy"] = args.threshold_strategy
                 if args.limit_samples:
                     config["train"]["limit_samples"] = args.limit_samples
-                for key in ("precision", "accumulation_steps", "max_steps"):
+                for key in ("precision", "accumulation_steps", "max_steps", "reconstruction_decay", "reconstruction_floor"):
                     value = getattr(args, key)
                     if value is not None:
                         config["train"][key] = value
             else:
+                if args.reconstruction_decay is not None or args.reconstruction_floor is not None:
+                    raise ValueError("Reconstruction scheduling is a research-model option")
                 from .trainer import train
             for key in ("seed", "epochs"):
                 value = getattr(args, key)
@@ -147,8 +154,13 @@ def main(argv=None):
             from .inference import evaluate
         feature_root = args.feature_root or checkpoint["config"]["data"]["features"]
         batch_size = args.batch_size or checkpoint["config"]["train"].get("batch_size", 128)
+        extra = {}
+        if args.decision:
+            if "model_name" not in checkpoint:
+                raise ValueError("Function decisions are supported for research models")
+            extra['decision_path'] = args.decision
         evaluate(args.checkpoint, args.data_root, feature_root, args.split, args.device, args.output,
-                 predictions=args.predictions, batch_size=batch_size)
+                 predictions=args.predictions, batch_size=batch_size, **extra)
     elif args.command == "gpu-check":
         from .runtime_check import inspect, run
         feature_root = args.feature_root or f"features/esm2_{args.esm}"
@@ -171,16 +183,19 @@ def main(argv=None):
     else:
         if args.inputs:
             from .research import predict_inputs
-            result = predict_inputs(args.checkpoint, args.inputs, args.device)
+            result = predict_inputs(args.checkpoint, args.inputs, args.device, decision_path=args.decision)
         else:
             import torch
             checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
             if "model_name" in checkpoint:
                 from .research import predict_sequences
             else:
+                if args.decision:
+                    raise ValueError("Function decisions are supported for research models")
                 from .inference import predict_sequences
             sequences = [line.strip() for line in Path(args.sequences).read_text(encoding="utf-8").splitlines() if line.strip()]
-            result = predict_sequences(args.checkpoint, sequences, args.device)
+            extra = {'decision_path': args.decision} if args.decision else {}
+            result = predict_sequences(args.checkpoint, sequences, args.device, **extra)
         destination = Path(args.output)
         destination.parent.mkdir(parents=True, exist_ok=True)
         with destination.open("x", encoding="utf-8") as f:

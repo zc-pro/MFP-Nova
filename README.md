@@ -451,3 +451,42 @@ mfp-nova train --model trirelay --task major15 --precision fp16 --batch-size 8 -
 ```
 
 `--max-steps` 是诊断上限，按 optimizer 尝试步计数，AMP 跳过的更新单独记录；含此参数的 run 不进入正式比较。恢复诊断运行可增大 `--max-steps`，从下一轮开始继续，不承诺部分 epoch 内逐样本精确续接。最终 batch/精度应依据两台服务器各自实测选择，不把另一台或本机的结果代入。
+
+## 下一阶段候选：辅助目标日程与独立功能决策
+
+以下为尚待真实 Validation 对比的可选算法，默认训练和历史 checkpoint 行为不变。保留三个完整模型，不新增架构层数。既有 `data.augment=false` 关闭迁移包增强样本，但训练内的模态 dropout、理化/结构特征 masking 与重建仍由 Loss 配置控制；本次不重复增加这些扰动，也不修改序列、D/L 或结构真值。
+
+训练候选仅对重建辅助目标增加 warmup 后余弦衰减：`--reconstruction-decay 5 20 --reconstruction-floor 0.2` 表示第 5 轮保持原权重，第 20 轮降至原权重的 20%，之后保持。原重建权重 0.05 最终为 0.01；其他辅助目标、分类 Loss、架构、checkpoint 选模规则不变。动机是训练后期 Val 平台与较高辅助 Loss 占比；占比不能证明梯度冲突，收益必须实测。实际权重记录在每轮 `loss_settings` 中，恢复训练读取原 checkpoint 日程。
+
+先仅导出已有 TriRelay / major15 / seed42 的完整 Val 概率（服务器旧版已经支持此命令，无需为了导出更新正在运行的项目）：
+
+```powershell
+Set-Location "D:\Data\ChatGPT\mfp\MFP-Nova"
+$mfpPython = "D:\App\Code\Anaconda\envs\MFP-Nova\python.exe"
+$baseline = "runs/trirelay_major15_esm650m_seed42_rtx5070_fp32_b64_20261015_105336"
+$tag = Get-Date -Format "yyyyMMdd_HHmmss"
+& $mfpPython -m mfp_nova.cli evaluate --checkpoint "$baseline/best.pt" --split val --device cuda:0 --batch-size 64 --output "$baseline/val_decision_$tag.json" --predictions "$baseline/val_predictions_$tag.npz"
+```
+
+回传新生成的 JSON 和 NPZ 即可，不必传模型、ESM 缓存或 Test。NPZ 含原始概率、目标、标签顺序、row_id 和已保存阈值。独立功能决策实验可在本机 CPU 上运行：
+
+```powershell
+.\.venv\Scripts\python.exe -m mfp_nova.decisions --predictions "实际回传的val_predictions文件.npz" --task major15 --output "runs/analysis/decision_major15_seed42_唯一名称"
+```
+
+实验比较原保存阈值、全局阈值扫描，以及保持最强活跃独立功能、提高其他功能证据要求的决策。沿用独立功能映射，抗菌亚型和泛抗微生物不重复计数。所有规则保留原概率，所以 AP/AUROC 不变，可能改变 MFP-F1 和传统五指标。输出 `candidates.csv`、`results.json`、`decision.json`；候选默认允许 Jaccard 下降最多 0.005（0.5 个百分点），在此范围最大化 MFP-F1，同时报告 Pareto 候选；这只是显式权衡参数，不是已证明的最优设置。完整 Val 拟合结果有选择乐观性；按簇划分的两折决策交叉拟合仅检查额外决策搜索，checkpoint 和原阈值已经用全 Val 选择，因此也不是独立泛化证据。默认不采用候选，不使用 Test 调参。
+
+保留候选后，研究模型的 `evaluate` / `predict` 可通过 `--decision <decision.json>` 读取其决策；不改原 checkpoint。无该参数时完全沿用原阈值。
+
+需要单 Seed 训练对比时，在 RTX 5070 空闲且更新代码后单独运行（不使用原五 Seed 批量脚本）：
+
+```powershell
+$tag = Get-Date -Format "yyyyMMdd_HHmmss"
+$candidate = "trirelay_major15_reconstruction_decay_seed42_$tag"
+& $mfpPython -m mfp_nova.cli train --model trirelay --task major15 --esm 650m --seed 42 --device cuda:0 --precision fp32 --batch-size 64 --reconstruction-decay 5 20 --reconstruction-floor 0.2 --name $candidate
+& $mfpPython -m mfp_nova.cli summarize --runs $baseline "runs/$candidate" --split val --output "runs/analysis/reconstruction_comparison_$tag.json"
+```
+
+保持原最大 epoch 与学习率日程，以便和既有 seed42 比较。新日程单列协议，不进入原固定五 Seed 汇总。必须同时观察 Macro-AP、MFP P/R/F1、五指标及逐标签变化；单 Seed 的小幅上涨不能宣称稳定提升。本轮旧 Test 已被分析，不作为候选选择依据。
+
+修改前原文件保存在仓库外 `D:\Data\Code\MFP-Nova-originals\20261018-generalization`：`src/mfp_nova/{research,metrics,cli}.py`，原 commit 为 `8c7eac346b4ba6f23a24701e58941941b06b0e48`。需要恢复时，在无运行任务且保存后续工作后，将对应原文件复制回同名路径；其余正常开发历史由 Git 管理。本轮未修改三个模型架构文件。

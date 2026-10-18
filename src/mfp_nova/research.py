@@ -82,6 +82,25 @@ def validate_cache(dataset, config, reference=None):
         raise ValueError("Split feature definitions differ")
 
 
+def epoch_loss_settings(config, epoch):
+    """Original warmup, with optional reconstruction-only cosine decay."""
+    settings = config['train']
+    loss = dict(config['loss'])
+    ramp = min(1, epoch/max(1, settings.get('aux_warmup_epochs', 5)))
+    for key in ('direct', 'branch', 'reconstruction', 'prototype', 'diversity', 'balance', 'factor'):
+        if key in loss:
+            loss[key] *= ramp
+    decay = settings.get('reconstruction_decay')
+    if decay is not None:
+        start, end = decay
+        floor = settings.get('reconstruction_floor', .2)
+        if end <= start or start < settings.get('aux_warmup_epochs', 5) or not 0 <= floor <= 1:
+            raise ValueError('Reconstruction decay requires warmup <= start < end and floor in [0, 1]')
+        progress = min(1, max(0, (epoch-start)/(end-start)))
+        loss['reconstruction'] *= floor+(1-floor)*.5*(1+math.cos(math.pi*progress))
+    return loss
+
+
 def train(config, name, resume=None):
     settings = config["train"]
     device = torch.device(settings["device"])
@@ -189,11 +208,7 @@ def train(config, name, resume=None):
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
         online_targets, online_probabilities = [], []
-        loss_settings = dict(config["loss"])
-        ramp = min(1, epoch/max(1, settings.get("aux_warmup_epochs", 5)))
-        for key in ("direct", "branch", "reconstruction", "prototype", "diversity", "balance", "factor"):
-            if key in loss_settings:
-                loss_settings[key] *= ramp
+        loss_settings = epoch_loss_settings(config, epoch)
         optimizer.zero_grad(set_to_none=True)
         for batch_index, batch in enumerate(loaders[0]):
             batch = to_device(batch, device)
@@ -300,7 +315,7 @@ def load_model(path, device="cpu"):
     return model.eval(), checkpoint
 
 
-def evaluate(checkpoint_path, data_root, feature_root, split, device, output, predictions=None, batch_size=32):
+def evaluate(checkpoint_path, data_root, feature_root, split, device, output, predictions=None, batch_size=32, decision_path=None):
     model, checkpoint = load_model(checkpoint_path, device)
     source = MultimodalData(data_root, checkpoint["track"], checkpoint["statistics"])
     dataset = MultimodalPeptides(source, feature_root, split)
@@ -308,13 +323,23 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
     loader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_multimodal)
     y, probabilities = predict_loader(model, loader, device)
     threshold = checkpoint["threshold"]
+    decision, predicted = None, None
+    if decision_path:
+        from .decisions import apply_decision
+        decision = json.loads(Path(decision_path).read_text(encoding='utf-8'))
+        predicted = apply_decision(probabilities, source.data.labels, checkpoint['track'], decision)
     grouped = {}
     for name, mask in source.groups(dataset.indices, y).items():
-        grouped[name] = {"rows": int(mask.sum()), "metrics": metrics(y[mask], probabilities[mask], source.statistics, threshold) if mask.any() else None}
+        grouped[name] = {"rows": int(mask.sum()), "metrics": evaluate_metrics(
+            y[mask], probabilities[mask], threshold, source.statistics['labels']['support'],
+            source.statistics['function_projection'], None if predicted is None else predicted[mask]) if mask.any() else None}
     result = {"model": checkpoint["model_name"], "task": checkpoint["track"], "split": split, "rows": len(dataset),
               "labels": source.data.labels, "threshold": threshold, "checkpoint": str(checkpoint_path),
-              "metrics": metrics(y, probabilities, source.statistics, threshold), "groups": grouped,
+              "metrics": evaluate_metrics(y, probabilities, threshold, source.statistics['labels']['support'],
+                  source.statistics['function_projection'], predicted), "groups": grouped,
               "annotation_based_metrics": True, "experimental_structure_group": None}
+    if decision is not None:
+        result['decision'] = decision
     Path(output).parent.mkdir(parents=True, exist_ok=True)
     with Path(output).open("x", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2, allow_nan=False)
@@ -322,11 +347,12 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
         Path(predictions).parent.mkdir(parents=True, exist_ok=True)
         with Path(predictions).open("xb") as f:
             np.savez_compressed(f, row_id=source.data.rows[dataset.indices], ID=source.data.ids[dataset.indices],
-                                targets=y, probabilities=probabilities, label_names=np.array(source.data.labels), threshold=threshold)
+                                targets=y, probabilities=probabilities, label_names=np.array(source.data.labels), threshold=threshold,
+                                split=split, task=checkpoint['track'], decision_json=json.dumps(decision))
     return result
 
 
-def predict_inputs(checkpoint_path, input_path, device="cpu", batch_size=32):
+def predict_inputs(checkpoint_path, input_path, device="cpu", batch_size=32, decision_path=None):
     """Inference on portable tensor inputs exported by the shared preprocessing API.
 
     The NPZ contains batched collate_multimodal fields (no labels required). Numeric
@@ -346,17 +372,21 @@ def predict_inputs(checkpoint_path, input_path, device="cpu", batch_size=32):
         for start in range(0, len(inputs["aa"]), batch_size):
             batch = {k: v[start:start+batch_size].to(device) for k, v in inputs.items()}
             probabilities.extend(model(batch)["logits"].sigmoid().cpu().tolist())
-    return prediction_records(checkpoint, probabilities, "provided_multimodal_fields")
+    return prediction_records(checkpoint, probabilities, "provided_multimodal_fields", decision_path)
 
 
-def prediction_records(checkpoint, probabilities, scope):
+def prediction_records(checkpoint, probabilities, scope, decision_path=None):
+    predicted = np.asarray(probabilities) >= checkpoint['threshold']
+    if decision_path:
+        from .decisions import apply_decision
+        decision = json.loads(Path(decision_path).read_text(encoding='utf-8'))
+        predicted = apply_decision(probabilities, checkpoint['labels'], checkpoint['track'], decision)
     return [{"probabilities": dict(zip(checkpoint["labels"], p)), "evidence_scope": scope,
-             "predicted_labels": [label for label, value, threshold in zip(checkpoint["labels"], p,
-                                     np.broadcast_to(checkpoint["threshold"], (len(p),))) if value>=threshold]}
-            for p in probabilities]
+             "predicted_labels": [label for label, keep in zip(checkpoint['labels'], selected) if keep]}
+            for p, selected in zip(probabilities, predicted)]
 
 
-def predict_sequences(checkpoint_path, sequences, device="cpu"):
+def predict_sequences(checkpoint_path, sequences, device="cpu", decision_path=None):
     """Missing-modality inference; never fabricates structure or chemical descriptors."""
     from .encoder import FrozenEncoder
     from .multimodal import prepare_inputs
@@ -385,7 +415,7 @@ def predict_sequences(checkpoint_path, sequences, device="cpu"):
         inputs = prepare_inputs(raw, checkpoint["statistics"])
         with torch.inference_mode():
             probs = model(to_device(inputs, device))["logits"].sigmoid().cpu().tolist()
-        records = prediction_records(checkpoint, probs, "sequence_and_stereochemistry_only")
+        records = prediction_records(checkpoint, probs, "sequence_and_stereochemistry_only", decision_path)
         for s, record in zip(selected, records):
             record["sequence"] = s
         output.extend(records)

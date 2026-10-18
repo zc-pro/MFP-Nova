@@ -2,11 +2,16 @@ import numpy as np
 from sklearn.metrics import average_precision_score, f1_score, jaccard_score, precision_score, recall_score, roc_auc_score
 
 
-def evaluate_metrics(targets, probabilities, threshold=0.5, train_support=None, function_projection=None):
+def evaluate_metrics(targets, probabilities, threshold=0.5, train_support=None, function_projection=None, predicted=None):
     active = targets.sum(0) > 0
     ap = [float(average_precision_score(targets[:, c], probabilities[:, c])) if active[c] else None
           for c in range(targets.shape[1])]
-    predicted = probabilities >= threshold
+    if predicted is None:
+        predicted = probabilities >= threshold
+    else:
+        predicted = np.asarray(predicted, dtype=bool)
+        if predicted.shape != targets.shape:
+            raise ValueError("Decision labels must have the target shape")
     result = {
         "macro_ap": float(np.mean([v for v in ap if v is not None])) if active.any() else None,
         "micro_ap": float(average_precision_score(targets.ravel(), probabilities.ravel())) if active.any() else None,
@@ -110,7 +115,7 @@ def evaluate_metrics(targets, probabilities, threshold=0.5, train_support=None, 
     return result
 
 
-def evaluate_groups(targets, probabilities, groups, threshold, train_support, function_projection):
+def evaluate_groups(targets, probabilities, groups, threshold, train_support, function_projection, predicted=None):
     """CPU summaries of the same predictions; no additional model forward."""
     output = {}
     for name, mask in groups.items():
@@ -118,7 +123,8 @@ def evaluate_groups(targets, probabilities, groups, threshold, train_support, fu
         if not rows:
             output[name] = {"rows": 0, "metrics": None, "reason": "no_samples"}
             continue
-        score = evaluate_metrics(targets[mask], probabilities[mask], threshold, train_support, function_projection)
+        score = evaluate_metrics(targets[mask], probabilities[mask], threshold, train_support, function_projection,
+                                 None if predicted is None else predicted[mask])
         # Global per-label arrays live once in history; group summaries retain
         # scalars, MFP counts, and explicit undefined-statistic explanations.
         score = {k: v for k, v in score.items() if not isinstance(v, list)}
