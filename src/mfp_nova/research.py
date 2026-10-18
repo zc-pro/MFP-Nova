@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
+from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
 from .metrics import evaluate_metrics, evaluate_groups, format_epoch, fit_global_threshold, fit_label_thresholds
 from .multimodal import MultimodalData, MultimodalPeptides, collate_multimodal
@@ -101,6 +102,12 @@ def epoch_loss_settings(config, epoch):
     return loss
 
 
+def update_ema(ema, model, epoch, start_epoch, skipped):
+    """Average successful optimizer updates, never microbatches or AMP skips."""
+    if ema is not None and epoch >= start_epoch and not skipped:
+        ema.update_parameters(model)
+
+
 def train(config, name, resume=None):
     settings = config["train"]
     device = torch.device(settings["device"])
@@ -111,6 +118,8 @@ def train(config, name, resume=None):
     if checkpoint is not None:
         # Resume preserves the trained model/priors/protocol; only execution controls change.
         original = checkpoint["config"]
+        if settings.get("ema_decay") is not None and original["train"].get("ema_decay") is None:
+            raise ValueError("EMA changes the experiment; start a new training run instead of resuming a non-EMA checkpoint")
         if config["model_name"] != original["model_name"] or config["data"]["track"] != original["data"]["track"]:
             raise ValueError("Resume model/task differs from checkpoint")
         for key in ("model", "loss", "encoder"):
@@ -146,6 +155,19 @@ def train(config, name, resume=None):
     scaler = torch.amp.GradScaler("cuda", enabled=precision=="fp16", init_scale=1024.)
     planned_epochs = checkpoint.get("planned_epochs", settings["epochs"]) if checkpoint else settings["epochs"]
     warmup = settings.get("warmup_epochs", 5)
+    ema_decay = settings.get("ema_decay")
+    ema_start = settings.get("ema_start_epoch", warmup+1)
+    if ema_decay is not None and (not 0 < ema_decay < 1 or not 1 <= ema_start <= planned_epochs):
+        raise ValueError("EMA requires 0 < decay < 1 and a start epoch within the training schedule")
+    if ema_decay is None and settings.get("ema_start_epoch") is not None:
+        raise ValueError("ema_start_epoch requires ema_decay")
+    # These models use LayerNorm; buffers are Train priors/indices, not BN moments.
+    # Keep buffers copied from the online model, rather than averaging their values.
+    ema = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(ema_decay)) if ema_decay is not None else None
+    if ema is not None:
+        ema.requires_grad_(False)
+    online_best_state, online_best_key, online_best_epoch = None, (-float("inf"), -float("inf")), 0
+    best_weights = "online"
     def schedule(epoch):
         if warmup and epoch<warmup:
             return (epoch+1)/warmup
@@ -164,6 +186,12 @@ def train(config, name, resume=None):
         start = checkpoint["epoch"]+1
         best_key, best_epoch, stale = tuple(checkpoint["best_key"]), checkpoint["best_epoch"], checkpoint["stale"]
         best_state = checkpoint["best_model_state"]
+        best_weights = checkpoint.get("best_weights", "online")
+        if ema is not None:
+            ema.load_state_dict(checkpoint["ema_state"])
+            online_best_state = checkpoint["online_best_state"]
+            online_best_key = tuple(checkpoint["online_best_key"])
+            online_best_epoch = checkpoint["online_best_epoch"]
         random.setstate(checkpoint["python_rng"])
         np_state = checkpoint["numpy_rng"]
         np.random.set_state((np_state[0], np.asarray(np_state[1], dtype=np.uint32), *np_state[2:]))
@@ -225,7 +253,9 @@ def train(config, name, resume=None):
                 old_scale = scaler.get_scale()
                 scaler.step(optimizer)
                 scaler.update()
-                skipped += int(scaler.get_scale()<old_scale)
+                step_skipped = scaler.get_scale()<old_scale
+                skipped += int(step_skipped)
+                update_ema(ema, model, epoch, ema_start, step_skipped)
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
             n = len(batch["y"])
@@ -241,6 +271,21 @@ def train(config, name, resume=None):
         del online_targets, online_probabilities
         y, probabilities, validation_loss = predict_loader(model, loaders[1], device, precision, config["loss"])
         report = metrics(y, probabilities, source.statistics)
+        selected_model, validation_weights = model, "online"
+        online_report, online_loss = report, validation_loss
+        if ema is not None:
+            online_key = (report["macro_ap"], report["micro_ap"])
+            if online_key > online_best_key:
+                online_best_key, online_best_epoch = online_key, epoch
+                online_best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            validation_weights = "online_warmup"
+            if int(ema.n_averaged) > 0:
+                selected_model, validation_weights = ema.module, "ema"
+                # An extra DataLoader iterator consumes a CPU base seed, even with
+                # zero workers. Preserve it so this observation does not change Train RNG.
+                with torch.random.fork_rng(devices=[]):
+                    y, probabilities, validation_loss = predict_loader(selected_model, loaders[1], device, precision, config["loss"])
+                report = metrics(y, probabilities, source.statistics)
         groups = evaluate_groups(y, probabilities, validation_groups, .5, source.statistics["labels"]["support"],
                                  source.statistics["function_projection"])
         if report["macro_ap"] is None:
@@ -248,8 +293,9 @@ def train(config, name, resume=None):
         key = (report["macro_ap"], report["micro_ap"])
         if key>best_key:
             best_key, best_epoch, stale = key, epoch, 0
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            torch.save({**static, "model_state": best_state, "best_epoch": best_epoch}, run/"best.pt")
+            best_state = {k: v.detach().cpu().clone() for k, v in selected_model.state_dict().items()}
+            best_weights = validation_weights
+            torch.save({**static, "model_state": best_state, "best_epoch": best_epoch, "weight_source": best_weights}, run/"best.pt")
         else:
             stale += 1
         epoch_peak = torch.cuda.max_memory_allocated(device) if device.type=="cuda" else None
@@ -264,8 +310,15 @@ def train(config, name, resume=None):
                    "best_macro_ap": best_key[0], "best_micro_ap": best_key[1], "best_epoch": best_epoch,
                    "early_stopping_count": stale, "peak_cuda_memory_bytes": epoch_peak}
         scheduler.step()
+        ema_checkpoint = {}
+        if ema is not None:
+            history.update(online_validation=online_report, online_validation_loss=online_loss,
+                           validation_weights=validation_weights, ema_updates=int(ema.n_averaged),
+                           online_best_epoch=online_best_epoch)
+            ema_checkpoint = {"ema_state": ema.state_dict(), "online_best_state": online_best_state,
+                              "online_best_key": online_best_key, "online_best_epoch": online_best_epoch}
         numpy_rng = np.random.get_state()
-        torch.save({**static, "model_state": model.state_dict(), "optimizer_state": optimizer.state_dict(),
+        torch.save({**static, **ema_checkpoint, "best_weights": best_weights, "model_state": model.state_dict(), "optimizer_state": optimizer.state_dict(),
                     "scheduler_state": scheduler.state_dict(), "best_model_state": best_state,
                     "scaler_state": scaler.state_dict(), "global_step": global_step,
                     "best_key": best_key, "best_epoch": best_epoch, "epoch": epoch, "stale": stale,
@@ -278,6 +331,12 @@ def train(config, name, resume=None):
         with (run/"history.jsonl").open("a", encoding="utf-8") as f:
             f.write(json.dumps(history, allow_nan=False)+"\n")
         print(format_epoch(config["model_name"], source.data.track, settings["seed"], settings["epochs"], history, settings["patience"]), flush=True)
+        if ema is not None:
+            print(f"Weights | Val={validation_weights} EMA-updates={int(ema.n_averaged)} | OnlineVal "
+                  f"MacroAP={online_report['macro_ap']:.4f} MicroAP={online_report['micro_ap']:.4f} "
+                  f"MFP-F1={online_report['mfp_detection']['f1']:.4f} "
+                  f"Acc={online_report['accuracy']:.4f} Prec={online_report['precision']:.4f} "
+                  f"Cov={online_report['coverage']:.4f} AT={online_report['absolute_true']:.4f} AF={online_report['absolute_false']:.4f}", flush=True)
         if settings["patience"] and stale>=settings["patience"]:
             break
         if settings.get("max_steps") and global_step>=settings["max_steps"]:
@@ -285,7 +344,8 @@ def train(config, name, resume=None):
     model.load_state_dict(best_state)
     y, probabilities, validation_loss = predict_loader(model, loaders[1], device, precision, config["loss"])
     threshold = fit_label_thresholds(y, probabilities) if settings.get("threshold_strategy", "global")=="per_label" else fit_global_threshold(y, probabilities)
-    torch.save({**static, "model_state": best_state, "best_epoch": best_epoch, "threshold": threshold}, run/"best.pt")
+    torch.save({**static, "model_state": best_state, "best_epoch": best_epoch, "threshold": threshold,
+                "weight_source": best_weights}, run/"best.pt")
     if device.type=="cuda":
         peak_memory = max(peak_memory, torch.cuda.max_memory_allocated(device))
     if terminal_resume:
@@ -304,6 +364,23 @@ def train(config, name, resume=None):
               "final_metrics_scope": "best_checkpoint_with_validation_fitted_threshold",
               "annotation_based_metrics": True,
               "checkpoint": str(run/"best.pt")}
+    if ema is not None:
+        model.load_state_dict(online_best_state)
+        raw_y, raw_p, raw_loss = predict_loader(model, loaders[1], device, precision, config["loss"])
+        raw_threshold = fit_label_thresholds(raw_y, raw_p) if settings.get("threshold_strategy", "global")=="per_label" else fit_global_threshold(raw_y, raw_p)
+        torch.save({**static, "model_state": online_best_state, "best_epoch": online_best_epoch,
+                    "threshold": raw_threshold, "weight_source": "online"}, run/"online_best.pt")
+        result.update(weight_source=best_weights, ema_updates=int(ema.n_averaged),
+                      online_reference={"best_epoch": online_best_epoch, "threshold": raw_threshold,
+                          "threshold_fit_split": "val", "validation_loss": raw_loss,
+                          "validation": metrics(raw_y, raw_p, source.statistics, raw_threshold),
+                          "validation_groups": evaluate_groups(raw_y, raw_p, validation_groups, raw_threshold,
+                              source.statistics['labels']['support'], source.statistics['function_projection']),
+                          "checkpoint": str(run/"online_best.pt"),
+                          "scope": "same optimizer trajectory; stopping follows primary Validation, not an independent baseline training"})
+        result['elapsed_seconds'] = elapsed_before+time.perf_counter()-started
+        if device.type == "cuda":
+            result['peak_cuda_memory_bytes'] = max(peak_memory, torch.cuda.max_memory_allocated(device))
     write_json(run/"results.json", result)
     return result
 
@@ -335,6 +412,7 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
             source.statistics['function_projection'], None if predicted is None else predicted[mask]) if mask.any() else None}
     result = {"model": checkpoint["model_name"], "task": checkpoint["track"], "split": split, "rows": len(dataset),
               "labels": source.data.labels, "threshold": threshold, "checkpoint": str(checkpoint_path),
+              "weight_source": checkpoint.get("weight_source", "online"),
               "metrics": evaluate_metrics(y, probabilities, threshold, source.statistics['labels']['support'],
                   source.statistics['function_projection'], predicted), "groups": grouped,
               "annotation_based_metrics": True, "experimental_structure_group": None}

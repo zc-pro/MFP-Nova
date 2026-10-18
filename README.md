@@ -526,3 +526,37 @@ $candidate = "trirelay_major15_reconstruction_decay_seed42_$tag"
 以上两组各自使用 Val 拟合阈值（原 0.68、候选 0.71），不能拿训练日志的固定 0.50 阈值指标替代最终结果。MFP 真阳性 1,152→1,151，假阳性 1,291→1,432，未改善多功能识别。候选训练后期 online Train Macro-AP 到 0.9697，Val 约 0.52，分类训练 Loss 仍下降而干净 Val 分类 Loss 回升；降低总 Loss 没有消除泛化平台。总体不采用此日程，不扩大实验。部分 AP 上升（drug_delivery +4.61、antiparasitic +4.14 个百分点），但 cell_communication −5.36、growth_regeneration −4.46；major15 的 Tail-AP 仅对应 thrombolytic 一个标签，本次亦下降。
 
 归因边界：原代码 commit `0cbf428`、候选 `88c1ba9`，期间增加指标记录与恢复逻辑；所查 TriRelay 前向与 Loss 公式未变。第 5 轮尚未开始衰减，Val Macro-AP 已为 0.457015 vs 0.464487；现有 seed 设置未启用强制确定性，差异原因未定位，不能把全程差异严格归因于日程。原实验 35 轮/78.66 分钟，候选 25 轮/58.77 分钟，耗时减少来自更早停止，不是吞吐提升证明。结果与图保存于本地 `runs/analysis/reconstruction_decay_seed42_20261018/`。本轮未使用 Test；保留原训练默认值与权重，结束这两个候选的首轮验证，尚无足够证据替换原正式方案。
+
+## 下一项候选：同次训练的 EMA 权重对照
+
+重建日程实验停止扩展后，新增可选 EMA（指数移动平均）候选。研究假设是对更新中的参数做平均可能缓解 Val 波动，尚未证明适用于本数据。它不修改模型架构、Loss、数据增强、学习率或默认配置，不与重建衰减叠加。使用 [PyTorch AveragedModel / EMA](https://docs.pytorch.org/docs/2.8/optim.html#weight-averaging-swa-and-ema)，第一次成功更新复制在线权重，后续按 `ema = decay * ema + (1-decay) * online` 更新。现有模型的 buffers 是先验和索引，直接同步，不做平均；无 BatchNorm 统计重估。EMA 不参与反向，也不产生伪标签。
+
+固定首个实验：TriRelay / major15 / seed42 / FP32 / batch64，`decay=0.999`，第 6 轮起启用；原重建权重仍为 0.05。EMA 只计成功 optimizer step，不计梯度累积微批次和 AMP 跳步。在每轮同时评价在线权重与 EMA，额外的验证迭代隔离 CPU RNG，避免 DataLoader 基础种子消耗干扰后续训练。CPU 测试检查在线轨迹与无 EMA 时一致，不宣称 GPU 位级重现。
+
+- 常规 `Val` 行：预热期为在线权重，EMA 启用后为平均权重。仍按 Macro-AP → Micro-AP → 更早 epoch 选模与早停。
+- 新增 `Weights / OnlineVal` 行：标记当前权重来源、EMA 更新次数，以及在线权重的 AP、MFP-F1 和五指标。
+- `best.pt`：主分支最佳权重，`weight_source` 明确标注 `ema` 或 `online_warmup`；`online_best.pt`：同次训练在线权重的独立最佳 checkpoint。两者分别在 Val 拟合阈值，均可用原 evaluate/predict 入口。
+- `last.pt`：保存在线模型、优化器、EMA 状态、两组最佳状态与 RNG；恢复继续同一日程。不能在旧非 EMA checkpoint 上临时添加 EMA 并伪装成同一实验。
+- `results.json` 的顶层 `validation` 为主分支，`online_reference.validation` 为在线对照；`history.jsonl` 保存逐轮两组指标。这个对照共享训练轨迹和主分支停止时刻，不能当作独立训练的第二个 Seed。
+
+额外开销为一份平均模型、一次每步参数平均以及 EMA 启用后每轮额外一次 Val 前向，无额外训练反向。RTX 5070 的实际显存和时长尚待实测。新实验自动与原五 Seed 协议分开，原结果不覆盖。
+
+RTX 5070 空闲、无运行中训练时，在 PowerShell 执行一次：
+
+```powershell
+Set-Location "D:\Data\ChatGPT\mfp\MFP-Nova"
+git pull --ff-only
+if ($LASTEXITCODE -ne 0) { throw "Git 更新失败" }
+$mfpPython = "D:\App\Code\Anaconda\envs\MFP-Nova\python.exe"
+$tag = Get-Date -Format "yyyyMMdd_HHmmss"
+$run = "trirelay_major15_ema_seed42_$tag"
+& $mfpPython -m mfp_nova.cli train --model trirelay --task major15 --esm 650m --seed 42 --device cuda:0 --precision fp32 --batch-size 64 --ema-decay 0.999 --ema-start-epoch 6 --name $run
+if ($LASTEXITCODE -ne 0) { throw "训练失败，请保留输出；可使用新目录从 last.pt 恢复" }
+$zip = Join-Path ([Environment]::GetFolderPath("Desktop")) "ema_results_$tag.zip"
+Compress-Archive -LiteralPath "runs/$run/metadata.json","runs/$run/results.json","runs/$run/history.jsonl" -DestinationPath $zip
+Write-Host "回传：$zip"
+```
+
+先比较该单次训练内两组最佳 checkpoint 的 AP、MFP P/R/F1、五指标、逐标签及分组结果，再参考历史 seed42；不以单一指标的小幅变化决定采用，不使用 Test 调参。本轮修改前原始 `research.py`、`cli.py` 已保存在仓库外 `D:\Data\Code\MFP-Nova-originals\20261018-ema`，对应 commit `2830405`；恢复方式与前节相同。模型架构文件未修改。
+
+本地相关 8 项检查通过：成功步平均/跳步/先验 buffer、在线训练轨迹、完整 epoch 边界恢复、两组权重独立评价、终止后恢复、三模型原有恢复接口及固定五 Seed 隔离等。真实 ESM-650M 缓存另完成完整 35,196,329 参数 TriRelay 的两步 CPU 诊断，生成 `best.pt` 与 `online_best.pt`，EMA 更新次数为 2；仅验证接口，未作为性能证据。该诊断为了覆盖平均操作从第 1 轮启用 EMA，正式候选仍从第 6 轮开始。RTX 5070 正式收益与资源开销尚未验证。

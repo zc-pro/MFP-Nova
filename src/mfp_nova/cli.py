@@ -37,6 +37,8 @@ def main(argv=None):
             sub.add_argument("--reconstruction-decay", nargs=2, type=int, metavar=("START", "END"),
                              help="Research models: cosine-decay reconstruction weight after warmup")
             sub.add_argument("--reconstruction-floor", type=float, help="Fraction of initial reconstruction weight retained after decay (default 0.2)")
+            sub.add_argument("--ema-decay", type=float, help="Optional parameter EMA; evaluate online and averaged weights in the same run")
+            sub.add_argument("--ema-start-epoch", type=int, help="First EMA update epoch (default: after LR warmup)")
             sub.add_argument("--name")
             sub.add_argument("--seed", type=int)
             sub.add_argument("--epochs", type=int)
@@ -120,11 +122,13 @@ def main(argv=None):
                     config["train"]["threshold_strategy"] = args.threshold_strategy
                 if args.limit_samples:
                     config["train"]["limit_samples"] = args.limit_samples
-                for key in ("precision", "accumulation_steps", "max_steps", "reconstruction_decay", "reconstruction_floor"):
+                for key in ("precision", "accumulation_steps", "max_steps", "reconstruction_decay", "reconstruction_floor", "ema_decay", "ema_start_epoch"):
                     value = getattr(args, key)
                     if value is not None:
                         config["train"][key] = value
             else:
+                if args.ema_decay is not None or args.ema_start_epoch is not None:
+                    raise ValueError("EMA is a research-model option")
                 if args.reconstruction_decay is not None or args.reconstruction_floor is not None:
                     raise ValueError("Reconstruction scheduling is a research-model option")
                 from .trainer import train

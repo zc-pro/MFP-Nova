@@ -94,6 +94,8 @@ def compatibility_issues(metadata, result, directory):
             if config[key]!=expected[key]:
                 issues.append(f"{key} configuration differs from the fixed protocol")
         settings = config["train"]
+        if settings.get("ema_decay") is not None:
+            issues.append("train.ema_decay differs from the fixed protocol")
         if settings.get("reconstruction_decay") is not None:
             issues.append("train.reconstruction_decay differs from the fixed protocol")
         for key, value in {"batch_size": 64, "precision": "fp32", "accumulation_steps": 1,
