@@ -11,7 +11,8 @@ class TriRelay(nn.Module):
     def __init__(self, input_dim, num_labels, vocab_size, statistics, dim=256, heads=8,
                  dropout=.15, sequence_depth=4, geometry_depth=4, property_depth=2,
                  interaction_depth=3, feedback=True, relations=True, high_order=True,
-                 quality_aware=True, property_geometry=True):
+                 quality_aware=True, property_geometry=True, function_aux=False,
+                 function_aux_statistics=None):
         super().__init__()
         self.statistics = statistics
         self.feedback_enabled, self.relations_enabled = feedback, relations
@@ -29,6 +30,9 @@ class TriRelay(nn.Module):
         self.classifier = TailClassifier(num_labels, dim, statistics)
         self.relation_gate = nn.Linear(2*dim, 1)
         self.reconstruction = Reconstruction(dim)
+        if function_aux:
+            from .function_auxiliary import FunctionAuxiliary
+            self.function_auxiliary = FunctionAuxiliary(statistics["labels"], function_aux_statistics, dim, heads, dropout)
 
     def forward(self, batch):
         prop, pmask = self.properties(batch)
@@ -53,11 +57,15 @@ class TriRelay(nn.Module):
         direct_logits = self.classifier(direct)
         evidence_logits = self.classifier(final)
         relation_logits = self.classifier(relation)-evidence_logits
-        logits = evidence_logits+torch.sigmoid(self.relation_gate(torch.cat([final, relation], -1))).squeeze(-1)*relation_logits
+        relation_weight = torch.sigmoid(self.relation_gate(torch.cat([final, relation], -1)))
+        logits = evidence_logits+relation_weight.squeeze(-1)*relation_logits
         branch = torch.stack([self.classifier(evidence[:, :, m]) for m in range(3)], 1)
-        return {"logits": logits, "direct": direct_logits, "branch": branch, "fusion": fusion,
+        output = {"logits": logits, "direct": direct_logits, "branch": branch, "fusion": fusion,
                 "available": torch.stack([m.any(1) for m in masks], 1),
                 "reconstruction": self.reconstruction(streams[0][:, :-1], streams[2])}
+        if hasattr(self, "function_auxiliary"):
+            output["function_aux"] = self.function_auxiliary(final+relation_weight*(relation-final))
+        return output
 
     def compute_loss(self, batch, settings, return_output=False):
         view, hidden = training_views(batch, settings.get("modality_dropout", .1), settings.get("mask_ratio", .15))
@@ -69,4 +77,8 @@ class TriRelay(nn.Module):
         terms["branch"] = torch.stack(branches).mean()
         terms["reconstruction"] = reconstruction_loss(output["reconstruction"], batch, hidden)
         total = terms["classification"]+settings.get("direct", .2)*terms["direct"]+settings.get("branch", .1)*terms["branch"]+settings.get("reconstruction", .05)*terms["reconstruction"]
+        if hasattr(self, "function_auxiliary"):
+            auxiliary = self.function_auxiliary.loss(output["logits"], output["function_aux"], batch, settings)
+            terms.update(auxiliary)
+            total = total+sum(settings.get(key, 0)*value for key, value in auxiliary.items())
         return (total, terms, output) if return_output else (total, terms)

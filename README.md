@@ -760,6 +760,60 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\export_trirela
 .\.venv\Scripts\python.exe -m mfp_nova.decisions --reference "解压目录/fine39_ema_only.npz" --predictions "解压目录/fine39_consistency.npz" --task fine39 --output "runs/analysis/val_probability_fine39_唯一名称"
 ```
 
+### TriRelay 当前候选：跨粒度功能辅助监督
+
+2026-10-20 的真实 Val 概率诊断表明，一致性权重 0.1 的退步不能仅靠阈值修复：逐标签簇两折诊断中 major15/fine39 Macro-F1 分别下降约 1.566/1.415 个百分点，fine39 尾类 F1 从 0.4736 降至 0.4232。该方案保留可选，不追加其他 Seed。本轮在 **EMA-only 基准**上单独研究跨粒度辅助监督；只开发 TriRelay，完整 major15/fine39，固定 seed42，不叠加教师一致性或新的 PU 伪标签。
+
+两任务分别训练一个完整 TriRelay，并增加一个读取最终标签证据的辅助头：
+
+| 主任务 | 主输出 / 评价 | 辅助监督 | 完整 Train / Val | 有辅助 Train 监督 |
+|---|---|---|---|---:|
+| major15 | 原 15 类 | 实际 fine39 亚类标签 | 39,478 / 8,534 | 39,455 |
+| fine39 | 原 39 类 | 实际 major15 功能轴标签 | 39,455 / 8,529 | 39,455 |
+
+这不是把两个任务合并成一个训练、不是把缺行填成阴性，也不是给 major15 重复加一个同目标分类器。两任务分别使用自己的主划分；辅助标签以 `row_id` 对齐，只对两任务共同有效的 **Train** 行启用。major15 的另 23 行仍参与主任务，辅助分类与层级 Loss 均屏蔽。辅助权重、先验及长尾收缩统计只来自这些实际 Train 行。当前共同 Train 中，fine39 映射到 major15 的父功能正例无矛盾；major15 还提供 71 个不能由 fine39 正例投影得到的已标注轴单元，因此直接使用实际 major15 标签，而非仅从 fine39 自行生成目标。
+
+新头输入为主分类所用的最终证据 `E = H_final + gate * (H_relation - H_final)`，不是读取真值或主概率。辅助 Query 由功能族内证据均值与可学习标签 Query 组成，通过带功能族偏置的交叉 Attention 读取全部主标签上下文，再经过前馈层和现有长尾分类器。主序列/几何/理化编码、三轮交互、关系推理和标签反馈全部保留。辅助梯度回到完整证据网络；主输出仍使用原分类头，**不混合辅助概率、不增加新的预测阈值**。
+
+新增训练目标：
+
+```text
+L = L_original + lambda_aux * L_observed(aux_logits, actual_other_task_labels, aux_mask)
+               + lambda_hierarchy * mean_valid(ReLU(p_subtype - p_parent)^2)
+```
+
+候选设置 `lambda_aux=0.1`、`lambda_hierarchy=0.02`，随既有辅助 warmup 在第 1～5 轮线性升至目标值。辅助分类继续使用原 ASL 风格弱未标注项、Train 正例权重和 `__unknown` 语义；0 仍非确认阴性。层级项是分数上的柔性父子存在约束，允许多亚类同时存在，`__unknown` 不与已知亚类互斥；它不保证真实概率校准。泛抗微生物与具体抗菌可同时存在，独立功能数继续在原评价函数中去重；不把“只标了一个功能”强行当作真实单功能阴性。
+
+新功能默认关闭；`--function-aux-weight` 为正时启用，`--function-hierarchy-weight 0` 可单独消融层级项。不传新参数仍实例化旧架构，旧 checkpoint 可照常加载；候选必须从新运行开始，不能把旧 EMA-only / 一致性 `last.pt` 当作新目标的续训起点。
+
+RTX 5070 在当前训练结束后执行以下 **PowerShell** 命令。两组串行，完整数据，没有 `--limit-samples` / `--max-steps`；若只想先跑一组，将任务列表改为单个 `'fine39'`。当前 batch64/FP32 为沿用的起点，新增候选的显存与速度仍需 RTX 实测。
+
+```powershell
+Set-Location 'D:\Data\ChatGPT\mfp\MFP-Nova'
+git pull --ff-only
+if ($LASTEXITCODE -ne 0) { throw 'Git 更新失败，先处理上方错误。' }
+$mfpPython = 'D:\App\Code\Anaconda\envs\MFP-Nova\python.exe'
+& $mfpPython -m pip install --no-deps -e .
+if ($LASTEXITCODE -ne 0) { throw '项目安装失败。' }
+$tag = Get-Date -Format 'yyyyMMdd_HHmmss'
+foreach ($task in @('fine39', 'major15')) {
+    $run = "trirelay_${task}_esm650m_ema_functionaux_seed42_$tag"
+    & $mfpPython -u -m mfp_nova.cli train `
+        --model trirelay --task $task --esm 650m --seed 42 `
+        --device cuda:0 --precision fp32 --batch-size 64 `
+        --ema-decay 0.999 --ema-start-epoch 6 --consistency-weight 0 `
+        --function-aux-weight 0.1 --function-hierarchy-weight 0.02 `
+        --name $run
+    if ($LASTEXITCODE -ne 0) { throw "$task 训练失败；后续任务未启动。" }
+}
+```
+
+每轮新增 `FunctionAux` 行，显示辅助任务、分类权重/Loss、层级权重/Loss；0 层级 Loss 表示当前 batch 未违反约束，并非模块未启用。两项 Loss 与权重写入 `history.jsonl`，metadata 记录辅助标签顺序与 Train 支持行数，checkpoint 保存辅助参数与统计，支持自己的 `last.pt` 精确恢复。恢复时指定原任务和自己的 `last.pt`，使用新的唯一 `--name`；省略辅助参数会沿用 checkpoint 中的原设置。
+
+主任务的 Val 分类 Loss、Macro-AP/Micro-AP 选模、Val 全局 Jaccard 阈值、传统五指标和独立 MFP 指标继续原协议。辅助 Val/Test 标签不进入训练或阈值拟合；本轮不运行 Test。对比对象是各任务已有的 **EMA-only seed42 独立运行**，不是此次受到辅助 Loss 影响的 `online_best.pt`。这轮增加了另一标签粒度的 Train 监督，论文比较应明确说明该实验设定。
+
+本机已通过新机制 7 项 CPU 检查和原 EMA/一致性相关 14 项检查，覆盖辅助范围/Train-only 统计、父子语义、完整结构梯度、两任务短训练、精确恢复与独立 Val 复现。真实 ESM-650M 缓存的完整模型两任务各做 2 步 CPU 检查，记录在 `runs/diagnostics/trirelay_function_aux_20261020/real_cache_check.json`；覆盖有/无结构、D 构型、padding 和 major15 无辅助标签行。参数量为 major15 **36,016,304**、fine39 **36,016,240**（不含冻结 ESM）。这些仅证明代码链路可运行，尚未证明 GPU 收敛、性能或资源收益。
+
 诊断按`row_id`和标签名称对齐两份完整Val概率，核对当前观测标签；输出原保存阈值、共享0.50/参考阈值/候选阈值、逐标签Val拟合与两折簇交叉拟合结果。共享阈值用于研究分数尺度差异；逐标签全Val拟合有选择乐观性，交叉拟合仅隔离额外阈值拟合，checkpoint仍用完整Val选择，均不能当作独立Test结论。所有阈值实验都不改写原checkpoint、不自动采用。AP保持原始概率口径，未标注0不解释为实验确认阴性，分数分位数不解释为真实概率校准。
 
 本地输出仅`results.json`、`label_diagnostics.csv`和`report.md`，包含逐标签AP/F1、TP/观测FP/FN、正例/未标注分数分位数、近阈值数量及缺结构/D构型分组。相关15项CPU测试通过，并确认旧的真实8534×15 Val NPZ仍可读取；当前四份正式概率尚在服务器待导出，本机未执行四checkpoint重评。此次只增加分析入口和导出脚本，没有修改训练算法或配置；修改前的`decisions.py`和README保存在仓库外`D:\Data\Code\MFP-Nova-originals\20261020-val-probability-comparison`。

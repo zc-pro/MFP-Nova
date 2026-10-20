@@ -42,6 +42,8 @@ def main(argv=None):
             sub.add_argument("--consistency-weight", type=float, help="TriRelay: optional clean-EMA / masked-student consistency (candidate: 0.1)")
             sub.add_argument("--consistency-start-epoch", type=int, help="First consistency epoch (default: EMA start + 1)")
             sub.add_argument("--consistency-ramp-epochs", type=int, help="Consistency weight ramp length (default: 5)")
+            sub.add_argument("--function-aux-weight", type=float, help="TriRelay: real paired major15/fine39 auxiliary supervision (candidate: 0.1)")
+            sub.add_argument("--function-hierarchy-weight", type=float, help="Soft subtype <= parent constraint (default: 0.02 when auxiliary is enabled)")
             sub.add_argument("--name")
             sub.add_argument("--seed", type=int)
             sub.add_argument("--epochs", type=int)
@@ -126,11 +128,14 @@ def main(argv=None):
                 if args.limit_samples:
                     config["train"]["limit_samples"] = args.limit_samples
                 for key in ("precision", "accumulation_steps", "max_steps", "reconstruction_decay", "reconstruction_floor", "ema_decay", "ema_start_epoch",
-                            "consistency_weight", "consistency_start_epoch", "consistency_ramp_epochs"):
+                            "consistency_weight", "consistency_start_epoch", "consistency_ramp_epochs",
+                            "function_aux_weight", "function_hierarchy_weight"):
                     value = getattr(args, key)
                     if value is not None:
                         config["train"][key] = value
             else:
+                if args.function_aux_weight is not None or args.function_hierarchy_weight is not None:
+                    raise ValueError("Function auxiliary supervision is a TriRelay training option")
                 if any(getattr(args, key) is not None for key in ("consistency_weight", "consistency_start_epoch", "consistency_ramp_epochs")):
                     raise ValueError("Consistency is a TriRelay training option")
                 if args.ema_decay is not None or args.ema_start_epoch is not None:

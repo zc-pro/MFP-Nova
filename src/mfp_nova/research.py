@@ -102,6 +102,9 @@ def epoch_loss_settings(config, epoch):
         loss['reconstruction'] *= floor+(1-floor)*.5*(1+math.cos(math.pi*progress))
     if settings.get("consistency_weight", 0) > 0:
         loss["consistency"] = consistency_weight(settings, epoch)
+    if settings.get("function_aux_weight", 0) > 0:
+        loss["function_aux"] = settings["function_aux_weight"]*ramp
+        loss["function_hierarchy"] = settings.get("function_hierarchy_weight", .02)*ramp
     return loss
 
 
@@ -126,6 +129,9 @@ def train(config, name, resume=None):
         for key in ("consistency_weight", "consistency_start_epoch", "consistency_ramp_epochs"):
             if key in settings and settings[key] != original["train"].get(key, 0 if key == "consistency_weight" else None):
                 raise ValueError("Consistency changes the experiment; resume its own last.pt or start a new run")
+        for key in ("function_aux_weight", "function_hierarchy_weight"):
+            if key in settings and settings[key] != original["train"].get(key, 0 if key == "function_aux_weight" else .02):
+                raise ValueError("Function auxiliary supervision changes the experiment; start a new run")
         if config["model_name"] != original["model_name"] or config["data"]["track"] != original["data"]["track"]:
             raise ValueError("Resume model/task differs from checkpoint")
         for key in ("model", "loss", "encoder"):
@@ -146,9 +152,19 @@ def train(config, name, resume=None):
             raise ValueError("Consistency starts after EMA initialization and requires a positive ramp length")
     elif any(key in settings for key in ("consistency_start_epoch", "consistency_ramp_epochs")):
         raise ValueError("Consistency scheduling requires a positive consistency_weight")
+    function_aux = settings.get("function_aux_weight", 0)
+    hierarchy = settings.get("function_hierarchy_weight", .02)
+    if not math.isfinite(function_aux) or function_aux < 0 or not math.isfinite(hierarchy) or hierarchy < 0:
+        raise ValueError("Function auxiliary weights must be finite and nonnegative")
+    if function_aux and config["model_name"] != "trirelay":
+        raise ValueError("Function auxiliary supervision currently supports TriRelay")
+    if function_aux:
+        config["model"]["function_aux"] = True
     source = MultimodalData(config["data"]["root"], config["data"]["track"],
                            checkpoint["statistics"] if checkpoint else None,
                            config.get("min_factor_support", 20), config.get("max_factors", 32))
+    if function_aux:
+        source.enable_function_auxiliary()
     limit = settings.get("limit_samples")
     diagnostic = bool(limit or settings.get("max_steps") or (checkpoint and checkpoint["config"]["train"].get("max_steps")))
     # Diagnostic optimization subsets retain full original-Train priors/statistics:
@@ -165,6 +181,8 @@ def train(config, name, resume=None):
     args = {"input_dim": datasets[0].meta["input_dim"], "num_labels": len(source.data.labels),
             "vocab_size": len(source.statistics["chemical_vocab"])+2,
             "statistics": source.statistics["labels"], **config["model"]}
+    if function_aux:
+        args["function_aux_statistics"] = source.statistics["function_auxiliary"]
     model = make_model(config["model_name"], args).to(device)
     run = Path(settings["output"])/name
     run.mkdir(parents=True, exist_ok=False)
@@ -234,6 +252,10 @@ def train(config, name, resume=None):
                 "resume": str(resume) if resume else None, "diagnostic_subset": diagnostic,
                 "monitor_threshold": .5, "train_metrics_scope": "online_augmented_changing_weights",
                 "validation_loss_scope": "main_classification_clean_eval; no stochastic auxiliary reconstruction"}
+    if function_aux:
+        aux_stats = source.statistics["function_auxiliary"]
+        metadata["function_auxiliary"] = {"task": aux_stats["track"], "labels": aux_stats["labels"],
+                                          "statistics_train_rows": aux_stats["train_rows"]}
     write_json(run/"metadata.json", metadata)
     static = {"model_name": config["model_name"], "model_args": args, "config": config, "statistics": source.statistics,
               "labels": source.data.labels, "track": source.data.track, "encoder": datasets[0].meta, "planned_epochs": planned_epochs}
@@ -375,6 +397,12 @@ def train(config, name, resume=None):
                   f"KL={history['losses']['consistency']:.6f} "
                   f"high={history['losses']['consistency_high']:.6f} "
                   f"low={history['losses']['consistency_low']:.6f}", flush=True)
+        if function_aux:
+            print(f"FunctionAux | task={source.statistics['function_auxiliary']['track']} "
+                  f"weight={loss_settings['function_aux']:.4f} "
+                  f"loss={history['losses']['function_aux']:.6f} "
+                  f"hierarchy_weight={loss_settings['function_hierarchy']:.4f} "
+                  f"hierarchy={history['losses']['function_hierarchy']:.6f}", flush=True)
         if settings["patience"] and stale>=settings["patience"]:
             break
         if settings.get("max_steps") and global_step>=settings["max_steps"]:

@@ -160,6 +160,24 @@ class MultimodalData:
             raise ValueError("Checkpoint label order differs from data")
         self.statistics = statistics
 
+    def enable_function_auxiliary(self):
+        """Pair actual Train labels only; out-of-scope rows have no auxiliary supervision."""
+        track = "fine39" if self.data.track == "major15" else "major15"
+        other = PeptideData(self.root, track)
+        if not np.array_equal(other.rows, self.data.rows) or not np.array_equal(other.splits, self.data.splits):
+            raise ValueError("Cross-task row_id/split alignment differs")
+        valid = np.zeros(len(self.data.rows), bool)
+        valid[np.intersect1d(self.data.indices("train"), other.indices("train"))] = True
+        self.aux_mask = valid
+        self.aux_y = np.zeros_like(other.y)
+        self.aux_y[valid] = other.y[valid]
+        if "function_auxiliary" not in self.statistics:
+            stats = label_statistics(other.y[valid], other.clusters[valid], other.labels)
+            stats.update(track=track, train_rows=int(valid.sum()))
+            self.statistics["function_auxiliary"] = stats
+        if self.statistics["function_auxiliary"]["labels"] != other.labels:
+            raise ValueError("Auxiliary checkpoint label order differs from data")
+
     def sample(self, i, esm):
         length = len(self.data.sequences[i])
         s = self.struct
@@ -241,7 +259,12 @@ class MultimodalPeptides(Dataset):
 
     def __getitem__(self, index):
         esm, _ = self.cache[self.cache_indices[index]]
-        return self.source.sample(int(self.indices[index]), esm)
+        i = int(self.indices[index])
+        sample = self.source.sample(i, esm)
+        if hasattr(self.source, "aux_mask"):
+            sample["aux_y"] = torch.from_numpy(self.source.aux_y[i].astype(np.float32))
+            sample["aux_mask"] = torch.tensor(bool(self.source.aux_mask[i]))
+        return sample
 
 
 def diagnostic_indices(source, pool, count, cover_labels=True, seed=42):
