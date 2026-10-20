@@ -133,7 +133,7 @@ def evaluate_groups(targets, probabilities, groups, threshold, train_support, fu
 
 
 def format_epoch(model, task, seed, maximum_epochs, record, patience):
-    """Four console lines; the JSONL remains the complete metric record."""
+    """Separated epoch console block; JSONL remains the complete metric record."""
     def number(value):
         return "NA" if value is None else f"{value:.4f}"
 
@@ -149,6 +149,8 @@ def format_epoch(model, task, seed, maximum_epochs, record, patience):
     peak = record["peak_cuda_memory_bytes"]
     memory = "NA" if peak is None else f"{peak/2**30:.2f}GiB"
     return "\n".join([
+        "",
+        "="*96,
         f"Epoch {record['epoch']}/{maximum_epochs} | Model={model} Task={task} Seed={seed} | MonitorThreshold={record['monitor_threshold']:.2f}",
         line("Train", record["train"], record["losses"]["total"]),
         line("Val", validation, record["validation_loss"]),
