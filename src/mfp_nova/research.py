@@ -132,6 +132,9 @@ def train(config, name, resume=None):
         for key in ("function_aux_weight", "function_hierarchy_weight"):
             if key in settings and settings[key] != original["train"].get(key, 0 if key == "function_aux_weight" else .02):
                 raise ValueError("Function auxiliary supervision changes the experiment; start a new run")
+        for key, default in (("reconstruction_gradient", "sum"), ("reconstruction_grad_ratio", 1.)):
+            if key in settings and settings[key] != original["train"].get(key, default):
+                raise ValueError("Reconstruction gradient optimization changes the experiment; start a new run")
         if config["model_name"] != original["model_name"] or config["data"]["track"] != original["data"]["track"]:
             raise ValueError("Resume model/task differs from checkpoint")
         for key in ("model", "loss", "encoder"):
@@ -160,6 +163,12 @@ def train(config, name, resume=None):
         raise ValueError("Function auxiliary supervision currently supports TriRelay")
     if function_aux:
         config["model"]["function_aux"] = True
+    reconstruction_gradient = settings.get("reconstruction_gradient", "sum")
+    gradient_ratio = settings.get("reconstruction_grad_ratio", 1.)
+    if reconstruction_gradient not in ("sum", "project") or not math.isfinite(gradient_ratio) or gradient_ratio < 0:
+        raise ValueError("Use reconstruction_gradient=sum/project and a finite nonnegative gradient ratio")
+    if reconstruction_gradient == "project" and config["model_name"] != "trirelay":
+        raise ValueError("Reconstruction gradient balancing currently supports TriRelay")
     source = MultimodalData(config["data"]["root"], config["data"]["track"],
                            checkpoint["statistics"] if checkpoint else None,
                            config.get("min_factor_support", 20), config.get("max_factors", 32))
@@ -256,6 +265,8 @@ def train(config, name, resume=None):
         aux_stats = source.statistics["function_auxiliary"]
         metadata["function_auxiliary"] = {"task": aux_stats["track"], "labels": aux_stats["labels"],
                                           "statistics_train_rows": aux_stats["train_rows"]}
+    if reconstruction_gradient == "project":
+        metadata["gradient_optimization"] = "main-priority reconstruction; logged total is the original weighted loss sum"
     write_json(run/"metadata.json", metadata)
     static = {"model_name": config["model_name"], "model_args": args, "config": config, "statistics": source.statistics,
               "labels": source.data.labels, "track": source.data.track, "encoder": datasets[0].meta, "planned_epochs": planned_epochs}
@@ -273,6 +284,7 @@ def train(config, name, resume=None):
     for epoch in (() if terminal_resume else range(start, settings["epochs"]+1)):
         model.train()
         totals, count, skipped = {}, 0, 0
+        gradient_records = []
         epoch_start = time.perf_counter()
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
@@ -300,7 +312,20 @@ def train(config, name, resume=None):
             if not torch.isfinite(loss):
                 raise FloatingPointError("Nonfinite research loss")
             group_size = min(accumulation, len(loaders[0])-(batch_index//accumulation)*accumulation)
-            scaler.scale(loss/group_size).backward()
+            if reconstruction_gradient == "project":
+                from .gradient_balance import backward_reconstruction
+                auxiliary = loss_settings.get("reconstruction", .05)*components["reconstruction"]
+                # Construct the primary graph directly: subtracting reconstruction
+                # from total leaves zero-but-present gradients on its private head.
+                main = (components["classification"]+loss_settings.get("direct", .2)*components["direct"]
+                        +loss_settings.get("branch", .1)*components["branch"])
+                for key in ("function_aux", "function_hierarchy", "consistency"):
+                    if key in components:
+                        main = main+loss_settings.get(key, 0)*components[key]
+                gradient_records.append(backward_reconstruction(scaler.scale(main/group_size),
+                    scaler.scale(auxiliary/group_size), model.parameters(), gradient_ratio))
+            else:
+                scaler.scale(loss/group_size).backward()
             boundary = (batch_index+1)%accumulation==0 or batch_index+1==len(loaders[0])
             if boundary:
                 scaler.unscale_(optimizer)
@@ -364,6 +389,15 @@ def train(config, name, resume=None):
                    "validation_rows": len(y), "validation_groups": groups, "monitor_threshold": .5,
                    "best_macro_ap": best_key[0], "best_micro_ap": best_key[1], "best_epoch": best_epoch,
                    "early_stopping_count": stale, "peak_cuda_memory_bytes": epoch_peak}
+        if gradient_records:
+            valid = [r for r in gradient_records if r["finite"]]
+            history["reconstruction_gradient"] = {
+                "mode":"project", "batches":len(gradient_records), "finite_batches":len(valid),
+                "conflicting_batches":sum(r["conflict"] for r in valid),
+                "capped_batches":sum(r["capped"] for r in valid), "max_ratio":gradient_ratio}
+            for key in ("cosine", "weighted_aux_main_ratio", "applied_aux_main_ratio"):
+                observed = [r[key] for r in valid if r[key] is not None]
+                history["reconstruction_gradient"]["mean_"+key] = sum(observed)/len(observed) if observed else None
         scheduler.step()
         ema_checkpoint = {}
         if ema is not None:
@@ -403,6 +437,13 @@ def train(config, name, resume=None):
                   f"loss={history['losses']['function_aux']:.6f} "
                   f"hierarchy_weight={loss_settings['function_hierarchy']:.4f} "
                   f"hierarchy={history['losses']['function_hierarchy']:.6f}", flush=True)
+        if gradient_records:
+            g = history["reconstruction_gradient"]
+            fmt = lambda value: "NA" if value is None else f"{value:.4f}"
+            print(f"ReconGrad | conflict={g['conflicting_batches']}/{g['finite_batches']} "
+                  f"capped={g['capped_batches']}/{g['finite_batches']} "
+                  f"cosine={fmt(g['mean_cosine'])} ratio={fmt(g['mean_weighted_aux_main_ratio'])} "
+                  f"applied={fmt(g['mean_applied_aux_main_ratio'])} max={gradient_ratio:g}", flush=True)
         if settings["patience"] and stale>=settings["patience"]:
             break
         if settings.get("max_steps") and global_step>=settings["max_steps"]:

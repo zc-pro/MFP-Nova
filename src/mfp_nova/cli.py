@@ -44,6 +44,8 @@ def main(argv=None):
             sub.add_argument("--consistency-ramp-epochs", type=int, help="Consistency weight ramp length (default: 5)")
             sub.add_argument("--function-aux-weight", type=float, help="TriRelay: real paired major15/fine39 auxiliary supervision (candidate: 0.1)")
             sub.add_argument("--function-hierarchy-weight", type=float, help="Soft subtype <= parent constraint (default: 0.02 when auxiliary is enabled)")
+            sub.add_argument("--reconstruction-gradient", choices=("sum", "project"), help="TriRelay: main-priority reconstruction gradient projection and norm balancing")
+            sub.add_argument("--reconstruction-grad-ratio", type=float, help="Maximum shared reconstruction/main gradient norm ratio (default: 1)")
             sub.add_argument("--name")
             sub.add_argument("--seed", type=int)
             sub.add_argument("--epochs", type=int)
@@ -129,11 +131,14 @@ def main(argv=None):
                     config["train"]["limit_samples"] = args.limit_samples
                 for key in ("precision", "accumulation_steps", "max_steps", "reconstruction_decay", "reconstruction_floor", "ema_decay", "ema_start_epoch",
                             "consistency_weight", "consistency_start_epoch", "consistency_ramp_epochs",
-                            "function_aux_weight", "function_hierarchy_weight"):
+                            "function_aux_weight", "function_hierarchy_weight",
+                            "reconstruction_gradient", "reconstruction_grad_ratio"):
                     value = getattr(args, key)
                     if value is not None:
                         config["train"][key] = value
             else:
+                if args.reconstruction_gradient is not None or args.reconstruction_grad_ratio is not None:
+                    raise ValueError("Reconstruction gradient balancing is a TriRelay training option")
                 if args.function_aux_weight is not None or args.function_hierarchy_weight is not None:
                     raise ValueError("Function auxiliary supervision is a TriRelay training option")
                 if any(getattr(args, key) is not None for key in ("consistency_weight", "consistency_start_epoch", "consistency_ramp_epochs")):

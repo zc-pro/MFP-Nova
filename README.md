@@ -814,6 +814,59 @@ foreach ($task in @('fine39', 'major15')) {
 
 本机已通过新机制 7 项 CPU 检查和原 EMA/一致性相关 14 项检查，覆盖辅助范围/Train-only 统计、父子语义、完整结构梯度、两任务短训练、精确恢复与独立 Val 复现。真实 ESM-650M 缓存的完整模型两任务各做 2 步 CPU 检查，记录在 `runs/diagnostics/trirelay_function_aux_20261020/real_cache_check.json`；覆盖有/无结构、D 构型、padding 和 major15 无辅助标签行。参数量为 major15 **36,016,304**、fine39 **36,016,240**（不含冻结 ESM）。这些仅证明代码链路可运行，尚未证明 GPU 收敛、性能或资源收益。
 
+### TriRelay 下一项候选：主任务优先的重建梯度平衡
+
+跨粒度辅助监督的两个 seed42 完整实验已经返回：相对 EMA-only，major15/fine39 Macro-AP 分别 +0.660/+0.092 个百分点，但独立 MFP-F1 分别 −0.535/−1.454 个百分点；当前权重0.1/0.02不作为默认，不追加其他Seed。详细分析在本机 `runs/analysis/trirelay_functionaux_seed42_20261020/report.md`。
+
+依据项目外改进书第6.2节，本轮回到 **原完整 TriRelay + EMA**，仅研究原重建任务的梯度作用。真实 ESM-650M Train 的完整模型各做6步CPU探查，序列投影层观察到 major15 3/6、fine39 2/6 批次主辅梯度夹角为负；反馈层分别2/6、4/6。部分层的加权重建梯度远大于分类梯度。这是**新初始化模型的局部短训练证据**，不是正式服务器checkpoint的梯度结论，也不能证明其造成之前的指标退步。记录位于 `runs/diagnostics/trirelay_reconstruction_gradient_20261020/probe.json`。
+
+设主目标为原功能分类组（最终主头＋加权直接头＋加权分支头），辅助目标为原加权重建组。只在两个目标共同使用的参数上，计算：
+
+```text
+g_main = grad(L_classification + w_direct*L_direct + w_branch*L_branch)
+g_aux  = grad(w_reconstruction*L_reconstruction)
+
+若 dot(g_main,g_aux)<0:
+    g_aux = g_aux - dot(g_main,g_aux)/||g_main||² * g_main
+g_aux *= min(1, rho*||g_main||/||g_aux||)
+g = g_main + g_aux                       # 共同参数
+```
+
+`rho=1` 是本轮固定候选；无共享主梯度时不让重建单独移动共享参数。主任务私有参数保留原分类梯度，重建头私有参数保留原重建梯度，不把辅助修正注入分类器私有参数。方向投影与范数平衡都在**共同参数整体**上完成，不是逐层或逐标签约束。它保留原重建任务、原0.05权重及辅助warmup，改变的是梯度组合，而非删除重建模块或再次实施重建权重衰减。
+
+这是项目适配的非对称主辅梯度方法，不宣称复现AuxiNash或完整PCGrad。约束只在每个microbatch的原始梯度空间成立；梯度累积的交叉项、AdamW预条件及参数更新仍可能改变方向，因此不保证下一step的分类Loss、Val指标或长期收敛单调改善。辅助组范围不包含新的跨粒度监督；本轮指令将其与一致性均关闭。
+
+新功能默认关闭；`--reconstruction-gradient sum` 为旧梯度求和，`project` 启用上述投影和范数平衡。`--reconstruction-grad-ratio` 只控制共享重建梯度的上限，默认1。model参数量恢复为 major15 **35,196,329**、fine39 **35,209,345**，冻结ESM不计入；输入、模型深度、反馈、关系推理和评价协议不变。
+
+RTX5070 的 **PowerShell** 正式实验命令如下，每组使用完整原数据、seed42、EMA、FP32/batch64；从新运行开始，不接旧目标的 `last.pt`。先fine39，再major15，串行执行：
+
+```powershell
+Set-Location 'D:\Data\ChatGPT\mfp\MFP-Nova'
+git pull --ff-only
+if ($LASTEXITCODE -ne 0) { throw 'Git 更新失败。' }
+$mfpPython = 'D:\App\Code\Anaconda\envs\MFP-Nova\python.exe'
+& $mfpPython -m pip install --no-deps -e .
+if ($LASTEXITCODE -ne 0) { throw '项目安装失败。' }
+$tag = Get-Date -Format 'yyyyMMdd_HHmmss'
+foreach ($task in @('fine39', 'major15')) {
+    $run = "trirelay_${task}_esm650m_ema_recongrad_seed42_$tag"
+    & $mfpPython -u -m mfp_nova.cli train `
+        --model trirelay --task $task --esm 650m --seed 42 `
+        --device cuda:0 --precision fp32 --batch-size 64 `
+        --ema-decay 0.999 --ema-start-epoch 6 `
+        --consistency-weight 0 --function-aux-weight 0 `
+        --reconstruction-gradient project --reconstruction-grad-ratio 1 `
+        --name $run
+    if ($LASTEXITCODE -ne 0) { throw "$task 训练失败；后续任务未启动。" }
+}
+```
+
+每轮新增 `ReconGrad` 行与对应history字段：冲突批次数、范数受限批次数、投影前平均cosine、加权主辅范数比及施加后的范数比。分母为梯度有限的microbatch数；AMP溢出仍由已有GradScaler跳步处理，FP32非有限梯度仍明确报错，不用零梯度掩盖。无梯度范数时相关诊断为NA。总Loss仍记录原加权目标和，**投影后的梯度通常不对应这个标量的普通梯度**，metadata明确记录这一点。
+
+自己的 `last.pt` 可恢复并自动沿用投影参数；不能通过恢复旧checkpoint临时改变优化规则。正式比较继续Val Macro-AP最大、Micro-AP并列判定、Val全局Jaccard阈值，关注五指标、尾类和独立MFP P/R/F1，不按Test结果调参。对照为原EMA-only独立运行，`online_best.pt`仅为同轨迹在线参考。
+
+本轮8项优化相关检查与3项原EMA检查覆盖投影/范数上限、私有梯度、损失缩放与累积、两任务短训练、精确恢复、独立Val重评与实验汇总区分。真实缓存的完整模型另作两任务各2步CPU检查，结果在 `runs/diagnostics/trirelay_reconstruction_gradient_20261020/real_cache_check.json`。每step对同一前向图做两组梯度计算，GPU耗时及额外梯度内存需实测，不能沿用原训练速度或宣称已提高指标。本轮不占用远端GPU、不执行正式Test。
+
 诊断按`row_id`和标签名称对齐两份完整Val概率，核对当前观测标签；输出原保存阈值、共享0.50/参考阈值/候选阈值、逐标签Val拟合与两折簇交叉拟合结果。共享阈值用于研究分数尺度差异；逐标签全Val拟合有选择乐观性，交叉拟合仅隔离额外阈值拟合，checkpoint仍用完整Val选择，均不能当作独立Test结论。所有阈值实验都不改写原checkpoint、不自动采用。AP保持原始概率口径，未标注0不解释为实验确认阴性，分数分位数不解释为真实概率校准。
 
 本地输出仅`results.json`、`label_diagnostics.csv`和`report.md`，包含逐标签AP/F1、TP/观测FP/FN、正例/未标注分数分位数、近阈值数量及缺结构/D构型分组。相关15项CPU测试通过，并确认旧的真实8534×15 Val NPZ仍可读取；当前四份正式概率尚在服务器待导出，本机未执行四checkpoint重评。此次只增加分析入口和导出脚本，没有修改训练算法或配置；修改前的`decisions.py`和README保存在仓库外`D:\Data\Code\MFP-Nova-originals\20261020-val-probability-comparison`。
