@@ -730,3 +730,36 @@ foreach ($task in @("major15", "fine39")) {
 修改前的 `research.py`、`cli.py`、README 及Git提交号保存在仓库外 `D:\Data\Code\MFP-Nova-originals\20261020-trirelay-consistency`。原始三模型架构文件、YAML、数据、缓存与历史checkpoint未改动。
 
 本机相关14项CPU检查通过：稳定Bernoulli KL、正例/监督范围mask、教师停止梯度、高低分组预算、权重日程、15/39标签训练与独立Val重评、精确断点恢复及旧EMA-only checkpoint不能临时改目标。原EMA关闭新目标时的训练轨迹检查也通过。另用真实ESM-650M缓存，对完整35,196,329/35,209,345参数的两任务模型各做2步CPU检查，覆盖长度50/5/2、D构型、有/无结构与padding；logits、Loss、梯度有限，反馈参数更新且一致性KL非零。诊断记录位于本机`runs/diagnostics/trirelay_consistency_20261020/real_cache_check.json`，它提前启用EMA只为覆盖接口，不能作为正式性能或收敛证据。尚未执行此次候选的GPU训练。
+
+### 一致性实验后的 Val 概率配对诊断
+
+2026-10-20 两任务 seed42 已回传。相对各自 EMA-only：major15 Macro-AP +1.178 pp、Macro-F1 −0.591 pp、MFP-F1 −1.641 pp；fine39 Macro-AP +0.308 pp、Macro-F1 −3.019 pp、MFP-F1 +0.894 pp。fine39 五指标改善，但尾组 Macro-F1 0.4713→0.4080，缺结构组 MFP-F1 两任务均下降。当前一致性权重0.1保留为可选候选，不替换默认方案，不追加多 Seed。详细记录位于本机`runs/analysis/trirelay_{major15,fine39}_consistency_seed42_20261020/`。
+
+下一步先复用已有最佳 checkpoint 做四次 **Val** 前向并导出概率，不重新训练、不重新拟合模型、不访问 Test。RTX 5070 空闲且项目没有正在运行的训练时，在 PowerShell 执行：
+
+```powershell
+Set-Location "D:\Data\ChatGPT\mfp\MFP-Nova"
+git pull --ff-only
+if ($LASTEXITCODE -ne 0) { throw "Git同步失败" }
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\export_trirelay_val.ps1 -Python "D:\App\Code\Anaconda\envs\MFP-Nova\python.exe" -Device cuda:0
+```
+
+脚本固定读取以下四个运行的`best.pt`（不是`online_best.pt`或`last.pt`）：
+
+| 任务 | EMA-only | EMA＋一致性 |
+| --- | --- | --- |
+| major15 | `trirelay_major15_ema_seed42_20261018_215416` | `trirelay_major15_esm650m_ema_consistency_seed42_20261020_093530` |
+| fine39 | `trirelay_fine39_ema_seed42_20261019_090117` | `trirelay_fine39_esm650m_ema_consistency_seed42_20261020_125726` |
+
+输出写入新建`runs/trirelay_val_comparison_seed42_时间/`，每组一个JSON及一个NPZ，文件前缀为`major15_ema_only`、`major15_consistency`、`fine39_ema_only`、`fine39_consistency`。最终自动打包到桌面`trirelay_val_comparison_seed42_时间.zip`，不包含权重或ESM缓存。若某次导出失败，脚本停止并保留已完成文件；原checkpoint、训练结果与阈值不改写。
+
+回传后在本机CPU运行配对诊断，例如（按实际解压路径替换）：
+
+```powershell
+.\.venv\Scripts\python.exe -m mfp_nova.decisions --reference "解压目录/major15_ema_only.npz" --predictions "解压目录/major15_consistency.npz" --task major15 --output "runs/analysis/val_probability_major15_唯一名称"
+.\.venv\Scripts\python.exe -m mfp_nova.decisions --reference "解压目录/fine39_ema_only.npz" --predictions "解压目录/fine39_consistency.npz" --task fine39 --output "runs/analysis/val_probability_fine39_唯一名称"
+```
+
+诊断按`row_id`和标签名称对齐两份完整Val概率，核对当前观测标签；输出原保存阈值、共享0.50/参考阈值/候选阈值、逐标签Val拟合与两折簇交叉拟合结果。共享阈值用于研究分数尺度差异；逐标签全Val拟合有选择乐观性，交叉拟合仅隔离额外阈值拟合，checkpoint仍用完整Val选择，均不能当作独立Test结论。所有阈值实验都不改写原checkpoint、不自动采用。AP保持原始概率口径，未标注0不解释为实验确认阴性，分数分位数不解释为真实概率校准。
+
+本地输出仅`results.json`、`label_diagnostics.csv`和`report.md`，包含逐标签AP/F1、TP/观测FP/FN、正例/未标注分数分位数、近阈值数量及缺结构/D构型分组。相关15项CPU测试通过，并确认旧的真实8534×15 Val NPZ仍可读取；当前四份正式概率尚在服务器待导出，本机未执行四checkpoint重评。此次只增加分析入口和导出脚本，没有修改训练算法或配置；修改前的`decisions.py`和README保存在仓库外`D:\Data\Code\MFP-Nova-originals\20261020-val-probability-comparison`。
