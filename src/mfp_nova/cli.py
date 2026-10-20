@@ -39,6 +39,9 @@ def main(argv=None):
             sub.add_argument("--reconstruction-floor", type=float, help="Fraction of initial reconstruction weight retained after decay (default 0.2)")
             sub.add_argument("--ema-decay", type=float, help="Optional parameter EMA; evaluate online and averaged weights in the same run")
             sub.add_argument("--ema-start-epoch", type=int, help="First EMA update epoch (default: after LR warmup)")
+            sub.add_argument("--consistency-weight", type=float, help="TriRelay: optional clean-EMA / masked-student consistency (candidate: 0.1)")
+            sub.add_argument("--consistency-start-epoch", type=int, help="First consistency epoch (default: EMA start + 1)")
+            sub.add_argument("--consistency-ramp-epochs", type=int, help="Consistency weight ramp length (default: 5)")
             sub.add_argument("--name")
             sub.add_argument("--seed", type=int)
             sub.add_argument("--epochs", type=int)
@@ -122,11 +125,14 @@ def main(argv=None):
                     config["train"]["threshold_strategy"] = args.threshold_strategy
                 if args.limit_samples:
                     config["train"]["limit_samples"] = args.limit_samples
-                for key in ("precision", "accumulation_steps", "max_steps", "reconstruction_decay", "reconstruction_floor", "ema_decay", "ema_start_epoch"):
+                for key in ("precision", "accumulation_steps", "max_steps", "reconstruction_decay", "reconstruction_floor", "ema_decay", "ema_start_epoch",
+                            "consistency_weight", "consistency_start_epoch", "consistency_ramp_epochs"):
                     value = getattr(args, key)
                     if value is not None:
                         config["train"][key] = value
             else:
+                if any(getattr(args, key) is not None for key in ("consistency_weight", "consistency_start_epoch", "consistency_ramp_epochs")):
+                    raise ValueError("Consistency is a TriRelay training option")
                 if args.ema_decay is not None or args.ema_start_epoch is not None:
                     raise ValueError("EMA is a research-model option")
                 if args.reconstruction_decay is not None or args.reconstruction_floor is not None:

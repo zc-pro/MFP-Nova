@@ -17,6 +17,7 @@ from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 from .metrics import evaluate_metrics, evaluate_groups, format_epoch, fit_global_threshold, fit_label_thresholds
 from .multimodal import MultimodalData, MultimodalPeptides, collate_multimodal
 from .research_layers import observed_label_loss
+from .consistency import bernoulli_consistency, consistency_weight
 from .trainer import seed_everything, write_json
 
 
@@ -99,6 +100,8 @@ def epoch_loss_settings(config, epoch):
             raise ValueError('Reconstruction decay requires warmup <= start < end and floor in [0, 1]')
         progress = min(1, max(0, (epoch-start)/(end-start)))
         loss['reconstruction'] *= floor+(1-floor)*.5*(1+math.cos(math.pi*progress))
+    if settings.get("consistency_weight", 0) > 0:
+        loss["consistency"] = consistency_weight(settings, epoch)
     return loss
 
 
@@ -120,6 +123,9 @@ def train(config, name, resume=None):
         original = checkpoint["config"]
         if settings.get("ema_decay") is not None and original["train"].get("ema_decay") is None:
             raise ValueError("EMA changes the experiment; start a new training run instead of resuming a non-EMA checkpoint")
+        for key in ("consistency_weight", "consistency_start_epoch", "consistency_ramp_epochs"):
+            if key in settings and settings[key] != original["train"].get(key, 0 if key == "consistency_weight" else None):
+                raise ValueError("Consistency changes the experiment; resume its own last.pt or start a new run")
         if config["model_name"] != original["model_name"] or config["data"]["track"] != original["data"]["track"]:
             raise ValueError("Resume model/task differs from checkpoint")
         for key in ("model", "loss", "encoder"):
@@ -127,6 +133,19 @@ def train(config, name, resume=None):
         for key, value in original["train"].items():
             if key not in ("device", "output", "epochs", "num_workers", "max_steps"):
                 settings[key] = value
+    consistency = settings.get("consistency_weight", 0)
+    if not math.isfinite(consistency) or consistency < 0:
+        raise ValueError("consistency_weight must be finite and nonnegative")
+    if consistency:
+        if config["model_name"] != "trirelay" or settings.get("ema_decay") is None:
+            raise ValueError("Consistency currently requires TriRelay with EMA")
+        ema_start = settings.get("ema_start_epoch", settings.get("warmup_epochs", 5)+1)
+        settings.setdefault("consistency_start_epoch", ema_start+1)
+        settings.setdefault("consistency_ramp_epochs", 5)
+        if settings["consistency_start_epoch"] <= ema_start or settings["consistency_ramp_epochs"] < 1:
+            raise ValueError("Consistency starts after EMA initialization and requires a positive ramp length")
+    elif any(key in settings for key in ("consistency_start_epoch", "consistency_ramp_epochs")):
+        raise ValueError("Consistency scheduling requires a positive consistency_weight")
     source = MultimodalData(config["data"]["root"], config["data"]["track"],
                            checkpoint["statistics"] if checkpoint else None,
                            config.get("min_factor_support", 20), config.get("max_factors", 32))
@@ -240,8 +259,22 @@ def train(config, name, resume=None):
         optimizer.zero_grad(set_to_none=True)
         for batch_index, batch in enumerate(loaders[0]):
             batch = to_device(batch, device)
+            teacher_logits = None
+            if loss_settings.get("consistency", 0) > 0 and int(ema.n_averaged) > 0:
+                ema.module.eval()
+                with torch.no_grad(), autocast_context(device, precision):
+                    teacher_logits = ema.module(batch)["logits"]
             with autocast_context(device, precision):
                 loss, components, output = model.compute_loss(batch, loss_settings, return_output=True)
+            if consistency:
+                if teacher_logits is None:
+                    agreement = output["logits"].sum()*0
+                    agreement_terms = {"consistency_high": agreement, "consistency_low": agreement}
+                else:
+                    agreement, agreement_terms = bernoulli_consistency(output["logits"], teacher_logits, batch["y"])
+                loss = loss+loss_settings["consistency"]*agreement
+                components = {**components, "consistency": agreement, **agreement_terms}
+            del teacher_logits
             if not torch.isfinite(loss):
                 raise FloatingPointError("Nonfinite research loss")
             group_size = min(accumulation, len(loaders[0])-(batch_index//accumulation)*accumulation)
@@ -337,6 +370,11 @@ def train(config, name, resume=None):
                   f"MFP-F1={online_report['mfp_detection']['f1']:.4f} "
                   f"Acc={online_report['accuracy']:.4f} Prec={online_report['precision']:.4f} "
                   f"Cov={online_report['coverage']:.4f} AT={online_report['absolute_true']:.4f} AF={online_report['absolute_false']:.4f}", flush=True)
+        if consistency:
+            print(f"Consistency | weight={loss_settings['consistency']:.4f} "
+                  f"KL={history['losses']['consistency']:.6f} "
+                  f"high={history['losses']['consistency_high']:.6f} "
+                  f"low={history['losses']['consistency_low']:.6f}", flush=True)
         if settings["patience"] and stale>=settings["patience"]:
             break
         if settings.get("max_steps") and global_step>=settings["max_steps"]:

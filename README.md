@@ -697,3 +697,36 @@ Head/Medium/Tail 使用 Train 正例数 ≥1000、200～999、<200 的固定分�
 建议：TriRelay 的两个任务均保留固定 EMA 为优先候选，不再搜索 decay 或为了 MFP 改变主评价协议。若继续验证通用性，下一批可让 GeoFactor、ProtoRoute 各在 major15/fine39 做 seed42 同次在线—EMA 对照，共四次；不直接扩展为两模型全部五 Seed。MFP 决策问题独立保留，避免把分类 AP 改善误当成已解决多功能检测。本轮不使用 Test 选择策略，所有结论限于同一个用于开发的 Validation 集；正式评价前可独立加载所选 checkpoint 复核 Val。
 
 回传文件、全指标/全标签/分组配对统计及图位于 `runs/analysis/ema_fine39_five_seed_20261019/`：`analysis.json`、`comparison.png`、`learning_curves.png`。未修改模型、数据或配置，未启动训练。
+
+### TriRelay 下一项候选：受控视图的 EMA 教师一致性
+
+此项仅针对 TriRelay / major15、fine39 / seed42，正式实验使用完整原 Train/Val；不抽样、不重划分、不重提取 ESM。完整模型、既有模态 Dropout/分组 Mask、原分类及重建目标均保留。默认配置仍不启用新目标，GeoFactor、ProtoRoute 不受影响。
+
+教师是无梯度、eval 模式的 EMA 模型，读取原本可用的完整输入；在线学生继续读取既有训练视图。教师在 optimizer step **之前**提供目标，在成功更新之后按原规则平均。已知正例不做蒸馏，继续使用原分类监督，避免低分教师反向压制已知阳性；未标注项并不被宣布为真实阴性。
+
+新增目标为逐标签 Bernoulli `KL(teacher || student)`，不能用跨标签 softmax。未标注项按教师分数 `>=0.5` / `<0.5` 分成两组，各组先在标签内部平均，再对有效标签平均；`L_consistency = L_high + 0.1 * L_low`。0.5 只是分组规则，不是伪标签确认阈值；不给数据写回硬伪标签。该目标属于一致性正则，不是无偏 PU 风险。
+
+固定首轮设置：`--consistency-weight 0.1 --consistency-start-epoch 7 --consistency-ramp-epochs 5`。EMA仍为0.999、第6轮开始；第6轮只初始化和积累EMA，第7～11轮的一致性系数依次为0.02、0.04、0.06、0.08、0.10，之后保持0.10。此组数值是待验证候选，不代表已经优于EMA-only。
+
+RTX 5070 **PowerShell** 中，在该项目没有正在运行的训练、且本次代码已同步后执行（两任务串行）：
+
+```powershell
+Set-Location "D:\Data\ChatGPT\mfp\MFP-Nova"
+$mfpPython = "D:\App\Code\Anaconda\envs\MFP-Nova\python.exe"
+$tag = Get-Date -Format "yyyyMMdd_HHmmss"
+foreach ($task in @("major15", "fine39")) {
+    $run = "trirelay_${task}_esm650m_ema_consistency_seed42_$tag"
+    & $mfpPython -u -m mfp_nova.cli train --model trirelay --task $task --esm 650m --seed 42 --device cuda:0 --precision fp32 --batch-size 64 --ema-decay 0.999 --ema-start-epoch 6 --consistency-weight 0.1 --consistency-start-epoch 7 --consistency-ramp-epochs 5 --name $run
+    if ($LASTEXITCODE -ne 0) { throw "Training failed: $run" }
+}
+```
+
+不要在 CMD 中直接粘贴 PowerShell 变量语法；可先输入 `powershell.exe -NoProfile` 再运行上述代码。正式命令不带 `--limit-samples`、`--max-steps` 或短 `--epochs`。
+
+每轮新增 `Consistency` 行，记录当前权重、原始KL及高/低分组KL；`history.jsonl`、metadata 与checkpoint保存相应配置。Val分类Loss仍只计算原分类目标，checkpoint与阈值规则保持原协议。`online_best.pt`和`best.pt`都来自**受新Loss影响的同一训练**，因此判断新算法收益必须与之前保存的EMA-only seed42比较，不能把本次在线分支当成旧算法对照。
+
+候选可以从自己的 `last.pt` 恢复，省略一致性参数会自动使用已保存设置；不能向旧EMA-only checkpoint临时加入新目标。首次比较关注Macro-AP、五指标和MFP Precision/Recall/F1，并保留D构型、缺结构分组；不使用Test选择新机制。教师增加每步一次前向，原batch64与耗时需要RTX实际确认，不宣称已有GPU性能收益。
+
+修改前的 `research.py`、`cli.py`、README 及Git提交号保存在仓库外 `D:\Data\Code\MFP-Nova-originals\20261020-trirelay-consistency`。原始三模型架构文件、YAML、数据、缓存与历史checkpoint未改动。
+
+本机相关14项CPU检查通过：稳定Bernoulli KL、正例/监督范围mask、教师停止梯度、高低分组预算、权重日程、15/39标签训练与独立Val重评、精确断点恢复及旧EMA-only checkpoint不能临时改目标。原EMA关闭新目标时的训练轨迹检查也通过。另用真实ESM-650M缓存，对完整35,196,329/35,209,345参数的两任务模型各做2步CPU检查，覆盖长度50/5/2、D构型、有/无结构与padding；logits、Loss、梯度有限，反馈参数更新且一致性KL非零。诊断记录位于本机`runs/diagnostics/trirelay_consistency_20261020/real_cache_check.json`，它提前启用EMA只为覆盖接口，不能作为正式性能或收敛证据。尚未执行此次候选的GPU训练。
