@@ -46,6 +46,8 @@ def main(argv=None):
             sub.add_argument("--function-hierarchy-weight", type=float, help="Soft subtype <= parent constraint (default: 0.02 when auxiliary is enabled)")
             sub.add_argument("--reconstruction-gradient", choices=("sum", "cap", "project"), help="TriRelay: sum=original; cap=shared auxiliary norm cap; project=conflict projection plus norm cap")
             sub.add_argument("--reconstruction-grad-ratio", type=float, help="Maximum shared reconstruction/main gradient norm ratio (default: 1)")
+            sub.add_argument("--shared-private", action=argparse.BooleanOptionalAction, default=None,
+                             help="TriRelay: preserve private pre-relay evidence alongside shared interactions")
             sub.add_argument("--name")
             sub.add_argument("--seed", type=int)
             sub.add_argument("--epochs", type=int)
@@ -118,6 +120,10 @@ def main(argv=None):
             if args.model != "sequence":
                 from .research import train
                 config["model_name"] = args.model
+                if args.shared_private is not None:
+                    if args.model != "trirelay":
+                        raise ValueError("Shared/private evidence is a TriRelay model option")
+                    config["model"]["shared_private"] = args.shared_private
                 if args.task:
                     config["data"]["track"] = args.task
                 if args.ablate:
@@ -137,6 +143,8 @@ def main(argv=None):
                     if value is not None:
                         config["train"][key] = value
             else:
+                if args.shared_private is not None:
+                    raise ValueError("Shared/private evidence is a TriRelay model option")
                 if args.reconstruction_gradient is not None or args.reconstruction_grad_ratio is not None:
                     raise ValueError("Reconstruction gradient balancing is a TriRelay training option")
                 if args.function_aux_weight is not None or args.function_hierarchy_weight is not None:

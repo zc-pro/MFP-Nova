@@ -1,6 +1,6 @@
 # MFP-Nova
 
-独立的治疗肽多标签识别科研项目。已实现序列对照与 TriRelay、GeoFactor、ProtoRoute 三套多模态模型，并完成 RTX 5070 上六组 seed=42 正式训练。当前完善逐轮指标和分批五 Seed 实验；所有核心代码独立编写。
+独立的治疗肽多标签识别科研项目。已完成 TriRelay、GeoFactor、ProtoRoute 两任务各五 Seed 的首轮训练及独立评价；当前针对 TriRelay 的完整 major15/fine39、seed42 开展 EMA 和算法改进。所有核心代码独立编写，新候选继续仅用 Validation 比较。
 
 ## 本地数据与任务
 
@@ -935,3 +935,82 @@ printf 'PID=%s\n日志=runs/%s.log\n' "$!" "$run"
 `ReconGrad`显示`mode=cap`、观测冲突`conflict`、实际投影`projected=0`及范数限制`capped`。history保存真实mode与`projected_batches`，避免把观测到冲突误当作进行了投影。旧`project`行为保留；恢复自己的`last.pt`会沿用模式和rho，跨模式恢复仍会报错。
 
 继续以Val Macro-AP选checkpoint、Micro-AP并列判定、Val全局Jaccard选阈值。完成后独立导出最佳EMA的Val JSON与NPZ，与既有EMA-only及`project`进行相同口径比较，同时看传统五指标、MFP detection和`mfp_function_prediction`。不提前运行Test或改选checkpoint。本轮相关梯度及恢复测试和真实缓存CPU检查只验证实现，不能当作GPU性能或模型收益证据。
+
+### 当前实验：TriRelay 共享交互＋私有证据
+
+major15 的 cap 实验已完成，AP 的微小提升没有带来 F1/Jaccard/MFP 的一致改善，因此不继续扩展重建梯度网格。下一项为改进书 7.1 的共享—私有机制：保留原完整深度和交互，增加绕过 relay/反馈回写的私有证据流；两轮标签条件读取及质量感知门控将其融入决策。完整数据仍为 major15 Train39478/Val8534、fine39 Train39455/Val8529；没有重新划分或缩小正式训练集。
+
+开关 `--shared-private`，默认关闭，旧模型及旧 checkpoint 保持可用。实际参数 major15 **39,147,692**、fine39 **39,160,708**，不含冻结 ESM。总 Loss 和原分支预算不增加；private 分支共享原 0.1 分支预算，重建只读取共享流。详细数据流和限制见[模型技术说明](docs/MFP-Next-Generation-Architecture.md)。本轮关闭此前一致性、功能辅助和重建梯度控制，只与已有 EMA-only 对照；新架构从新运行训练，不能接旧架构的 last.pt。
+
+以下两平台命令二选一，在所选项目无训练进程时更新源码。先 fine39 后 major15，固定 seed42、完整数据、FP32/batch64、EMA0.999/start6；每组结束自动独立重评最佳 checkpoint 的完整 Val 并导出逐样本概率。本轮不跑新 seed 或 Test。新增网络的 GPU 峰值/速度尚未实测，batch64 根据原模型约7GiB的记录作为起点，不保证新模型用量相同。`sum` 恢复单次普通 backward，避免此前 cap/project 的双梯度计算；实际加速以 GPU 日志为准。
+
+RTX5070，**PowerShell**：
+
+```powershell
+Set-Location 'D:\Data\ChatGPT\mfp\MFP-Nova'
+git pull --ff-only
+if ($LASTEXITCODE -ne 0) { throw 'Git 更新失败。' }
+$mfpPython = 'D:\App\Code\Anaconda\envs\MFP-Nova\python.exe'
+$tag = Get-Date -Format 'yyyyMMdd_HHmmss'
+$artifacts = @()
+foreach ($task in @('fine39', 'major15')) {
+    $run = "trirelay_${task}_esm650m_ema_sharedprivate_seed42_rtx5070_$tag"
+    & $mfpPython -u -m mfp_nova.cli train `
+        --model trirelay --task $task --esm 650m --seed 42 `
+        --device cuda:0 --precision fp32 --batch-size 64 `
+        --ema-decay 0.999 --ema-start-epoch 6 --shared-private `
+        --consistency-weight 0 --function-aux-weight 0 `
+        --reconstruction-gradient sum --name $run
+    if ($LASTEXITCODE -ne 0) { throw "$task 训练失败；后续任务未启动。" }
+    & $mfpPython -u -m mfp_nova.cli evaluate `
+        --checkpoint "runs/$run/best.pt" --split val --device cuda:0 --batch-size 64 `
+        --output "runs/$run/val.json" --predictions "runs/$run/val_predictions.npz"
+    if ($LASTEXITCODE -ne 0) { throw "$task Val 导出失败。" }
+    foreach ($file in @('metadata.json','results.json','history.jsonl','val.json','val_predictions.npz')) {
+        $artifacts += "runs/$run/$file"
+    }
+}
+$zip = Join-Path ([Environment]::GetFolderPath('Desktop')) "trirelay_sharedprivate_seed42_$tag.zip"
+# 直接压缩并保留运行目录；不复制输出、不压缩 pt 权重。
+& $mfpPython -c "import sys,zipfile; z=zipfile.ZipFile(sys.argv[1],'x',zipfile.ZIP_DEFLATED); [z.write(p,p) for p in sys.argv[2:]]; z.close()" $zip $artifacts
+if ($LASTEXITCODE -ne 0) { throw '结果压缩失败。' }
+Write-Host "回传文件：$zip"
+```
+
+V100，**Ubuntu Bash**。`GPU_ID`选空闲物理GPU，`CPU_THREADS`可选2/4/8等；后台整个串行队列，关闭SSH后继续。`CUDA_VISIBLE_DEVICES`映射后，进程内始终使用`cuda:0`。
+
+```bash
+(
+set -e
+cd ~/wuzhencheng/projects/MFP-Nova
+git pull --ff-only
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate MFP-Nova
+GPU_ID=1
+CPU_THREADS=4
+tag="$(date +%Y%m%d_%H%M%S)"
+mkdir -p runs
+nohup env CUDA_VISIBLE_DEVICES="$GPU_ID" OMP_NUM_THREADS="$CPU_THREADS" \
+    MKL_NUM_THREADS="$CPU_THREADS" OPENBLAS_NUM_THREADS="$CPU_THREADS" \
+    bash -c '
+set -e
+for task in fine39 major15; do
+    run="trirelay_${task}_esm650m_ema_sharedprivate_seed42_v100_${2}"
+    "$1" -u -m mfp_nova.cli train \
+        --model trirelay --task "$task" --esm 650m --seed 42 \
+        --device cuda:0 --precision fp32 --batch-size 64 \
+        --ema-decay 0.999 --ema-start-epoch 6 --shared-private \
+        --consistency-weight 0 --function-aux-weight 0 \
+        --reconstruction-gradient sum --name "$run"
+    "$1" -u -m mfp_nova.cli evaluate \
+        --checkpoint "runs/$run/best.pt" --split val --device cuda:0 --batch-size 64 \
+        --output "runs/$run/val.json" --predictions "runs/$run/val_predictions.npz"
+done
+tar -czf "runs/trirelay_sharedprivate_seed42_${2}.tar.gz" \
+    runs/trirelay_*_esm650m_ema_sharedprivate_seed42_v100_${2}/{metadata.json,results.json,history.jsonl,val.json,val_predictions.npz}
+' _ "$(command -v python)" "$tag" > "runs/sharedprivate_${tag}.log" 2>&1 < /dev/null &
+printf 'PID=%s\n日志=runs/sharedprivate_%s.log\n' "$!" "$tag"
+)
+```
+
+完成后回传压缩文件，比较 Macro/Micro-AP、F1、传统五指标、MFP检测及功能集合F1、逐标签和缺结构/D型分组；独立 Val 重评必须复现保存阈值下的结果。共享/私有路径的收益仍待实验验证，不把门控权重直接解释成生物因果作用。

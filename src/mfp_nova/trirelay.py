@@ -4,7 +4,44 @@ from torch import nn
 
 from .research_layers import (SequenceEncoder, GeometryEncoder, PropertyEncoder, MultimodalInteraction,
                               EvidenceReader, TailClassifier, LabelRelations, Attention, Reconstruction,
-                              masked_mean, training_views, reconstruction_loss, observed_label_loss)
+                              FeedForward, masked_mean, training_views, reconstruction_loss, observed_label_loss)
+
+
+class SharedPrivateEvidence(nn.Module):
+    """Preserve pre-relay evidence, without claiming statistical disentanglement."""
+
+    def __init__(self, dim, heads, dropout):
+        super().__init__()
+        self.shared = nn.ModuleList([FeedForward(dim, 2, dropout) for _ in range(3)])
+        self.private = nn.ModuleList([nn.ModuleList([FeedForward(dim, 2, dropout) for _ in range(2)])
+                                      for _ in range(3)])
+        self.readers = nn.ModuleList([Attention(dim, heads, dropout) for _ in range(3)])
+        self.gates = nn.ModuleList([nn.Sequential(nn.Linear(4*dim, dim), nn.GELU(), nn.Linear(dim, 1))
+                                    for _ in range(3)])
+
+    def split(self, streams, masks):
+        shared, private = [], []
+        for x, mask, shared_layer, private_layers in zip(streams, masks, self.shared, self.private):
+            shared.append(shared_layer(x, mask))
+            for layer in private_layers:
+                x = layer(x, mask)
+            private.append(x)
+        return shared, private
+
+    def read(self, reader, streams, private, masks, quality, context=None, quality_aware=True):
+        query, shared_evidence, qualities = reader.read(streams, masks, quality, context, quality_aware)
+        qmask = torch.ones(query.shape[:2], dtype=torch.bool, device=query.device)
+        private_evidence = torch.stack([attention(query, x, qmask, mask)
+                                       for attention, x, mask in zip(self.readers, private, masks)], 2)
+        gates = torch.stack([torch.sigmoid(gate(torch.cat([query, shared_evidence[:, :, m],
+                                                          private_evidence[:, :, m], qualities[:, :, m]], -1)))
+                             for m, gate in enumerate(self.gates)], 2)
+        present = torch.stack([mask.any(1) for mask in masks], 1)
+        gates = gates*present[:, None, :, None]
+        evidence = shared_evidence+gates*private_evidence
+        # Recompute modality weights using both evidence paths, including missing masks.
+        fused, evidence, weights = reader.fuse(query, evidence, qualities, masks)
+        return fused, evidence, weights, private_evidence, gates.squeeze(-1)
 
 
 class TriRelay(nn.Module):
@@ -12,7 +49,7 @@ class TriRelay(nn.Module):
                  dropout=.15, sequence_depth=4, geometry_depth=4, property_depth=2,
                  interaction_depth=3, feedback=True, relations=True, high_order=True,
                  quality_aware=True, property_geometry=True, function_aux=False,
-                 function_aux_statistics=None):
+                 function_aux_statistics=None, shared_private=False):
         super().__init__()
         self.statistics = statistics
         self.feedback_enabled, self.relations_enabled = feedback, relations
@@ -33,15 +70,24 @@ class TriRelay(nn.Module):
         if function_aux:
             from .function_auxiliary import FunctionAuxiliary
             self.function_auxiliary = FunctionAuxiliary(statistics["labels"], function_aux_statistics, dim, heads, dropout)
+        if shared_private:
+            self.evidence_partition = SharedPrivateEvidence(dim, heads, dropout)
 
     def forward(self, batch):
         prop, pmask = self.properties(batch)
         seq, smask = self.sequence(batch)
         geo, gmask = self.geometry(batch, masked_mean(prop, pmask) if self.property_geometry else None, self.quality_aware)
         streams, masks = [seq, geo, prop], [smask, gmask, pmask]
+        partitioned = hasattr(self, "evidence_partition")
+        if partitioned:
+            streams, private = self.evidence_partition.split(streams, masks)
         for interaction in self.interactions:
             streams = interaction(streams, masks, batch["quality"], self.quality_aware)
-        direct, evidence, fusion = self.reader(streams, masks, batch["quality"], quality_aware=self.quality_aware)
+        if partitioned:
+            direct, evidence, fusion, private_evidence, private_gate = self.evidence_partition.read(
+                self.reader, streams, private, masks, batch["quality"], quality_aware=self.quality_aware)
+        else:
+            direct, evidence, fusion = self.reader(streams, masks, batch["quality"], quality_aware=self.quality_aware)
         relation = self.relations(direct, self.high_order) if self.relations_enabled else direct
         if self.feedback_enabled:
             label_mask = torch.ones(relation.shape[:2], dtype=torch.bool, device=relation.device)
@@ -50,7 +96,11 @@ class TriRelay(nn.Module):
                 delta = attention(x, relation, mask, label_mask)
                 refined.append((x+torch.sigmoid(gate(torch.cat([x, delta], -1)))*delta)*mask[..., None])
             streams = self.refine(refined, masks, batch["quality"], self.quality_aware)
-            final, evidence, fusion = self.reader(streams, masks, batch["quality"], context=relation, quality_aware=self.quality_aware)
+            if partitioned:
+                final, evidence, fusion, private_evidence, private_gate = self.evidence_partition.read(
+                    self.reader, streams, private, masks, batch["quality"], context=relation, quality_aware=self.quality_aware)
+            else:
+                final, evidence, fusion = self.reader(streams, masks, batch["quality"], context=relation, quality_aware=self.quality_aware)
             relation = self.relations(final, self.high_order) if self.relations_enabled else final
         else:
             final = direct
@@ -63,6 +113,9 @@ class TriRelay(nn.Module):
         output = {"logits": logits, "direct": direct_logits, "branch": branch, "fusion": fusion,
                 "available": torch.stack([m.any(1) for m in masks], 1),
                 "reconstruction": self.reconstruction(streams[0][:, :-1], streams[2])}
+        if partitioned:
+            output["private_branch"] = torch.stack([self.classifier(private_evidence[:, :, m]) for m in range(3)], 1)
+            output["private_gate"] = private_gate
         if hasattr(self, "function_auxiliary"):
             output["function_aux"] = self.function_auxiliary(final+relation_weight*(relation-final))
         return output
@@ -72,8 +125,13 @@ class TriRelay(nn.Module):
         output = self(view)
         loss = lambda logits, target: observed_label_loss(logits, target, self.statistics, settings.get("unlabeled_weight", .3))
         terms = {"classification": loss(output["logits"], batch["y"]), "direct": loss(output["direct"], batch["y"])}
-        branches = [loss(output["branch"][output["available"][:, m], m], batch["y"][output["available"][:, m]])
-                    for m in range(3) if output["available"][:, m].any()]
+        # The existing branch-loss budget is shared by combined/private evidence;
+        # no additional loss coefficient or orthogonality objective is introduced.
+        branch_outputs = [output["branch"]]
+        if "private_branch" in output:
+            branch_outputs.append(output["private_branch"])
+        branches = [loss(branch[output["available"][:, m], m], batch["y"][output["available"][:, m]])
+                    for branch in branch_outputs for m in range(3) if output["available"][:, m].any()]
         terms["branch"] = torch.stack(branches).mean()
         terms["reconstruction"] = reconstruction_loss(output["reconstruction"], batch, hidden)
         total = terms["classification"]+settings.get("direct", .2)*terms["direct"]+settings.get("branch", .1)*terms["branch"]+settings.get("reconstruction", .05)*terms["reconstruction"]

@@ -221,7 +221,7 @@ class EvidenceReader(nn.Module):
         self.score = nn.Sequential(nn.Linear(3*dim, dim), nn.GELU(), nn.Linear(dim, 1))
         self.norm = nn.LayerNorm(dim)
 
-    def forward(self, streams, masks, quality, context=None, quality_aware=True):
+    def read(self, streams, masks, quality, context=None, quality_aware=True):
         query = self.query[None].expand(streams[0].shape[0], -1, -1)
         if context is not None:
             query = query+context
@@ -230,11 +230,18 @@ class EvidenceReader(nn.Module):
         qualities = self.quality(quality)[:, None].expand(-1, query.shape[1], -1, -1)
         if not quality_aware:
             qualities = torch.zeros_like(qualities)
+        return query, evidence, qualities
+
+    def fuse(self, query, evidence, qualities, masks):
         score = self.score(torch.cat([query[:, :, None].expand_as(evidence), evidence, qualities], -1)).squeeze(-1)
         present = torch.stack([mask.any(1) for mask in masks], 1)
         weights = score.masked_fill(~present[:, None], -1e4).softmax(-1)
         fused = self.norm(query+(evidence*weights[..., None]).sum(2))
         return fused, evidence, weights
+
+    def forward(self, streams, masks, quality, context=None, quality_aware=True):
+        query, evidence, qualities = self.read(streams, masks, quality, context, quality_aware)
+        return self.fuse(query, evidence, qualities, masks)
 
 
 class TailClassifier(nn.Module):

@@ -124,6 +124,8 @@ def train(config, name, resume=None):
     if checkpoint is not None:
         # Resume preserves the trained model/priors/protocol; only execution controls change.
         original = checkpoint["config"]
+        if "shared_private" in config["model"] and config["model"]["shared_private"] != original["model"].get("shared_private", False):
+            raise ValueError("Shared/private architecture differs from checkpoint; start a new run")
         if settings.get("ema_decay") is not None and original["train"].get("ema_decay") is None:
             raise ValueError("EMA changes the experiment; start a new training run instead of resuming a non-EMA checkpoint")
         for key in ("consistency_weight", "consistency_start_epoch", "consistency_ramp_epochs"):
