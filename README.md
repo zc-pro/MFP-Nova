@@ -836,7 +836,7 @@ g = g_main + g_aux                       # 共同参数
 
 这是项目适配的非对称主辅梯度方法，不宣称复现AuxiNash或完整PCGrad。约束只在每个microbatch的原始梯度空间成立；梯度累积的交叉项、AdamW预条件及参数更新仍可能改变方向，因此不保证下一step的分类Loss、Val指标或长期收敛单调改善。辅助组范围不包含新的跨粒度监督；本轮指令将其与一致性均关闭。
 
-新功能默认关闭；`--reconstruction-gradient sum` 为旧梯度求和，`project` 启用上述投影和范数平衡。`--reconstruction-grad-ratio` 只控制共享重建梯度的上限，默认1。model参数量恢复为 major15 **35,196,329**、fine39 **35,209,345**，冻结ESM不计入；输入、模型深度、反馈、关系推理和评价协议不变。
+新功能默认关闭；`--reconstruction-gradient sum` 为旧梯度求和，`project` 启用上述投影和范数平衡，`cap` 仅限制范数而保留原重建梯度方向。`--reconstruction-grad-ratio` 只控制共享重建梯度的上限，默认1。model参数量恢复为 major15 **35,196,329**、fine39 **35,209,345**，冻结ESM不计入；输入、模型深度、反馈、关系推理和评价协议不变。
 
 RTX5070 的 **PowerShell** 正式实验命令如下，每组使用完整原数据、seed42、EMA、FP32/batch64；从新运行开始，不接旧目标的 `last.pt`。先fine39，再major15，串行执行：
 
@@ -870,3 +870,39 @@ foreach ($task in @('fine39', 'major15')) {
 诊断按`row_id`和标签名称对齐两份完整Val概率，核对当前观测标签；输出原保存阈值、共享0.50/参考阈值/候选阈值、逐标签Val拟合与两折簇交叉拟合结果。共享阈值用于研究分数尺度差异；逐标签全Val拟合有选择乐观性，交叉拟合仅隔离额外阈值拟合，checkpoint仍用完整Val选择，均不能当作独立Test结论。所有阈值实验都不改写原checkpoint、不自动采用。AP保持原始概率口径，未标注0不解释为实验确认阴性，分数分位数不解释为真实概率校准。
 
 本地输出仅`results.json`、`label_diagnostics.csv`和`report.md`，包含逐标签AP/F1、TP/观测FP/FN、正例/未标注分数分位数、近阈值数量及缺结构/D构型分组。相关15项CPU测试通过，并确认旧的真实8534×15 Val NPZ仍可读取；当前四份正式概率尚在服务器待导出，本机未执行四checkpoint重评。此次只增加分析入口和导出脚本，没有修改训练算法或配置；修改前的`decisions.py`和README保存在仓库外`D:\Data\Code\MFP-Nova-originals\20261020-val-probability-comparison`。
+
+### fine39 重建梯度单项消融：仅限制范数
+
+完整 fine39 / seed42 Val 概率配对显示，`project, rho=1` 相对 EMA-only 在共同0.65阈值下，Jaccard由0.5456升至0.5556，多功能组的独立功能集合F1由0.6134升至0.6339，但MFP检测F1由0.5117降至0.5066。0.05～0.95、步长0.01的全局阈值扫描不能同时恢复原Jaccard及MFP检测F1。为区分方向投影与范数控制，下一轮只运行 **TriRelay / 完整fine39 / seed42 / cap / rho=1**；major15暂不追加，原默认模式仍为`sum`。
+
+`cap`在共同参数上使用原始加权重建梯度：
+
+```text
+g_aux *= min(1, rho * ||g_main|| / ||g_aux||)
+g = g_main + g_aux
+```
+
+与`project`相比仅取消负内积时的方向投影，其余共享参数定义、零主梯度处理、私有梯度、EMA、数据、损失权重及训练协议相同。`cap`保留负向分量，仍可能抵消部分主梯度；不保证下一步主Loss或Val改善。它仍对同一前向图计算两组梯度，不能假设恢复到原EMA-only速度。
+
+RTX5070空闲时在PowerShell执行；从新运行开始，不恢复`project`或EMA-only的`last.pt`：
+
+```powershell
+Set-Location 'D:\Data\ChatGPT\mfp\MFP-Nova'
+git pull --ff-only
+if ($LASTEXITCODE -ne 0) { throw 'Git 更新失败。' }
+$mfpPython = 'D:\App\Code\Anaconda\envs\MFP-Nova\python.exe'
+$tag = Get-Date -Format 'yyyyMMdd_HHmmss'
+$run = "trirelay_fine39_esm650m_ema_reconcap_seed42_$tag"
+& $mfpPython -u -m mfp_nova.cli train `
+    --model trirelay --task fine39 --esm 650m --seed 42 `
+    --device cuda:0 --precision fp32 --batch-size 64 `
+    --ema-decay 0.999 --ema-start-epoch 6 `
+    --consistency-weight 0 --function-aux-weight 0 `
+    --reconstruction-gradient cap --reconstruction-grad-ratio 1 `
+    --name $run
+if ($LASTEXITCODE -ne 0) { throw 'fine39 cap 训练失败。' }
+```
+
+`ReconGrad`显示`mode=cap`、观测冲突`conflict`、实际投影`projected=0`及范数限制`capped`。history保存真实mode与`projected_batches`，避免把观测到冲突误当作进行了投影。旧`project`行为保留；恢复自己的`last.pt`会沿用模式和rho，跨模式恢复仍会报错。
+
+继续以Val Macro-AP选checkpoint、Micro-AP并列判定、Val全局Jaccard选阈值。完成后独立导出最佳EMA的Val JSON与NPZ，与既有EMA-only及`project`进行相同口径比较，同时看传统五指标、MFP detection和`mfp_function_prediction`。不提前运行Test或改选checkpoint。本轮相关梯度及恢复测试和真实缓存CPU检查只验证实现，不能当作GPU性能或模型收益证据。

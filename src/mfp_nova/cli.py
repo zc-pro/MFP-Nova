@@ -44,7 +44,7 @@ def main(argv=None):
             sub.add_argument("--consistency-ramp-epochs", type=int, help="Consistency weight ramp length (default: 5)")
             sub.add_argument("--function-aux-weight", type=float, help="TriRelay: real paired major15/fine39 auxiliary supervision (candidate: 0.1)")
             sub.add_argument("--function-hierarchy-weight", type=float, help="Soft subtype <= parent constraint (default: 0.02 when auxiliary is enabled)")
-            sub.add_argument("--reconstruction-gradient", choices=("sum", "project"), help="TriRelay: main-priority reconstruction gradient projection and norm balancing")
+            sub.add_argument("--reconstruction-gradient", choices=("sum", "cap", "project"), help="TriRelay: sum=original; cap=shared auxiliary norm cap; project=conflict projection plus norm cap")
             sub.add_argument("--reconstruction-grad-ratio", type=float, help="Maximum shared reconstruction/main gradient norm ratio (default: 1)")
             sub.add_argument("--name")
             sub.add_argument("--seed", type=int)

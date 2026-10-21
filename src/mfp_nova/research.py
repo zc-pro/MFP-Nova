@@ -165,9 +165,9 @@ def train(config, name, resume=None):
         config["model"]["function_aux"] = True
     reconstruction_gradient = settings.get("reconstruction_gradient", "sum")
     gradient_ratio = settings.get("reconstruction_grad_ratio", 1.)
-    if reconstruction_gradient not in ("sum", "project") or not math.isfinite(gradient_ratio) or gradient_ratio < 0:
-        raise ValueError("Use reconstruction_gradient=sum/project and a finite nonnegative gradient ratio")
-    if reconstruction_gradient == "project" and config["model_name"] != "trirelay":
+    if reconstruction_gradient not in ("sum", "cap", "project") or not math.isfinite(gradient_ratio) or gradient_ratio < 0:
+        raise ValueError("Use reconstruction_gradient=sum/cap/project and a finite nonnegative gradient ratio")
+    if reconstruction_gradient != "sum" and config["model_name"] != "trirelay":
         raise ValueError("Reconstruction gradient balancing currently supports TriRelay")
     source = MultimodalData(config["data"]["root"], config["data"]["track"],
                            checkpoint["statistics"] if checkpoint else None,
@@ -265,8 +265,8 @@ def train(config, name, resume=None):
         aux_stats = source.statistics["function_auxiliary"]
         metadata["function_auxiliary"] = {"task": aux_stats["track"], "labels": aux_stats["labels"],
                                           "statistics_train_rows": aux_stats["train_rows"]}
-    if reconstruction_gradient == "project":
-        metadata["gradient_optimization"] = "main-priority reconstruction; logged total is the original weighted loss sum"
+    if reconstruction_gradient != "sum":
+        metadata["gradient_optimization"] = f"reconstruction gradient mode={reconstruction_gradient}; logged total is the original weighted loss sum"
     write_json(run/"metadata.json", metadata)
     static = {"model_name": config["model_name"], "model_args": args, "config": config, "statistics": source.statistics,
               "labels": source.data.labels, "track": source.data.track, "encoder": datasets[0].meta, "planned_epochs": planned_epochs}
@@ -312,7 +312,7 @@ def train(config, name, resume=None):
             if not torch.isfinite(loss):
                 raise FloatingPointError("Nonfinite research loss")
             group_size = min(accumulation, len(loaders[0])-(batch_index//accumulation)*accumulation)
-            if reconstruction_gradient == "project":
+            if reconstruction_gradient != "sum":
                 from .gradient_balance import backward_reconstruction
                 auxiliary = loss_settings.get("reconstruction", .05)*components["reconstruction"]
                 # Construct the primary graph directly: subtracting reconstruction
@@ -323,7 +323,8 @@ def train(config, name, resume=None):
                     if key in components:
                         main = main+loss_settings.get(key, 0)*components[key]
                 gradient_records.append(backward_reconstruction(scaler.scale(main/group_size),
-                    scaler.scale(auxiliary/group_size), model.parameters(), gradient_ratio))
+                    scaler.scale(auxiliary/group_size), model.parameters(), gradient_ratio,
+                    project_conflicts=reconstruction_gradient=="project"))
             else:
                 scaler.scale(loss/group_size).backward()
             boundary = (batch_index+1)%accumulation==0 or batch_index+1==len(loaders[0])
@@ -392,8 +393,9 @@ def train(config, name, resume=None):
         if gradient_records:
             valid = [r for r in gradient_records if r["finite"]]
             history["reconstruction_gradient"] = {
-                "mode":"project", "batches":len(gradient_records), "finite_batches":len(valid),
+                "mode":reconstruction_gradient, "batches":len(gradient_records), "finite_batches":len(valid),
                 "conflicting_batches":sum(r["conflict"] for r in valid),
+                "projected_batches":sum(r["projected"] for r in valid),
                 "capped_batches":sum(r["capped"] for r in valid), "max_ratio":gradient_ratio}
             for key in ("cosine", "weighted_aux_main_ratio", "applied_aux_main_ratio"):
                 observed = [r[key] for r in valid if r[key] is not None]
@@ -440,7 +442,8 @@ def train(config, name, resume=None):
         if gradient_records:
             g = history["reconstruction_gradient"]
             fmt = lambda value: "NA" if value is None else f"{value:.4f}"
-            print(f"ReconGrad | conflict={g['conflicting_batches']}/{g['finite_batches']} "
+            print(f"ReconGrad | mode={reconstruction_gradient} conflict={g['conflicting_batches']}/{g['finite_batches']} "
+                  f"projected={g['projected_batches']}/{g['finite_batches']} "
                   f"capped={g['capped_batches']}/{g['finite_batches']} "
                   f"cosine={fmt(g['mean_cosine'])} ratio={fmt(g['mean_weighted_aux_main_ratio'])} "
                   f"applied={fmt(g['mean_applied_aux_main_ratio'])} max={gradient_ratio:g}", flush=True)

@@ -1,12 +1,13 @@
-"""Main-priority reconstruction gradients, confined to shared parameters."""
+"""Reconstruction gradient projection and norm caps on shared parameters."""
 import math
 import torch
 
 
-def backward_reconstruction(primary_loss, auxiliary_loss, parameters, max_ratio=1.):
+def backward_reconstruction(primary_loss, auxiliary_loss, parameters, max_ratio=1., project_conflicts=True):
     """Losses already include task weights, accumulation divisor and AMP scale.
 
-    Project only a conflicting auxiliary component; then bound its shared norm.
+    Optionally project a conflicting auxiliary component, then cap its norm.
+    With project_conflicts=False the auxiliary direction is preserved.
     Private gradients retain their original values. AdamW/clipping can still
     change update directions: this is a gradient-space, per-microbatch rule.
     """
@@ -29,7 +30,7 @@ def backward_reconstruction(primary_loss, auxiliary_loss, parameters, max_ratio=
             raw_ratio = (aux_norm_sq/main_norm_sq)**.5
             cosine = product/(main_norm_sq*aux_norm_sq)**.5 if aux_norm_sq > 0 else None
             conflict = product < 0
-            coefficient = product/main_norm_sq if conflict else 0.
+            coefficient = product/main_norm_sq if conflict and project_conflicts else 0.
             projected_sq = max(0., aux_norm_sq-coefficient*product)
             projected_ratio = (projected_sq/main_norm_sq)**.5
             capped = projected_ratio > max_ratio
@@ -51,6 +52,6 @@ def backward_reconstruction(primary_loss, auxiliary_loss, parameters, max_ratio=
             p.grad = contribution
         else:
             p.grad.add_(contribution)
-    return {'finite':finite, 'conflict':conflict, 'capped':capped,
+    return {'finite':finite, 'conflict':conflict, 'projected':conflict and project_conflicts, 'capped':capped,
             'cosine':cosine, 'weighted_aux_main_ratio':raw_ratio,
             'applied_aux_main_ratio':applied_ratio}
