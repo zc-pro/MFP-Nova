@@ -504,8 +504,13 @@ def load_model(path, device="cpu"):
     return model.eval(), checkpoint
 
 
-def evaluate(checkpoint_path, data_root, feature_root, split, device, output, predictions=None, batch_size=32, decision_path=None):
+def evaluate(checkpoint_path, data_root, feature_root, split, device, output, predictions=None, batch_size=32, decision_path=None,
+             without_private_evidence=False):
     model, checkpoint = load_model(checkpoint_path, device)
+    if without_private_evidence:
+        if checkpoint["model_name"] != "trirelay" or not hasattr(model, "evidence_partition"):
+            raise ValueError("Private evidence ablation requires a shared-private TriRelay checkpoint")
+        model.private_evidence_enabled = False
     source = MultimodalData(data_root, checkpoint["track"], checkpoint["statistics"])
     dataset = MultimodalPeptides(source, feature_root, split)
     validate_cache(dataset, checkpoint["config"], checkpoint["encoder"])
@@ -528,6 +533,12 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
               "metrics": evaluate_metrics(y, probabilities, threshold, source.statistics['labels']['support'],
                   source.statistics['function_projection'], predicted), "groups": grouped,
               "annotation_based_metrics": True, "experimental_structure_group": None}
+    if hasattr(model, "evidence_partition"):
+        result['inference_ablation'] = {
+            'private_evidence_enabled': not without_private_evidence,
+            'scope': ('Zero private evidence residual in both reads; feedback/context and fusion recomputed; weights unchanged'
+                      if without_private_evidence else 'Unmodified shared-private checkpoint inference'),
+            'threshold_refit': False}
     if decision is not None:
         result['decision'] = decision
     Path(output).parent.mkdir(parents=True, exist_ok=True)
@@ -538,7 +549,8 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
         with Path(predictions).open("xb") as f:
             np.savez_compressed(f, row_id=source.data.rows[dataset.indices], ID=source.data.ids[dataset.indices],
                                 targets=y, probabilities=probabilities, label_names=np.array(source.data.labels), threshold=threshold,
-                                split=split, task=checkpoint['track'], decision_json=json.dumps(decision))
+                                split=split, task=checkpoint['track'], decision_json=json.dumps(decision),
+                                inference_ablation_json=json.dumps(result.get('inference_ablation')))
     return result
 
 

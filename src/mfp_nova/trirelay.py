@@ -28,7 +28,7 @@ class SharedPrivateEvidence(nn.Module):
             private.append(x)
         return shared, private
 
-    def read(self, reader, streams, private, masks, quality, context=None, quality_aware=True):
+    def read(self, reader, streams, private, masks, quality, context=None, quality_aware=True, private_enabled=True):
         query, shared_evidence, qualities = reader.read(streams, masks, quality, context, quality_aware)
         qmask = torch.ones(query.shape[:2], dtype=torch.bool, device=query.device)
         private_evidence = torch.stack([attention(query, x, qmask, mask)
@@ -38,6 +38,8 @@ class SharedPrivateEvidence(nn.Module):
                              for m, gate in enumerate(self.gates)], 2)
         present = torch.stack([mask.any(1) for mask in masks], 1)
         gates = gates*present[:, None, :, None]
+        if not private_enabled:
+            gates = torch.zeros_like(gates)
         evidence = shared_evidence+gates*private_evidence
         # Recompute modality weights using both evidence paths, including missing masks.
         fused, evidence, weights = reader.fuse(query, evidence, qualities, masks)
@@ -55,6 +57,8 @@ class TriRelay(nn.Module):
         self.feedback_enabled, self.relations_enabled = feedback, relations
         self.high_order, self.quality_aware = high_order, quality_aware
         self.property_geometry = property_geometry
+        # Runtime inference intervention; not a learned parameter/checkpoint setting.
+        self.private_evidence_enabled = True
         self.sequence = SequenceEncoder(input_dim, vocab_size, dim, heads, dropout, sequence_depth)
         self.geometry = GeometryEncoder(dim, heads, dropout, geometry_depth)
         self.properties = PropertyEncoder(dim, heads, dropout, property_depth)
@@ -85,7 +89,8 @@ class TriRelay(nn.Module):
             streams = interaction(streams, masks, batch["quality"], self.quality_aware)
         if partitioned:
             direct, evidence, fusion, private_evidence, private_gate = self.evidence_partition.read(
-                self.reader, streams, private, masks, batch["quality"], quality_aware=self.quality_aware)
+                self.reader, streams, private, masks, batch["quality"], quality_aware=self.quality_aware,
+                private_enabled=self.private_evidence_enabled)
         else:
             direct, evidence, fusion = self.reader(streams, masks, batch["quality"], quality_aware=self.quality_aware)
         relation = self.relations(direct, self.high_order) if self.relations_enabled else direct
@@ -98,7 +103,8 @@ class TriRelay(nn.Module):
             streams = self.refine(refined, masks, batch["quality"], self.quality_aware)
             if partitioned:
                 final, evidence, fusion, private_evidence, private_gate = self.evidence_partition.read(
-                    self.reader, streams, private, masks, batch["quality"], context=relation, quality_aware=self.quality_aware)
+                    self.reader, streams, private, masks, batch["quality"], context=relation, quality_aware=self.quality_aware,
+                    private_enabled=self.private_evidence_enabled)
             else:
                 final, evidence, fusion = self.reader(streams, masks, batch["quality"], context=relation, quality_aware=self.quality_aware)
             relation = self.relations(final, self.high_order) if self.relations_enabled else final

@@ -63,6 +63,8 @@ def main(argv=None):
     evaluate.add_argument("--batch-size", type=int)
     evaluate.add_argument("--predictions", help="Optional aligned sample probabilities in NPZ format")
     evaluate.add_argument("--decision", help="Validation-fitted research-model decision.json; raw ranking scores stay unchanged")
+    evaluate.add_argument("--without-private-evidence", action="store_true",
+                          help="Shared-private TriRelay: zero private residual in both reads, retaining weights and saved threshold")
     predict = commands.add_parser("predict")
     predict.add_argument("--checkpoint", required=True)
     prediction_input = predict.add_mutually_exclusive_group(required=True)
@@ -176,6 +178,8 @@ def main(argv=None):
     elif args.command == "evaluate":
         import torch
         checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
+        if args.without_private_evidence and "model_name" not in checkpoint:
+            raise ValueError("Private evidence ablation requires a shared-private TriRelay checkpoint")
         if "model_name" in checkpoint:
             from .research import evaluate
         else:
@@ -183,6 +187,8 @@ def main(argv=None):
         feature_root = args.feature_root or checkpoint["config"]["data"]["features"]
         batch_size = args.batch_size or checkpoint["config"]["train"].get("batch_size", 128)
         extra = {}
+        if args.without_private_evidence:
+            extra['without_private_evidence'] = True
         if args.decision:
             if "model_name" not in checkpoint:
                 raise ValueError("Function decisions are supported for research models")

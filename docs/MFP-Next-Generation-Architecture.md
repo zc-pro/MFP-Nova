@@ -240,6 +240,8 @@ alpha_icm = masked_softmax_m(score([query_ic, e_icm, quality_im]))
 
 实现检查：12 项相关 CPU 测试通过，覆盖两任务、D/L/padding/缺模态、两轮私有 token 不被回写、关键路径梯度、旧模型兼容、EMA 精确恢复及独立 Val 重评。真实 ESM-650M 缓存另做两任务各 8 样本、2 optimizer step 的完整规模 CPU 检查，全部选定模块有非零有限梯度及参数更新；诊断记录位于 `runs/diagnostics/trirelay_shared_private_20261021/real_cache_check.json`。这是实现验证，不是性能/收敛结果；本轮未运行 GPU 或 Test。
 
+后续RTX5070完整seed42训练已完成，major15/fine39最佳轮13/15、早停轮28/30、显存7.20/7.61GiB，MFP检测F1均低于EMA-only。先通过`mfp_nova.private_evidence`导出两份best.pt的完整Val及同权重推理消融。消融在两次读取都将`g * private_evidence`置零，第一轮标签关系、反馈和第二轮query据此重新计算；保留新模型学得的共享投影和全部其他权重，使用同一保存阈值。它检验模型对私有残差的依赖，不等价于重训原架构，不预设移除残差后能改善。运行时开关不进入state_dict、不改变旧权重加载或训练默认值；正式GPU消融结果待回传。
+
 ### 数据和 Tensor 约定
 
 默认继续使用原始明确骨架队列，不使用已有未验证合成肽。保留无结构和 D 肽。序列输入为 ESM `[B,L,D]`、AA/D/残基化学 token `[B,L]`、全局修饰 token `[B,T]`；G 不赋予真实 D 构型。未定位 PTM/连接文本保留为全局化学语义，不虚构局部修饰位置。

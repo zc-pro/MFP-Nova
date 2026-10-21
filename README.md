@@ -938,11 +938,11 @@ printf 'PID=%s\n日志=runs/%s.log\n' "$!" "$run"
 
 ### 当前实验：TriRelay 共享交互＋私有证据
 
-major15 的 cap 实验已完成，AP 的微小提升没有带来 F1/Jaccard/MFP 的一致改善，因此不继续扩展重建梯度网格。下一项为改进书 7.1 的共享—私有机制：保留原完整深度和交互，增加绕过 relay/反馈回写的私有证据流；两轮标签条件读取及质量感知门控将其融入决策。完整数据仍为 major15 Train39478/Val8534、fine39 Train39455/Val8529；没有重新划分或缩小正式训练集。
+major15 的 cap 实验已完成，AP 的微小提升没有带来 F1/Jaccard/MFP 的一致改善，因此不继续扩展重建梯度网格。改进书 7.1 的共享—私有机制也已完成两任务seed42训练：保留原完整深度和交互，增加绕过 relay/反馈回写的私有证据流；两轮标签条件读取及质量感知门控将其融入决策。完整数据仍为 major15 Train39478/Val8534、fine39 Train39455/Val8529；没有重新划分或缩小正式训练集。
 
 开关 `--shared-private`，默认关闭，旧模型及旧 checkpoint 保持可用。实际参数 major15 **39,147,692**、fine39 **39,160,708**，不含冻结 ESM。总 Loss 和原分支预算不增加；private 分支共享原 0.1 分支预算，重建只读取共享流。详细数据流和限制见[模型技术说明](docs/MFP-Next-Generation-Architecture.md)。本轮关闭此前一致性、功能辅助和重建梯度控制，只与已有 EMA-only 对照；新架构从新运行训练，不能接旧架构的 last.pt。
 
-以下两平台命令二选一，在所选项目无训练进程时更新源码。先 fine39 后 major15，固定 seed42、完整数据、FP32/batch64、EMA0.999/start6；每组结束自动独立重评最佳 checkpoint 的完整 Val 并导出逐样本概率。本轮不跑新 seed 或 Test。新增网络的 GPU 峰值/速度尚未实测，batch64 根据原模型约7GiB的记录作为起点，不保证新模型用量相同。`sum` 恢复单次普通 backward，避免此前 cap/project 的双梯度计算；实际加速以 GPU 日志为准。
+以下保留已完成实验的训练命令供复现；当前下一步执行文末的Val导出及私有路径推理消融，无需重训。两平台命令二选一，在所选项目无训练进程时更新源码。训练协议为固定seed42、完整数据、FP32/batch64、EMA0.999/start6；不跑新seed或Test。RTX5070实际峰值major15为7.20GiB、fine39为7.61GiB，EMA阶段每轮约169/177秒，分别第13/15轮最佳、第28/30轮早停，两组总计约165分钟。V100尚未实测此候选。
 
 RTX5070，**PowerShell**：
 
@@ -1014,3 +1014,54 @@ printf 'PID=%s\n日志=runs/sharedprivate_%s.log\n' "$!" "$tag"
 ```
 
 完成后回传压缩文件，比较 Macro/Micro-AP、F1、传统五指标、MFP检测及功能集合F1、逐标签和缺结构/D型分组；独立 Val 重评必须复现保存阈值下的结果。共享/私有路径的收益仍待实验验证，不把门控权重直接解释成生物因果作用。
+
+### 下一步：同 checkpoint 的完整 Val 导出与私有证据推理消融
+
+已完成的共享—私有训练相对EMA-only：major15 MacroAP 0.5614→0.5636、MacroF1 0.5510→0.5536，但MFP检测F1 0.5313→0.5056；fine39 MacroAP 0.5359→0.5374、MicroF1 0.5947→0.6004，但MFP检测F1 0.5117→0.4788、功能集合F1 0.6134→0.6039。当前不替换默认算法、不扩展五seed，先利用已有权重定位私有路径与决策差异。
+
+`python -m mfp_nova.private_evidence`对每个run的`best.pt`做两次完整Val推理：`full`保留原计算；`without_private`仅将**两轮读取中的私有证据残差**置零，保留全部权重、共享投影、交互、反馈、高阶关系及原保存阈值，重新计算反馈上下文和融合权重。没有重训或重新拟合阈值，不能将其视作原EMA-only架构或重训的无私有流模型。推理仍计算私有表示，不用于测量移除模块后的加速。
+
+两任务共四次Val推理，输出各自`full.json/.npz`、`without_private.json/.npz`和一份`summary.json`，自动生成同名ZIP，不含checkpoint/ESM。summary记录完整推理相对原results的指标复现差值、阈值是否一致、消融差值、逐标签AP/F1变化及预测改变数量。NPZ保留row_id、ID、标签、目标、原阈值及消融说明；不覆盖原run。没有多功能标注或无正例时，无法定义的指标保持null。
+
+RTX5070 PowerShell，使用本次回传包对应的两份实际运行目录。在项目空闲时更新后执行，当前无需重新安装依赖：
+
+```powershell
+Set-Location 'D:\Data\ChatGPT\mfp\MFP-Nova'
+git pull --ff-only
+if ($LASTEXITCODE -ne 0) { throw 'Git 更新失败。' }
+$mfpPython = 'D:\App\Code\Anaconda\envs\MFP-Nova\python.exe'
+$out = 'runs/sharedprivate_val_seed42_' + (Get-Date -Format 'yyyyMMdd_HHmmss')
+& $mfpPython -u -m mfp_nova.private_evidence `
+    --runs `
+    'runs/trirelay_major15_esm650m_ema_sharedprivate_seed42_rtx5070_20261021_155324' `
+    'runs/trirelay_fine39_esm650m_ema_sharedprivate_seed42_rtx5070_20261021_171644' `
+    --device cuda:0 --batch-size 64 --output $out
+if ($LASTEXITCODE -ne 0) { throw 'Val导出或消融失败，请查看错误。' }
+Write-Host "回传：$out.zip"
+```
+
+V100 Bash：仅在**这两份相同的checkpoint和对应metadata/results已经传到下面目录**时运行；本机当前没有这两份正式权重，不替用户假定V100已完成传输。优先直接在RTX5070执行，不为V100补训。若已有V100本机独立运行，应替换为对应run目录，结果单独标记，不能冒充RTX同权重复现。
+
+```bash
+(
+set -e
+cd ~/wuzhencheng/projects/MFP-Nova
+git pull --ff-only
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate MFP-Nova
+GPU_ID=1
+CPU_THREADS=4
+out="runs/sharedprivate_val_seed42_v100_$(date +%Y%m%d_%H%M%S)"
+nohup env CUDA_VISIBLE_DEVICES="$GPU_ID" OMP_NUM_THREADS="$CPU_THREADS" \
+    MKL_NUM_THREADS="$CPU_THREADS" OPENBLAS_NUM_THREADS="$CPU_THREADS" \
+    "$(command -v python)" -u -m mfp_nova.private_evidence \
+    --runs \
+    runs/trirelay_major15_esm650m_ema_sharedprivate_seed42_rtx5070_20261021_155324 \
+    runs/trirelay_fine39_esm650m_ema_sharedprivate_seed42_rtx5070_20261021_171644 \
+    --device cuda:0 --batch-size 64 --output "$out" \
+    > "${out}.log" 2>&1 < /dev/null &
+printf 'PID=%s\n日志=%s.log\n回传=%s.zip\n' "$!" "$out" "$out"
+)
+```
+
+需要单独操作时，统一评价入口也支持`evaluate --without-private-evidence`，必须指向共享—私有TriRelay checkpoint。正常`evaluate`与所有训练默认计算保持不变；旧checkpoint不增加参数或state_dict键。当前本地4项相关检查覆盖两任务、两轮残差移除、mask、严格权重不变、阈值不变、独立导出及压缩；小型fixture结果仅验证实现，不报告成真实模型收益。正式四次GPU推理仍需在服务器执行。
