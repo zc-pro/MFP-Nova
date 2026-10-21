@@ -871,9 +871,9 @@ foreach ($task in @('fine39', 'major15')) {
 
 本地输出仅`results.json`、`label_diagnostics.csv`和`report.md`，包含逐标签AP/F1、TP/观测FP/FN、正例/未标注分数分位数、近阈值数量及缺结构/D构型分组。相关15项CPU测试通过，并确认旧的真实8534×15 Val NPZ仍可读取；当前四份正式概率尚在服务器待导出，本机未执行四checkpoint重评。此次只增加分析入口和导出脚本，没有修改训练算法或配置；修改前的`decisions.py`和README保存在仓库外`D:\Data\Code\MFP-Nova-originals\20261020-val-probability-comparison`。
 
-### fine39 重建梯度单项消融：仅限制范数
+### 重建梯度单项消融：仅限制范数
 
-完整 fine39 / seed42 Val 概率配对显示，`project, rho=1` 相对 EMA-only 在共同0.65阈值下，Jaccard由0.5456升至0.5556，多功能组的独立功能集合F1由0.6134升至0.6339，但MFP检测F1由0.5117降至0.5066。0.05～0.95、步长0.01的全局阈值扫描不能同时恢复原Jaccard及MFP检测F1。为区分方向投影与范数控制，下一轮只运行 **TriRelay / 完整fine39 / seed42 / cap / rho=1**；major15暂不追加，原默认模式仍为`sum`。
+完整 fine39 / seed42 的 `cap, rho=1` 已完成RTX5070训练及Val概率配对：相对EMA-only，保存阈值下Jaccard由0.5456升至0.5574、多功能组功能集合F1由0.6134升至0.6319，但MFP检测F1由0.5117降至0.5060。相对`project`，cap的Macro/Micro-F1及MFP检测F1改善，标签收益仍不均匀。三方案均第16轮最佳、第31轮早停，不能把这次单seed结果推广为普适收益。下一步只补 **TriRelay / 完整major15 / seed42 / cap / rho=1**，检查另一任务的适用性；不追加新Loss、其他seed或Test，原默认模式仍为`sum`。
 
 `cap`在共同参数上使用原始加权重建梯度：
 
@@ -884,7 +884,9 @@ g = g_main + g_aux
 
 与`project`相比仅取消负内积时的方向投影，其余共享参数定义、零主梯度处理、私有梯度、EMA、数据、损失权重及训练协议相同。`cap`保留负向分量，仍可能抵消部分主梯度；不保证下一步主Loss或Val改善。它仍对同一前向图计算两组梯度，不能假设恢复到原EMA-only速度。
 
-RTX5070空闲时在PowerShell执行；从新运行开始，不恢复`project`或EMA-only的`last.pt`：
+以下RTX5070与V100命令二选一，在所选项目空闲时同步并运行；与既有RTX对照做单项比较时优先使用RTX。V100使用相同实验协议，但不同硬件及PyTorch构建可能产生不同轨迹，不能作为额外独立seed合并。均从新运行开始，不恢复`project`或EMA-only的`last.pt`。
+
+RTX5070 PowerShell：
 
 ```powershell
 Set-Location 'D:\Data\ChatGPT\mfp\MFP-Nova'
@@ -892,15 +894,42 @@ git pull --ff-only
 if ($LASTEXITCODE -ne 0) { throw 'Git 更新失败。' }
 $mfpPython = 'D:\App\Code\Anaconda\envs\MFP-Nova\python.exe'
 $tag = Get-Date -Format 'yyyyMMdd_HHmmss'
-$run = "trirelay_fine39_esm650m_ema_reconcap_seed42_$tag"
+$run = "trirelay_major15_esm650m_ema_reconcap_seed42_rtx5070_$tag"
 & $mfpPython -u -m mfp_nova.cli train `
-    --model trirelay --task fine39 --esm 650m --seed 42 `
+    --model trirelay --task major15 --esm 650m --seed 42 `
     --device cuda:0 --precision fp32 --batch-size 64 `
     --ema-decay 0.999 --ema-start-epoch 6 `
     --consistency-weight 0 --function-aux-weight 0 `
     --reconstruction-gradient cap --reconstruction-grad-ratio 1 `
     --name $run
-if ($LASTEXITCODE -ne 0) { throw 'fine39 cap 训练失败。' }
+if ($LASTEXITCODE -ne 0) { throw 'major15 cap 训练失败。' }
+```
+
+V100 Bash（确认空闲GPU后修改GPU_ID，后台运行支持断开SSH；默认CPU线程4）：
+
+```bash
+(
+set -e
+cd ~/wuzhencheng/projects/MFP-Nova
+git pull --ff-only
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate MFP-Nova
+GPU_ID=1
+CPU_THREADS=4
+tag="$(date +%Y%m%d_%H%M%S)"
+run="trirelay_major15_esm650m_ema_reconcap_seed42_v100_${tag}"
+mkdir -p runs
+nohup env CUDA_VISIBLE_DEVICES="$GPU_ID" OMP_NUM_THREADS="$CPU_THREADS" \
+    MKL_NUM_THREADS="$CPU_THREADS" OPENBLAS_NUM_THREADS="$CPU_THREADS" \
+    "$(command -v python)" -u -m mfp_nova.cli train \
+    --model trirelay --task major15 --esm 650m --seed 42 \
+    --device cuda:0 --precision fp32 --batch-size 64 \
+    --ema-decay 0.999 --ema-start-epoch 6 \
+    --consistency-weight 0 --function-aux-weight 0 \
+    --reconstruction-gradient cap --reconstruction-grad-ratio 1 \
+    --name "$run" > "runs/${run}.log" 2>&1 < /dev/null &
+printf 'PID=%s\n日志=runs/%s.log\n' "$!" "$run"
+)
 ```
 
 `ReconGrad`显示`mode=cap`、观测冲突`conflict`、实际投影`projected=0`及范数限制`capped`。history保存真实mode与`projected_batches`，避免把观测到冲突误当作进行了投影。旧`project`行为保留；恢复自己的`last.pt`会沿用模式和rho，跨模式恢复仍会报错。
