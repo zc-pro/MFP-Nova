@@ -87,9 +87,9 @@ def test_two_task_val_export_preserves_weights_thresholds_and_packages_predictio
         for key,value in original['model_state'].items():
             torch.testing.assert_close(after['model_state'][key],value,rtol=0,atol=0)
     with zipfile.ZipFile(tmp_path/'paired.zip') as archive:
-        assert len(archive.namelist())==9
+        assert len(archive.namelist())==15
         assert 'summary.json' in archive.namelist()
-        assert all(name.endswith(('.json','.npz')) for name in archive.namelist())
+        assert all(name.endswith(('.json','.jsonl','.npz')) for name in archive.namelist())
 
     captured = {}
     monkeypatch.setattr(research,'evaluate',lambda *args,**kwargs: captured.update(kwargs))

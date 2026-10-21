@@ -1021,7 +1021,7 @@ printf 'PID=%s\n日志=runs/sharedprivate_%s.log\n' "$!" "$tag"
 
 `python -m mfp_nova.private_evidence`对每个run的`best.pt`做两次完整Val推理：`full`保留原计算；`without_private`仅将**两轮读取中的私有证据残差**置零，保留全部权重、共享投影、交互、反馈、高阶关系及原保存阈值，重新计算反馈上下文和融合权重。没有重训或重新拟合阈值，不能将其视作原EMA-only架构或重训的无私有流模型。推理仍计算私有表示，不用于测量移除模块后的加速。
 
-两任务共四次Val推理，输出各自`full.json/.npz`、`without_private.json/.npz`和一份`summary.json`，自动生成同名ZIP，不含checkpoint/ESM。summary记录完整推理相对原results的指标复现差值、阈值是否一致、消融差值、逐标签AP/F1变化及预测改变数量。NPZ保留row_id、ID、标签、目标、原阈值及消融说明；不覆盖原run。没有多功能标注或无正例时，无法定义的指标保持null。
+两任务共四次Val推理，输出各自`full.json/.npz`、`without_private.json/.npz`和一份`summary.json`，自动生成同名ZIP，不含checkpoint/ESM。ZIP现同时直接收录原run的`metadata.json/results.json/history.jsonl`，不复制权重或修改源记录，便于后续检查训练Loss。summary记录完整推理相对原results的指标复现差值、阈值是否一致、消融差值、逐标签AP/F1变化及预测改变数量。NPZ保留row_id、ID、标签、目标、原阈值及消融说明；不覆盖原run。没有多功能标注或无正例时，无法定义的指标保持null。
 
 RTX5070 PowerShell，使用本次回传包对应的两份实际运行目录。在项目空闲时更新后执行，当前无需重新安装依赖：
 
@@ -1065,3 +1065,77 @@ printf 'PID=%s\n日志=%s.log\n回传=%s.zip\n' "$!" "$out" "$out"
 ```
 
 需要单独操作时，统一评价入口也支持`evaluate --without-private-evidence`，必须指向共享—私有TriRelay checkpoint。正常`evaluate`与所有训练默认计算保持不变；旧checkpoint不增加参数或state_dict键。当前本地4项相关检查覆盖两任务、两轮残差移除、mask、严格权重不变、阈值不变、独立导出及压缩；小型fixture结果仅验证实现，不报告成真实模型收益。正式四次GPU推理仍需在服务器执行。
+
+### 当前下一项：反馈前共享／私有证据对等监督
+
+四次正式Val推理已完成：full复现原结果；移除私有残差使major15/fine39 MacroAP分别由0.5636/0.5374降至0.4326/0.4370，当前模型已依赖私有路径。full在全局阈值扫描中的最高MFP检测F1仍低于EMA-only原结果。下一轮只检验共享／私有分工的监督调整，不扩展seed、不用Test。
+
+开关为`--branch-supervision shared_private`，同时需要`--shared-private`；原默认`mixed_private`保留。新分支监督来自**第一次读取、标签反馈之前**的共享证据和未混合私有证据，二者均使用无关系上下文的原label query，不再以已混合的分支作为共享监督的替身。第二轮读取、动态融合、直接分类、反馈和高阶关系均照常工作。复用既有注意力输出和长尾分类器，不新增参数或注意力层；major15/fine39仍为39,147,692/39,160,708参数。
+
+```text
+L_branch = 0.5 * mean_available_modalities(L_shared_first_read)
+         + 0.5 * mean_available_modalities(L_private_first_read)
+L_total  = L_classification + 0.2 L_direct + 0.1 L_branch + 0.05 L_reconstruction
+```
+
+aux warmup仍沿用原规则，完整权重后两路径各占0.05；共享目标不向私有投影、私有读取器或门控反传，但两者仍共同训练编码器和原分类器，不宣称统计独立。只改分支监督内容，不增加总辅助预算；一致性/功能辅助关闭，重建梯度用sum。history新增`branch_shared`、`branch_private`，保留`branch`聚合；每epoch新增`Branches`行，显示两项原始Loss及各自有效权重。这是待实验检验的候选，不预先保证指标提高。
+
+新Loss从头创建新运行，不恢复上轮`last.pt`；恢复自己的新实验则可省略模式参数，Trainer会从checkpoint沿用，显式跨模式恢复会报错。推理无需指定该训练Loss开关，旧/新checkpoint的state_dict键和形状不变。Val MacroAP选模、MicroAP并列判定和原Val阈值策略保持不变。
+
+以下每段只运行一个任务。先设`task=major15`完成后，另行设为`fine39`再执行；不会自动启动第二组。两平台选一个运行，在项目空闲时先`git pull --ff-only`。没有依赖或环境升级。
+
+RTX5070 PowerShell：
+
+```powershell
+Set-Location 'D:\Data\ChatGPT\mfp\MFP-Nova'
+$mfpPython = 'D:\App\Code\Anaconda\envs\MFP-Nova\python.exe'
+$task = 'major15'   # 第二组单独改成 'fine39'
+$run = "trirelay_${task}_esm650m_ema_sharedsupervision_seed42_rtx5070_" + (Get-Date -Format 'yyyyMMdd_HHmmss')
+& $mfpPython -u -m mfp_nova.cli train `
+    --model trirelay --task $task --esm 650m --seed 42 `
+    --device cuda:0 --precision fp32 --batch-size 64 `
+    --ema-decay 0.999 --ema-start-epoch 6 --shared-private `
+    --branch-supervision shared_private `
+    --consistency-weight 0 --function-aux-weight 0 `
+    --reconstruction-gradient sum --name $run
+if ($LASTEXITCODE -ne 0) { throw "$task 训练失败。" }
+& $mfpPython -u -m mfp_nova.private_evidence `
+    --runs "runs/$run" --device cuda:0 --batch-size 64 --output "runs/${run}_val"
+if ($LASTEXITCODE -ne 0) { throw "$task Val导出失败。" }
+Write-Host "回传：runs/${run}_val.zip"
+```
+
+V100 Bash，选择空闲GPU和CPU线程；整段训练及后续导出在nohup后台执行，断开SSH后继续：
+
+```bash
+(
+set -e
+cd ~/wuzhencheng/projects/MFP-Nova
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate MFP-Nova
+GPU_ID=1
+CPU_THREADS=4
+task=major15   # 第二组单独改成 fine39
+run="trirelay_${task}_esm650m_ema_sharedsupervision_seed42_v100_$(date +%Y%m%d_%H%M%S)"
+mkdir -p runs
+nohup env CUDA_VISIBLE_DEVICES="$GPU_ID" OMP_NUM_THREADS="$CPU_THREADS" \
+    MKL_NUM_THREADS="$CPU_THREADS" OPENBLAS_NUM_THREADS="$CPU_THREADS" \
+    bash -c '
+set -e
+"$1" -u -m mfp_nova.cli train \
+    --model trirelay --task "$2" --esm 650m --seed 42 \
+    --device cuda:0 --precision fp32 --batch-size 64 \
+    --ema-decay 0.999 --ema-start-epoch 6 --shared-private \
+    --branch-supervision shared_private \
+    --consistency-weight 0 --function-aux-weight 0 \
+    --reconstruction-gradient sum --name "$3"
+"$1" -u -m mfp_nova.private_evidence \
+    --runs "runs/$3" --device cuda:0 --batch-size 64 --output "runs/${3}_val"
+' _ "$(command -v python)" "$task" "$run" > "runs/${run}.log" 2>&1 < /dev/null &
+printf 'PID=%s\n日志=runs/%s.log\n回传=runs/%s_val.zip\n' "$!" "$run" "$run"
+)
+```
+
+导出后回传每任务的`*_val.zip`：同时含训练三份记录、完整Val与同权重私有残差消融的JSON/NPZ和summary，不需再单独压缩。对照为前一轮shared-private候选；原EMA-only及fine39 cap继续保留作参照。
+
+本地6项相关检查覆盖Loss预算和mask、共享目标的私有梯度隔离、参数/前向输出不变、两任务短训练、EMA/精确恢复/独立Val及导出打包；真实650M缓存另作两任务各8样本2步的完整规模CPU检查，关键路径均有有限梯度和参数更新。记录在`runs/diagnostics/trirelay_branch_supervision_20261021/real_cache_check.json`。未启动远端GPU或正式Test，模型收益仍待本轮完整训练。

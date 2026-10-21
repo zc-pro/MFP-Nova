@@ -88,6 +88,8 @@ def epoch_loss_settings(config, epoch):
     """Original warmup, with optional reconstruction-only cosine decay."""
     settings = config['train']
     loss = dict(config['loss'])
+    if 'branch_supervision' in settings:
+        loss['branch_supervision'] = settings['branch_supervision']
     ramp = min(1, epoch/max(1, settings.get('aux_warmup_epochs', 5)))
     for key in ('direct', 'branch', 'reconstruction', 'prototype', 'diversity', 'balance', 'factor'):
         if key in loss:
@@ -124,6 +126,8 @@ def train(config, name, resume=None):
     if checkpoint is not None:
         # Resume preserves the trained model/priors/protocol; only execution controls change.
         original = checkpoint["config"]
+        if "branch_supervision" in settings and settings["branch_supervision"] != original["train"].get("branch_supervision", "mixed_private"):
+            raise ValueError("Branch supervision changes the experiment; resume its own last.pt or start a new run")
         if "shared_private" in config["model"] and config["model"]["shared_private"] != original["model"].get("shared_private", False):
             raise ValueError("Shared/private architecture differs from checkpoint; start a new run")
         if settings.get("ema_decay") is not None and original["train"].get("ema_decay") is None:
@@ -144,6 +148,11 @@ def train(config, name, resume=None):
         for key, value in original["train"].items():
             if key not in ("device", "output", "epochs", "num_workers", "max_steps"):
                 settings[key] = value
+    branch_supervision = settings.get("branch_supervision", "mixed_private")
+    if branch_supervision not in ("mixed_private", "shared_private"):
+        raise ValueError("branch_supervision must be mixed_private or shared_private")
+    if branch_supervision == "shared_private" and (config["model_name"] != "trirelay" or not config["model"].get("shared_private")):
+        raise ValueError("Shared/private branch supervision requires shared-private TriRelay")
     consistency = settings.get("consistency_weight", 0)
     if not math.isfinite(consistency) or consistency < 0:
         raise ValueError("consistency_weight must be finite and nonnegative")
@@ -269,6 +278,8 @@ def train(config, name, resume=None):
                                           "statistics_train_rows": aux_stats["train_rows"]}
     if reconstruction_gradient != "sum":
         metadata["gradient_optimization"] = f"reconstruction gradient mode={reconstruction_gradient}; logged total is the original weighted loss sum"
+    if branch_supervision == "shared_private":
+        metadata["branch_supervision_scope"] = "First read before mixed-label feedback: shared/private equally share the original branch weight; no extra parameters"
     write_json(run/"metadata.json", metadata)
     static = {"model_name": config["model_name"], "model_args": args, "config": config, "statistics": source.statistics,
               "labels": source.data.labels, "track": source.data.track, "encoder": datasets[0].meta, "planned_epochs": planned_epochs}
@@ -424,6 +435,10 @@ def train(config, name, resume=None):
         with (run/"history.jsonl").open("a", encoding="utf-8") as f:
             f.write(json.dumps(history, allow_nan=False)+"\n")
         print(format_epoch(config["model_name"], source.data.track, settings["seed"], settings["epochs"], history, settings["patience"]), flush=True)
+        if branch_supervision == "shared_private":
+            print(f"Branches | mode=shared_private stage=pre_feedback "
+                  f"shared={history['losses']['branch_shared']:.6f} private={history['losses']['branch_private']:.6f} "
+                  f"weight_each={loss_settings.get('branch', .1)/2:.3f}", flush=True)
         if ema is not None:
             print(f"Weights | Val={validation_weights} EMA-updates={int(ema.n_averaged)} | OnlineVal "
                   f"MacroAP={online_report['macro_ap']:.4f} MicroAP={online_report['micro_ap']:.4f} "

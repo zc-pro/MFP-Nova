@@ -48,6 +48,8 @@ def main(argv=None):
             sub.add_argument("--reconstruction-grad-ratio", type=float, help="Maximum shared reconstruction/main gradient norm ratio (default: 1)")
             sub.add_argument("--shared-private", action=argparse.BooleanOptionalAction, default=None,
                              help="TriRelay: preserve private pre-relay evidence alongside shared interactions")
+            sub.add_argument("--branch-supervision", choices=("mixed_private", "shared_private"),
+                             help="TriRelay: original mixed/private branches or symmetric pre-feedback shared/private supervision")
             sub.add_argument("--name")
             sub.add_argument("--seed", type=int)
             sub.add_argument("--epochs", type=int)
@@ -119,6 +121,8 @@ def main(argv=None):
             from .encoder import prepare_features
             prepare_features(config, args.splits, config["train"]["device"], resume_from=args.resume_from)
         else:
+            if args.branch_supervision is not None and args.model != "trirelay":
+                raise ValueError("Branch supervision is a TriRelay training option")
             if args.model != "sequence":
                 from .research import train
                 config["model_name"] = args.model
@@ -140,7 +144,7 @@ def main(argv=None):
                 for key in ("precision", "accumulation_steps", "max_steps", "reconstruction_decay", "reconstruction_floor", "ema_decay", "ema_start_epoch",
                             "consistency_weight", "consistency_start_epoch", "consistency_ramp_epochs",
                             "function_aux_weight", "function_hierarchy_weight",
-                            "reconstruction_gradient", "reconstruction_grad_ratio"):
+                            "reconstruction_gradient", "reconstruction_grad_ratio", "branch_supervision"):
                     value = getattr(args, key)
                     if value is not None:
                         config["train"][key] = value

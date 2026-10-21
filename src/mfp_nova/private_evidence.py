@@ -62,6 +62,7 @@ def export(runs, output, device='cpu', batch_size=64, data_root='data/therapeuti
                                  'changed_label_decisions':changed_cells,
                                  'changed_sample_decisions':int(((left['probabilities'] >= threshold)!=(right['probabilities'] >= threshold)).any(1).sum())}
         comparisons.append({'run':str(directory), 'task':full['task'], 'rows':full['rows'], 'threshold':full['threshold'],
+                            'branch_supervision':config['train'].get('branch_supervision','mixed_private'),
                             'saved_threshold_matches_results':np.array_equal(full['threshold'], stored['threshold']),
                             'full_reproduction_deltas':reproduction, 'without_minus_full':deltas,
                             'prediction_change':prediction_change, 'per_label_without_minus_full':per_label})
@@ -79,6 +80,10 @@ def export(runs, output, device='cpu', batch_size=64, data_root='data/therapeuti
         for file in sorted(output.rglob('*')):
             if file.is_file():
                 zipped.write(file,file.relative_to(output))
+        for directory in runs:
+            directory=Path(directory)
+            for name in ('metadata.json','results.json','history.jsonl'):
+                zipped.write(directory/name,Path(directory.name)/name)
     print(f'Completed Val only. Transfer: {archive}', flush=True)
     return summary
 

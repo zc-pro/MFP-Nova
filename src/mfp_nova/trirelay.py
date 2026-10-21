@@ -43,7 +43,7 @@ class SharedPrivateEvidence(nn.Module):
         evidence = shared_evidence+gates*private_evidence
         # Recompute modality weights using both evidence paths, including missing masks.
         fused, evidence, weights = reader.fuse(query, evidence, qualities, masks)
-        return fused, evidence, weights, private_evidence, gates.squeeze(-1)
+        return fused, evidence, weights, private_evidence, gates.squeeze(-1), shared_evidence
 
 
 class TriRelay(nn.Module):
@@ -77,7 +77,7 @@ class TriRelay(nn.Module):
         if shared_private:
             self.evidence_partition = SharedPrivateEvidence(dim, heads, dropout)
 
-    def forward(self, batch):
+    def forward(self, batch, unmixed_branches=False):
         prop, pmask = self.properties(batch)
         seq, smask = self.sequence(batch)
         geo, gmask = self.geometry(batch, masked_mean(prop, pmask) if self.property_geometry else None, self.quality_aware)
@@ -88,9 +88,14 @@ class TriRelay(nn.Module):
         for interaction in self.interactions:
             streams = interaction(streams, masks, batch["quality"], self.quality_aware)
         if partitioned:
-            direct, evidence, fusion, private_evidence, private_gate = self.evidence_partition.read(
+            direct, evidence, fusion, private_evidence, private_gate, shared_evidence = self.evidence_partition.read(
                 self.reader, streams, private, masks, batch["quality"], quality_aware=self.quality_aware,
                 private_enabled=self.private_evidence_enabled)
+            if unmixed_branches:
+                # First read has no relation context derived from mixed evidence.
+                # Reuse these same reads: no extra attention or learned classifier.
+                shared_branch = torch.stack([self.classifier(shared_evidence[:, :, m]) for m in range(3)], 1)
+                unmixed_private_branch = torch.stack([self.classifier(private_evidence[:, :, m]) for m in range(3)], 1)
         else:
             direct, evidence, fusion = self.reader(streams, masks, batch["quality"], quality_aware=self.quality_aware)
         relation = self.relations(direct, self.high_order) if self.relations_enabled else direct
@@ -102,7 +107,7 @@ class TriRelay(nn.Module):
                 refined.append((x+torch.sigmoid(gate(torch.cat([x, delta], -1)))*delta)*mask[..., None])
             streams = self.refine(refined, masks, batch["quality"], self.quality_aware)
             if partitioned:
-                final, evidence, fusion, private_evidence, private_gate = self.evidence_partition.read(
+                final, evidence, fusion, private_evidence, private_gate, shared_evidence = self.evidence_partition.read(
                     self.reader, streams, private, masks, batch["quality"], context=relation, quality_aware=self.quality_aware,
                     private_enabled=self.private_evidence_enabled)
             else:
@@ -122,23 +127,36 @@ class TriRelay(nn.Module):
         if partitioned:
             output["private_branch"] = torch.stack([self.classifier(private_evidence[:, :, m]) for m in range(3)], 1)
             output["private_gate"] = private_gate
+            if unmixed_branches:
+                output["shared_branch"] = shared_branch
+                output["unmixed_private_branch"] = unmixed_private_branch
         if hasattr(self, "function_auxiliary"):
             output["function_aux"] = self.function_auxiliary(final+relation_weight*(relation-final))
         return output
 
     def compute_loss(self, batch, settings, return_output=False):
+        symmetric = settings.get("branch_supervision", "mixed_private") == "shared_private"
+        if symmetric and not hasattr(self, "evidence_partition"):
+            raise ValueError("Shared/private branch supervision requires shared-private TriRelay")
         view, hidden = training_views(batch, settings.get("modality_dropout", .1), settings.get("mask_ratio", .15))
-        output = self(view)
+        output = self(view, unmixed_branches=symmetric)
         loss = lambda logits, target: observed_label_loss(logits, target, self.statistics, settings.get("unlabeled_weight", .3))
         terms = {"classification": loss(output["logits"], batch["y"]), "direct": loss(output["direct"], batch["y"])}
-        # The existing branch-loss budget is shared by combined/private evidence;
-        # no additional loss coefficient or orthogonality objective is introduced.
-        branch_outputs = [output["branch"]]
-        if "private_branch" in output:
-            branch_outputs.append(output["private_branch"])
-        branches = [loss(branch[output["available"][:, m], m], batch["y"][output["available"][:, m]])
-                    for branch in branch_outputs for m in range(3) if output["available"][:, m].any()]
-        terms["branch"] = torch.stack(branches).mean()
+        def branch_loss(branch):
+            return torch.stack([loss(branch[output["available"][:, m], m], batch["y"][output["available"][:, m]])
+                                for m in range(3) if output["available"][:, m].any()]).mean()
+        if symmetric:
+            terms["branch_shared"] = branch_loss(output["shared_branch"])
+            terms["branch_private"] = branch_loss(output["unmixed_private_branch"])
+            terms["branch"] = .5*(terms["branch_shared"]+terms["branch_private"])
+        else:
+            # Preserve the original reduction order and default supervision.
+            branch_outputs = [output["branch"]]
+            if "private_branch" in output:
+                branch_outputs.append(output["private_branch"])
+            branches = [loss(branch[output["available"][:, m], m], batch["y"][output["available"][:, m]])
+                        for branch in branch_outputs for m in range(3) if output["available"][:, m].any()]
+            terms["branch"] = torch.stack(branches).mean()
         terms["reconstruction"] = reconstruction_loss(output["reconstruction"], batch, hidden)
         total = terms["classification"]+settings.get("direct", .2)*terms["direct"]+settings.get("branch", .1)*terms["branch"]+settings.get("reconstruction", .05)*terms["reconstruction"]
         if hasattr(self, "function_auxiliary"):
