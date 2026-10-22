@@ -10,8 +10,11 @@ from .research_layers import (SequenceEncoder, GeometryEncoder, PropertyEncoder,
 class SharedPrivateEvidence(nn.Module):
     """Preserve pre-relay evidence, without claiming statistical disentanglement."""
 
-    def __init__(self, dim, heads, dropout):
+    def __init__(self, dim, heads, dropout, fusion="residual"):
         super().__init__()
+        if fusion not in ("residual", "normalized_competitive"):
+            raise ValueError("Evidence fusion must be residual or normalized_competitive")
+        self.fusion = fusion
         self.shared = nn.ModuleList([FeedForward(dim, 2, dropout) for _ in range(3)])
         self.private = nn.ModuleList([nn.ModuleList([FeedForward(dim, 2, dropout) for _ in range(2)])
                                       for _ in range(3)])
@@ -33,6 +36,14 @@ class SharedPrivateEvidence(nn.Module):
         qmask = torch.ones(query.shape[:2], dtype=torch.bool, device=query.device)
         private_evidence = torch.stack([attention(query, x, qmask, mask)
                                        for attention, x, mask in zip(self.readers, private, masks)], 2)
+        if self.fusion == "normalized_competitive":
+            # Parameter-free RMS scaling, shared by pure-branch supervision and
+            # mixing. FP32 reduction also works under V100 FP16 autocast.
+            def normalize(x):
+                value = x.float()
+                return (value*torch.rsqrt(value.square().mean(-1, keepdim=True)+1e-5)).to(x.dtype)
+            shared_evidence = normalize(shared_evidence)
+            private_evidence = normalize(private_evidence)
         gates = torch.stack([torch.sigmoid(gate(torch.cat([query, shared_evidence[:, :, m],
                                                           private_evidence[:, :, m], qualities[:, :, m]], -1)))
                              for m, gate in enumerate(self.gates)], 2)
@@ -40,7 +51,10 @@ class SharedPrivateEvidence(nn.Module):
         gates = gates*present[:, None, :, None]
         if not private_enabled:
             gates = torch.zeros_like(gates)
-        evidence = shared_evidence+gates*private_evidence
+        if self.fusion == "normalized_competitive":
+            evidence = (1-gates)*shared_evidence+gates*private_evidence
+        else:
+            evidence = shared_evidence+gates*private_evidence
         # Recompute modality weights using both evidence paths, including missing masks.
         fused, evidence, weights = reader.fuse(query, evidence, qualities, masks)
         return fused, evidence, weights, private_evidence, gates.squeeze(-1), shared_evidence
@@ -51,8 +65,10 @@ class TriRelay(nn.Module):
                  dropout=.15, sequence_depth=4, geometry_depth=4, property_depth=2,
                  interaction_depth=3, feedback=True, relations=True, high_order=True,
                  quality_aware=True, property_geometry=True, function_aux=False,
-                 function_aux_statistics=None, shared_private=False):
+                 function_aux_statistics=None, shared_private=False, evidence_fusion="residual"):
         super().__init__()
+        if evidence_fusion != "residual" and not shared_private:
+            raise ValueError("Non-residual evidence fusion requires shared-private TriRelay")
         self.statistics = statistics
         self.feedback_enabled, self.relations_enabled = feedback, relations
         self.high_order, self.quality_aware = high_order, quality_aware
@@ -75,7 +91,7 @@ class TriRelay(nn.Module):
             from .function_auxiliary import FunctionAuxiliary
             self.function_auxiliary = FunctionAuxiliary(statistics["labels"], function_aux_statistics, dim, heads, dropout)
         if shared_private:
-            self.evidence_partition = SharedPrivateEvidence(dim, heads, dropout)
+            self.evidence_partition = SharedPrivateEvidence(dim, heads, dropout, evidence_fusion)
 
     def forward(self, batch, unmixed_branches=False, first_readouts=False):
         prop, pmask = self.properties(batch)

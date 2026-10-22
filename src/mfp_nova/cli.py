@@ -50,6 +50,8 @@ def main(argv=None):
                              help="TriRelay: preserve private pre-relay evidence alongside shared interactions")
             sub.add_argument("--branch-supervision", choices=("mixed_private", "shared_private"),
                              help="TriRelay: original mixed/private branches or symmetric pre-feedback shared/private supervision")
+            sub.add_argument("--evidence-fusion", choices=("residual", "normalized_competitive"),
+                             help="Shared-private TriRelay: original additive residual or RMS-normalized competitive mixing")
             sub.add_argument("--name")
             sub.add_argument("--seed", type=int)
             sub.add_argument("--epochs", type=int)
@@ -66,7 +68,7 @@ def main(argv=None):
     evaluate.add_argument("--predictions", help="Optional aligned sample probabilities in NPZ format")
     evaluate.add_argument("--decision", help="Validation-fitted research-model decision.json; raw ranking scores stay unchanged")
     evaluate.add_argument("--without-private-evidence", action="store_true",
-                          help="Shared-private TriRelay: zero private residual in both reads, retaining weights and saved threshold")
+                          help="Shared-private TriRelay: use shared evidence alone in both reads, retaining weights and saved threshold")
     predict = commands.add_parser("predict")
     predict.add_argument("--checkpoint", required=True)
     prediction_input = predict.add_mutually_exclusive_group(required=True)
@@ -123,6 +125,8 @@ def main(argv=None):
         else:
             if args.branch_supervision is not None and args.model != "trirelay":
                 raise ValueError("Branch supervision is a TriRelay training option")
+            if args.evidence_fusion is not None and args.model != "trirelay":
+                raise ValueError("Evidence fusion is a TriRelay model option")
             if args.model != "sequence":
                 from .research import train
                 config["model_name"] = args.model
@@ -130,6 +134,8 @@ def main(argv=None):
                     if args.model != "trirelay":
                         raise ValueError("Shared/private evidence is a TriRelay model option")
                     config["model"]["shared_private"] = args.shared_private
+                if args.evidence_fusion is not None:
+                    config["model"]["evidence_fusion"] = args.evidence_fusion
                 if args.task:
                     config["data"]["track"] = args.task
                 if args.ablate:

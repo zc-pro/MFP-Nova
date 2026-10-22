@@ -130,6 +130,8 @@ def train(config, name, resume=None):
             raise ValueError("Branch supervision changes the experiment; resume its own last.pt or start a new run")
         if "shared_private" in config["model"] and config["model"]["shared_private"] != original["model"].get("shared_private", False):
             raise ValueError("Shared/private architecture differs from checkpoint; start a new run")
+        if "evidence_fusion" in config["model"] and config["model"]["evidence_fusion"] != original["model"].get("evidence_fusion", "residual"):
+            raise ValueError("Evidence fusion differs from checkpoint; resume its own last.pt or start a new run")
         if settings.get("ema_decay") is not None and original["train"].get("ema_decay") is None:
             raise ValueError("EMA changes the experiment; start a new training run instead of resuming a non-EMA checkpoint")
         for key in ("consistency_weight", "consistency_start_epoch", "consistency_ramp_epochs"):
@@ -153,6 +155,11 @@ def train(config, name, resume=None):
         raise ValueError("branch_supervision must be mixed_private or shared_private")
     if branch_supervision == "shared_private" and (config["model_name"] != "trirelay" or not config["model"].get("shared_private")):
         raise ValueError("Shared/private branch supervision requires shared-private TriRelay")
+    evidence_fusion = config["model"].get("evidence_fusion", "residual")
+    if evidence_fusion not in ("residual", "normalized_competitive"):
+        raise ValueError("Evidence fusion must be residual or normalized_competitive")
+    if evidence_fusion != "residual" and (config["model_name"] != "trirelay" or not config["model"].get("shared_private")):
+        raise ValueError("Non-residual evidence fusion requires shared-private TriRelay")
     consistency = settings.get("consistency_weight", 0)
     if not math.isfinite(consistency) or consistency < 0:
         raise ValueError("consistency_weight must be finite and nonnegative")
@@ -280,6 +287,8 @@ def train(config, name, resume=None):
         metadata["gradient_optimization"] = f"reconstruction gradient mode={reconstruction_gradient}; logged total is the original weighted loss sum"
     if branch_supervision == "shared_private":
         metadata["branch_supervision_scope"] = "First read before mixed-label feedback: shared/private equally share the original branch weight; no extra parameters"
+    if evidence_fusion == "normalized_competitive":
+        metadata["evidence_fusion_scope"] = "Both reads: parameter-free RMS(shared/private), same normalized evidence for branch supervision, convex (1-g)*shared+g*private; no extra parameters"
     write_json(run/"metadata.json", metadata)
     static = {"model_name": config["model_name"], "model_args": args, "config": config, "statistics": source.statistics,
               "labels": source.data.labels, "track": source.data.track, "encoder": datasets[0].meta, "planned_epochs": planned_epochs}
@@ -438,7 +447,7 @@ def train(config, name, resume=None):
         if branch_supervision == "shared_private":
             print(f"Branches | mode=shared_private stage=pre_feedback "
                   f"shared={history['losses']['branch_shared']:.6f} private={history['losses']['branch_private']:.6f} "
-                  f"weight_each={loss_settings.get('branch', .1)/2:.3f}", flush=True)
+                  f"weight_each={loss_settings.get('branch', .1)/2:.3f} fusion={evidence_fusion}", flush=True)
         if ema is not None:
             print(f"Weights | Val={validation_weights} EMA-updates={int(ema.n_averaged)} | OnlineVal "
                   f"MacroAP={online_report['macro_ap']:.4f} MicroAP={online_report['micro_ap']:.4f} "
@@ -549,9 +558,13 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
                   source.statistics['function_projection'], predicted), "groups": grouped,
               "annotation_based_metrics": True, "experimental_structure_group": None}
     if hasattr(model, "evidence_partition"):
+        fusion_mode = model.evidence_partition.fusion
         result['inference_ablation'] = {
             'private_evidence_enabled': not without_private_evidence,
-            'scope': ('Zero private evidence residual in both reads; feedback/context and fusion recomputed; weights unchanged'
+            'evidence_fusion': fusion_mode,
+            'scope': (('Use normalized shared evidence alone in both reads (g=0, shared coefficient=1); feedback/context and fusion recomputed; weights unchanged'
+                       if fusion_mode == 'normalized_competitive' else
+                       'Zero private evidence residual in both reads; feedback/context and fusion recomputed; weights unchanged')
                       if without_private_evidence else 'Unmodified shared-private checkpoint inference'),
             'threshold_refit': False}
     if decision is not None:

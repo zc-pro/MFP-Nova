@@ -1196,3 +1196,97 @@ printf 'PID=%s\n日志=%s.log\n回传=%s.zip\n' "$!" "$out" "$out"
 ```
 
 本地相关检查覆盖15/39标签、默认预测/参数不变、前反馈张量取值、D/L与缺结构、阈值不变、无可用结构、完整Val导出及ZIP。另对真实650M缓存各6条Val输入进行完整容量CPU前向，记录在`runs/diagnostics/trirelay_first_read_20261022/real_cache_check.json`；使用未训练模型验证输入链路，不报告性能。正式checkpoint的完整GPU诊断仍需在服务器执行。
+
+### 下一项对照：RMS归一化后的共享／私有竞争式融合
+
+首次读取诊断已完成：对等监督增强了纯共享／私有分支，但部分mixed分支出现评分尺度偏移，首次融合高度集中于序列。fine39的antihcv在前端已退步，major15的thrombolytic则在direct到final阶段退步。完整Val诊断没有发现运行错误，不应统一归因于反馈或直接删除模态。
+
+新开关为`--evidence-fusion normalized_competitive`，需要`--shared-private`。旧默认`residual`原样保留；旧checkpoint不新增state_dict键，参数量仍为major15=39,147,692、fine39=39,160,708。新模式在**两次读取**中执行：
+
+```text
+S_hat = S / sqrt(mean(S^2, feature_dim) + 1e-5)
+P_hat = P / sqrt(mean(P^2, feature_dim) + 1e-5)
+g     = sigmoid(existing_gate(query, S_hat, P_hat, quality))
+E     = (1-g) * S_hat + g * P_hat
+```
+
+RMS统计使用FP32，无额外可学习参数；纯共享／私有分类监督也读取S_hat/P_hat，避免训练和混合使用不同尺度。门控仍是样本—标签—模态条件，缺模态仍排除；完整编码深度、三轮交互、第二轮反馈、标签关系、高阶机制、重建及原优化策略均保留。
+
+原共享长尾分类器对特征线性，故在同一标签/模态上，`z_mixed=(1-g)*z_shared+g*z_private`；混合头logit位于两条纯分支之间，避免相加造成的直接重复放大。这不约束后续融合或final logits，也不保证门控不饱和或AP必升。该候选同时改变RMS尺度及加法/竞争组合，是一项联合机制对照，不能由本轮单独归因二者各自的效果。竞争式组合可能限制可叠加证据，需实验判断。
+
+继续固定TriRelay、完整major15/fine39、seed42，使用上一轮对等监督作为直接对照；不叠加PU、consistency、functionaux或cap。分支预算仍0.1=0.05+0.05，direct=0.2、重建=0.05、原warmup不变。Val MacroAP选模、MicroAP并列判定及Val全局阈值策略不变，不使用Test。
+
+从头创建新运行，**不恢复上一轮residual的last.pt**。恢复新模式自身训练时可省略融合选项，会从checkpoint沿用；显式跨融合模式恢复报错，防止同一实验中途改变模型。console的`Branches`行包含`fusion=normalized_competitive`；metadata/model_args保存该设置。新模式`--without-private-evidence`表示g=0、共享系数恢复为1、使用纯归一化共享证据，不能解释为固定共享权重后仅删去一个加法项；导出会明确记录。
+
+以下命令依次训练major15、fine39，最后一次性导出两份最佳权重的11头完整Val结果并自动压缩。无需再重复private-off或重训对照。运行前在项目无训练时同步Git；不升级环境，不覆盖旧运行。RTX与V100选择一个平台执行，不能把同seed不同硬件运行冒充独立seed。
+
+RTX5070 PowerShell：
+
+```powershell
+Set-Location 'D:\Data\ChatGPT\mfp\MFP-Nova'
+git pull --ff-only
+if ($LASTEXITCODE -ne 0) { throw 'Git更新失败。' }
+$mfpPython = 'D:\App\Code\Anaconda\envs\MFP-Nova\python.exe'
+$tag = Get-Date -Format 'yyyyMMdd_HHmmss'
+$runs = @()
+foreach ($task in @('major15','fine39')) {
+    $run = "trirelay_${task}_esm650m_ema_competitive_seed42_rtx5070_$tag"
+    & $mfpPython -u -m mfp_nova.cli train `
+        --model trirelay --task $task --esm 650m --seed 42 `
+        --device cuda:0 --precision fp32 --batch-size 64 `
+        --ema-decay 0.999 --ema-start-epoch 6 --shared-private `
+        --branch-supervision shared_private --evidence-fusion normalized_competitive `
+        --consistency-weight 0 --function-aux-weight 0 `
+        --reconstruction-gradient sum --name $run
+    if ($LASTEXITCODE -ne 0) { throw "$task 训练失败；后续任务未启动。" }
+    $runs += "runs/$run"
+}
+$out = "runs/trirelay_competitive_seed42_rtx5070_${tag}_val"
+& $mfpPython -u -m mfp_nova.branch_evidence --runs $runs `
+    --device cuda:0 --batch-size 64 --cpu-threads 4 --output $out
+if ($LASTEXITCODE -ne 0) { throw '完整Val导出失败。' }
+Write-Host "回传：${out}.zip"
+```
+
+V100 Bash：自有空闲GPU运行，修改GPU_ID与CPU_THREADS；nohup同时覆盖两组训练和最终导出，关闭SSH后继续。CUDA_VISIBLE_DEVICES选择物理卡后，进程内仍使用cuda:0。
+
+```bash
+(
+set -e
+cd ~/wuzhencheng/projects/MFP-Nova
+git pull --ff-only
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate MFP-Nova
+GPU_ID=1
+CPU_THREADS=4
+tag=$(date +%Y%m%d_%H%M%S)
+mkdir -p runs
+nohup env CUDA_VISIBLE_DEVICES="$GPU_ID" OMP_NUM_THREADS="$CPU_THREADS" \
+    MKL_NUM_THREADS="$CPU_THREADS" OPENBLAS_NUM_THREADS="$CPU_THREADS" \
+    bash -c '
+set -e
+python_bin="$1"
+tag="$2"
+cpu_threads="$3"
+run_paths=()
+for task in major15 fine39; do
+    run="trirelay_${task}_esm650m_ema_competitive_seed42_v100_${tag}"
+    "$python_bin" -u -m mfp_nova.cli train \
+        --model trirelay --task "$task" --esm 650m --seed 42 \
+        --device cuda:0 --precision fp32 --batch-size 64 \
+        --ema-decay 0.999 --ema-start-epoch 6 --shared-private \
+        --branch-supervision shared_private --evidence-fusion normalized_competitive \
+        --consistency-weight 0 --function-aux-weight 0 \
+        --reconstruction-gradient sum --name "$run"
+    run_paths+=("runs/$run")
+done
+"$python_bin" -u -m mfp_nova.branch_evidence --runs "${run_paths[@]}" \
+    --device cuda:0 --batch-size 64 --cpu-threads "$cpu_threads" \
+    --output "runs/trirelay_competitive_seed42_v100_${tag}_val"
+' _ "$(command -v python)" "$tag" "$CPU_THREADS" \
+    > "runs/trirelay_competitive_seed42_v100_${tag}.log" 2>&1 < /dev/null &
+printf 'PID=%s\n日志=runs/trirelay_competitive_seed42_v100_%s.log\n回传=runs/trirelay_competitive_seed42_v100_%s_val.zip\n' "$!" "$tag" "$tag"
+)
+```
+
+本地12项相关检查覆盖两任务、两轮归一化/凸组合、数值与梯度、D/L及缺失输入、默认residual兼容、EMA/精确恢复、独立评价和11头打包。另对真实650M Train输入各8样本执行完整容量CPU两步更新，所有关键路径有有限非零梯度，门控参数实际更新；记录在`runs/diagnostics/trirelay_competitive_20261022/real_cache_check.json`。这些检查只验证实现，不是正式性能。未启动服务器训练，V100/RTX本轮新机制的GPU收敛、最终指标及实际资源成本仍待上述运行。

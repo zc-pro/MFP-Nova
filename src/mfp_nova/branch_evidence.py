@@ -101,13 +101,15 @@ def export(runs, output, device='cpu', batch_size=64, data_root='data/therapeuti
                   'saved_threshold_matches_results':np.array_equal(threshold, stored['threshold']),
                   'weight_source':checkpoint.get('weight_source','online'), 'best_epoch':checkpoint['best_epoch'],
                   'branch_supervision':checkpoint['config']['train'].get('branch_supervision','mixed_private'),
+                  'evidence_fusion':model.evidence_partition.fusion,
                   'git_commit_trained':json.loads((directory/'metadata.json').read_text(encoding='utf-8'))['git_commit'],
                   'threshold_fit':False, 'weight_updates':False, 'inference_intervention':False,
                   'scope':'First read before mixed-label feedback; final follows the unchanged complete model',
                   'head_definitions':{
-                      'shared_*':'Per-modality unmixed shared evidence after relay, before feedback; existing classifier',
-                      'private_*':'Per-modality unmixed private evidence, ungated, before feedback; existing classifier',
-                      'mixed_*':'Per-modality shared + gated private evidence before feedback; diagnostic, not a separately supervised first-read mixed branch',
+                      'shared_*':'Per-modality unmixed shared evidence after relay, before feedback; RMS-normalized in normalized_competitive mode; existing classifier',
+                      'private_*':'Per-modality unmixed private evidence, ungated, before feedback; RMS-normalized in normalized_competitive mode; existing classifier',
+                      'mixed_*':('(1-g)*normalized_shared + g*normalized_private' if model.evidence_partition.fusion=='normalized_competitive' else
+                                 'shared + gated private')+' before feedback; diagnostic, not a separately supervised first-read mixed branch',
                       'direct':'Original first-read learned multimodal fusion classifier, supervised by direct loss',
                       'final':'Original final prediction after feedback and label relations'},
                   'threshold_scope':'All heads use the unchanged final-checkpoint threshold; head-specific calibration is not fitted. Prioritize AP for branch comparisons.',
