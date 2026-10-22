@@ -2,7 +2,7 @@
 import torch
 from torch import nn
 
-from .research_layers import (SequenceEncoder, GeometryEncoder, PropertyEncoder, MultimodalInteraction,
+from ..research_layers import (SequenceEncoder, GeometryEncoder, PropertyEncoder, MultimodalInteraction,
                               EvidenceReader, TailClassifier, LabelRelations, Attention, Reconstruction,
                               FeedForward, masked_mean, training_views, reconstruction_loss, observed_label_loss)
 
@@ -88,7 +88,7 @@ class TriRelay(nn.Module):
         self.relation_gate = nn.Linear(2*dim, 1)
         self.reconstruction = Reconstruction(dim)
         if function_aux:
-            from .function_auxiliary import FunctionAuxiliary
+            from ..function_auxiliary import FunctionAuxiliary
             self.function_auxiliary = FunctionAuxiliary(statistics["labels"], function_aux_statistics, dim, heads, dropout)
         if shared_private:
             self.evidence_partition = SharedPrivateEvidence(dim, heads, dropout, evidence_fusion)
@@ -192,7 +192,7 @@ class TriRelay(nn.Module):
         terms["reconstruction"] = reconstruction_loss(output["reconstruction"], batch, hidden)
         total = terms["classification"]+settings.get("direct", .2)*terms["direct"]+settings.get("branch", .1)*terms["branch"]+settings.get("reconstruction", .05)*terms["reconstruction"]
         if relation_view:
-            from .consistency import bernoulli_consistency
+            from ..consistency import bernoulli_consistency
             stable, _ = bernoulli_consistency(output["relation_view_logits"], output["logits"], batch["y"])
             # Anchor confident pre-final-relation evidence only. It already
             # contains earlier feedback, so this is not a relation-free teacher.

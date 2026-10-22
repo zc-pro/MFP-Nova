@@ -5,7 +5,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .research_layers import (SequenceEncoder, PropertyEncoder, GeometricLayer, Attention, FeedForward,
+from ..research_layers import (SequenceEncoder, PropertyEncoder, GeometricLayer, Attention, FeedForward,
                               TailClassifier, Reconstruction, masked_mean, training_views,
                               reconstruction_loss, observed_label_loss)
 

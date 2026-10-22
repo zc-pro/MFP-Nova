@@ -7,7 +7,7 @@ import torch
 
 from mfp_nova import research
 from mfp_nova.multimodal import MultimodalData, MultimodalPeptides, collate_multimodal
-from mfp_nova.trirelay import TriRelay
+from mfp_nova.models.trirelay import TriRelay
 from test_consistency import fixture_config
 
 

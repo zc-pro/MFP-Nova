@@ -1,0 +1,56 @@
+model_name: helixset
+data:
+  root: data/therapeutic_2025
+  track: major15
+  features: features/esm2_650m
+  augment: false
+encoder:
+  name: facebook/esm2_t33_650M_UR50D
+  revision: main
+  max_length: 80
+  batch_size: 8
+model:
+  dim: 384
+  heads: 8
+  dropout: 0.2
+  sequence_depth: 3
+  property_depth: 2
+  geometry_depth: 2
+  pair_dim: 48
+  pair_depth: 4
+  latent_count: 32
+  latent_depth: 6
+  decoder_depth: 3
+  triangles: true
+  label_context: true
+  pair_readout: true
+  fine_evidence: true
+  geometry_context: true
+  geometry_quality: true
+  distance_multiscale: true
+  scale_balance: true
+  pair_interactions: true
+loss:
+  unlabeled_weight: 0.3
+  direct: 0.2
+  branch: 0.1
+  modality_dropout: 0.1
+train:
+  device: cpu
+  seed: 42
+  epochs: 100
+  batch_size: 16
+  accumulation_steps: 4
+  precision: fp32
+  learning_rate: 0.0002
+  weight_decay: 0.01
+  patience: 15
+  warmup_epochs: 5
+  aux_warmup_epochs: 5
+  gradient_clip: 5
+  num_workers: 0
+  ema_decay: 0.999
+  ema_start_epoch: 6
+  metric_suite: traditional5
+  threshold_strategy: global
+  output: runs

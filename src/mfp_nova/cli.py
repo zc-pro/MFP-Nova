@@ -4,6 +4,8 @@ from pathlib import Path
 
 import yaml
 
+from .models import RESEARCH_MODELS
+
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="MFP-Nova research commands")
@@ -25,7 +27,9 @@ def main(argv=None):
             sub.add_argument("--resume-from", type=int, default=0,
                              help="Completed rows in the first split, from the interrupted extraction log")
         else:
-            sub.add_argument("--model", choices=("sequence", "trirelay", "geofactor", "protoroute"), default="sequence")
+            sub.add_argument("--model", choices=("sequence", *RESEARCH_MODELS), default="sequence")
+            sub.add_argument("--metric-suite", choices=("traditional5", "task_specific"),
+                             help="Research models: primary report and checkpoint selection protocol")
             sub.add_argument("--task", choices=("major15", "fine39"), help="Alias for --track")
             sub.add_argument("--resume", help="last.pt with optimizer and RNG state; creates a new run")
             sub.add_argument("--ablate", nargs="*", help="Model switches to disable, e.g. feedback high_order")
@@ -84,7 +88,7 @@ def main(argv=None):
     summarize.add_argument("--split", choices=("val", "test"), default="val")
     summarize.add_argument("--output", help="Optional JSON; otherwise print")
     gpu_check = commands.add_parser("gpu-check", help="Real-cache full-model server probes and bounded short training")
-    gpu_check.add_argument("--models", nargs="+", choices=("trirelay", "geofactor", "protoroute"), default=["trirelay", "geofactor", "protoroute"])
+    gpu_check.add_argument("--models", nargs="+", choices=RESEARCH_MODELS, default=list(RESEARCH_MODELS))
     gpu_check.add_argument("--tasks", nargs="+", choices=("major15", "fine39"), default=["major15", "fine39"])
     gpu_check.add_argument("--esm", choices=("35m", "650m"), default="650m")
     gpu_check.add_argument("--feature-root")
@@ -131,6 +135,10 @@ def main(argv=None):
                 raise ValueError("Evidence fusion is a TriRelay model option")
             if (args.relation_view_weight is not None or args.relation_dropout is not None) and args.model != "trirelay":
                 raise ValueError("Relation views are a TriRelay training option")
+            if args.metric_suite is not None:
+                if args.model == "sequence":
+                    raise ValueError("--metric-suite requires a research model")
+                config["train"]["metric_suite"] = args.metric_suite
             if args.model != "sequence":
                 from .research import train
                 config["model_name"] = args.model

@@ -1,6 +1,6 @@
 # MFP-Nova 指标说明书
 
-适用范围：TriRelay、GeoFactor、ProtoRoute 的 major15 / fine39 多标签实验。日期：2026-10-16。本文以当前 `metrics.py`、`research.py`、`multimodal.py` 的实际实现为准，说明定义、计算、范围、用途及指标之间的联系。公式中的“真值”均指**已有观测标注**，不代表完整的实验生物学真值。
+适用范围：TriRelay、GeoFactor、ProtoRoute、HelixSet 的 major15 / fine39 多标签实验。2026-10-22 更新四模型与评价模式说明。本文以 `metrics.py`、`metric_protocol.py`、`research.py`、`multimodal.py` 的实际实现为准，说明定义、计算、范围、用途及指标之间的联系。公式中的“真值”均指**已有观测标注**，不代表完整的实验生物学真值。同名 PDF 尚未同步此次文字更新，当前以 Markdown 为准。
 
 ## 阅读导航
 
@@ -550,7 +550,7 @@ AP/AUROC 还涉及跨组正负样本的相对排序，整体通常不能由组 A
 
 ### 10.1 Loss 是优化目标，不是百分比成绩
 
-三模型的主分类 Loss 使用长尾正例权重和弱未标注项。记 $q_{ij}=\min(1,1-p_{ij}+0.03)$，其核心形式为：
+四模型的主分类 Loss 使用长尾正例权重和弱未标注项。记 $q_{ij}=\min(1,1-p_{ij}+0.03)$，其核心形式为：
 
 $$
 \ell_{ij}=-y_{ij}w_j\log p_{ij}
@@ -561,13 +561,14 @@ $$
 
 `classification` / `direct` / `branch` 分别评价最终、直接及分支分类输出；通常非负、无固定上界，越低表示相应优化目标拟合更好，不代表 AP/F1 一定更高。
 
-### 10.2 三模型总 Loss 的组成
+### 10.2 四模型总 Loss 的组成
 
 | 模型 | 总 Loss 的组成 |
 |---|---|
 | TriRelay | classification + 加权 direct + branch + reconstruction |
 | GeoFactor | classification + 加权 direct + reconstruction + factor |
 | ProtoRoute | classification + 加权 direct + branch + prototype + diversity + balance + reconstruction |
+| HelixSet | classification + 加权 direct（潜变量辅助分类）+ branch（中间解码监督） |
 
 `reconstruction` 监督遮蔽特征恢复；`factor` 约束关系因子幅度；`prototype` 促进正例与原型匹配；`diversity` 减少原型过度相似；`balance` 约束可用专家的使用分布。这些数值尺度和目标不同，不能直接按大小判断模块重要性。
 
@@ -602,19 +603,19 @@ $$
 
 ### 11.1 每轮监控与最终结果的区别
 
-每轮 `history.jsonl` 的 Train / Val 阈值化指标使用固定 0.5，连续分数的 AP/AUROC 不受这个阈值影响。
+每轮 `history.jsonl` 的 Train / Val 监控指标使用固定 0.5，连续分数的 AP/AUROC 不受这个阈值影响。`traditional5` 模式另存当轮 Val 拟合阈值后的 `selection_metrics` 与 `selection_threshold` 用于选模，不能与固定阈值监控列混用。
 
 Train 指标复用当轮训练产生的预测：含增强和 Dropout，参数随 batch 更新，表示在线训练过程，**不是某个固定 checkpoint 的完整 Train 评估**。Val 每轮完整 eval 前向一次，所有全局与分组指标共用结果。训练结束还会对选中的最佳模型评价 Val，以拟合最终阈值。
 
 ### 11.2 Checkpoint 选择
 
-当前按以下顺序比较：
+`task_specific` 模式（原三模型默认）按以下顺序比较：
 
 1. Validation Macro-AP 最大。
 2. Macro-AP 完全相同时，Micro-AP 最大。
 3. 两者完全相同时，保留更早 epoch。
 
-这保证主目标仍是标签均衡的排序质量。打印四位小数相同不一定意味着内部完整精度相同。
+`traditional5` 模式（HelixSet 默认）按每轮 Val 拟合阈值后的 Acc 最大选模，同分依次比较 AT 与更早 epoch。四模型均可显式选择任一模式；不同模式的结果不混成同一组均值。打印四位小数相同不一定意味着内部完整精度相同。
 
 ### 11.3 最终全局阈值
 

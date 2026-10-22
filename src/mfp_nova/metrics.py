@@ -138,6 +138,9 @@ def format_epoch(model, task, seed, maximum_epochs, record, patience):
         return "NA" if value is None else f"{value:.4f}"
 
     def line(name, report, loss):
+        if "metric_suite" in record:
+            from .metric_protocol import format_primary
+            return f"{name:5} | Loss={number(loss)} | {format_primary(record['metric_suite'], report)}"
         fields = [("Acc", "accuracy"), ("Prec", "precision"), ("Cov", "coverage"),
                   ("AT", "absolute_true"), ("AF", "absolute_false"),
                   ("MacroAP", "macro_ap"), ("MicroAP", "micro_ap"),
@@ -148,6 +151,7 @@ def format_epoch(model, task, seed, maximum_epochs, record, patience):
     validation = record["validation"]
     peak = record["peak_cuda_memory_bytes"]
     memory = "NA" if peak is None else f"{peak/2**30:.2f}GiB"
+    best_name = "SelectedEpochMacroAP" if record.get("metric_suite") == "traditional5" else "Best"
     return "\n".join([
         "",
         "="*96,
@@ -157,7 +161,7 @@ def format_epoch(model, task, seed, maximum_epochs, record, patience):
         f"Extra | HeadAP={number(validation.get('head_macro_ap'))} MediumAP={number(validation.get('medium_macro_ap'))} "
         f"TailAP={number(validation.get('tail_macro_ap'))} | LR={record['lr']:.3g} Time={record['seconds']:.1f}s "
         f"Elapsed={record['elapsed_seconds']/60:.1f}min Peak={memory} "
-        f"Best={number(record['best_macro_ap'])}@{record['best_epoch']} Patience={record['early_stopping_count']}/{patience} "
+        f"{best_name}={number(record['best_macro_ap'])}@{record['best_epoch']} Patience={record['early_stopping_count']}/{patience} "
         f"AMP-skipped={record['skipped_amp_updates']}",
     ])
 

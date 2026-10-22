@@ -19,17 +19,21 @@ from .multimodal import MultimodalData, MultimodalPeptides, collate_multimodal
 from .research_layers import observed_label_loss
 from .consistency import bernoulli_consistency, consistency_weight
 from .trainer import seed_everything, write_json
+from .metric_protocol import protocol_description, primary_metrics, selection, format_primary
 
 
 def make_model(name, arguments):
+    if name == "helixset":
+        from .models.helixset import HelixSet
+        return HelixSet(**arguments)
     if name == "trirelay":
-        from .trirelay import TriRelay
+        from .models.trirelay import TriRelay
         return TriRelay(**arguments)
     if name == "geofactor":
-        from .geofactor import GeoFactor
+        from .models.geofactor import GeoFactor
         return GeoFactor(**arguments)
     if name == "protoroute":
-        from .protoroute import ProtoRoute
+        from .models.protoroute import ProtoRoute
         return ProtoRoute(**arguments)
     raise ValueError(f"Unknown research model: {name}")
 
@@ -129,6 +133,8 @@ def train(config, name, resume=None):
     if checkpoint is not None:
         # Resume preserves the trained model/priors/protocol; only execution controls change.
         original = checkpoint["config"]
+        if settings.get("metric_suite", "task_specific") != original["train"].get("metric_suite", "task_specific"):
+            raise ValueError("Metric suite changes checkpoint selection; start a new run or resume with its saved suite")
         if "branch_supervision" in settings and settings["branch_supervision"] != original["train"].get("branch_supervision", "mixed_private"):
             raise ValueError("Branch supervision changes the experiment; resume its own last.pt or start a new run")
         if "shared_private" in config["model"] and config["model"]["shared_private"] != original["model"].get("shared_private", False):
@@ -156,6 +162,8 @@ def train(config, name, resume=None):
         for key, value in original["train"].items():
             if key not in ("device", "output", "epochs", "num_workers", "max_steps"):
                 settings[key] = value
+    suite = settings.get("metric_suite", "task_specific")
+    protocol = protocol_description(suite, settings.get("threshold_strategy", "global"))
     branch_supervision = settings.get("branch_supervision", "mixed_private")
     if branch_supervision not in ("mixed_private", "shared_private"):
         raise ValueError("branch_supervision must be mixed_private or shared_private")
@@ -251,6 +259,8 @@ def train(config, name, resume=None):
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, schedule)
     start, best_key, best_epoch, stale = 1, (-float("inf"), -float("inf")), 0, 0
     best_state = None
+    best_ranking = (None, None)
+    best_selection_threshold = None
     global_step = 0
     if checkpoint:
         model.load_state_dict(checkpoint["model_state"])
@@ -262,6 +272,8 @@ def train(config, name, resume=None):
         start = checkpoint["epoch"]+1
         best_key, best_epoch, stale = tuple(checkpoint["best_key"]), checkpoint["best_epoch"], checkpoint["stale"]
         best_state = checkpoint["best_model_state"]
+        best_ranking = tuple(checkpoint.get("best_ranking", best_key))
+        best_selection_threshold = checkpoint.get("best_selection_threshold")
         best_weights = checkpoint.get("best_weights", "online")
         if ema is not None:
             ema.load_state_dict(checkpoint["ema_state"])
@@ -303,6 +315,7 @@ def train(config, name, resume=None):
         metadata["evidence_fusion_scope"] = "Both reads: parameter-free RMS(shared/private), same normalized evidence for branch supervision, convex (1-g)*shared+g*private; no extra parameters"
     elif evidence_fusion == "normalized_residual":
         metadata["evidence_fusion_scope"] = "Both reads: same parameter-free RMS, gate inputs and branch supervision as normalized_competitive; only mixing changes to shared+g*private; no extra parameters"
+    metadata["metric_protocol"] = protocol
     write_json(run/"metadata.json", metadata)
     static = {"model_name": config["model_name"], "model_args": args, "config": config, "statistics": source.statistics,
               "labels": source.data.labels, "track": source.data.track, "encoder": datasets[0].meta, "planned_epochs": planned_epochs}
@@ -391,7 +404,8 @@ def train(config, name, resume=None):
         selected_model, validation_weights = model, "online"
         online_report, online_loss = report, validation_loss
         if ema is not None:
-            online_key = (report["macro_ap"], report["micro_ap"])
+            online_selection = selection(y, probabilities, report, suite, protocol["threshold_strategy"])
+            online_key = online_selection[0]
             if online_key > online_best_key:
                 online_best_key, online_best_epoch = online_key, epoch
                 online_best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
@@ -407,9 +421,13 @@ def train(config, name, resume=None):
                                  source.statistics["function_projection"])
         if report["macro_ap"] is None:
             raise ValueError("No positive Validation labels for checkpoint selection")
-        key = (report["macro_ap"], report["micro_ap"])
+        key, selection_threshold, selection_report = (
+            online_selection if ema is not None and selected_model is model
+            else selection(y, probabilities, report, suite, protocol["threshold_strategy"]))
         if key>best_key:
             best_key, best_epoch, stale = key, epoch, 0
+            best_ranking = (report["macro_ap"], report["micro_ap"])
+            best_selection_threshold = selection_threshold
             best_state = {k: v.detach().cpu().clone() for k, v in selected_model.state_dict().items()}
             best_weights = validation_weights
             torch.save({**static, "model_state": best_state, "best_epoch": best_epoch, "weight_source": best_weights}, run/"best.pt")
@@ -424,8 +442,12 @@ def train(config, name, resume=None):
                    "validation": report, "validation_loss": validation_loss,
                    "validation_loss_scope": "main_classification_clean_eval; no stochastic auxiliary reconstruction",
                    "validation_rows": len(y), "validation_groups": groups, "monitor_threshold": .5,
-                   "best_macro_ap": best_key[0], "best_micro_ap": best_key[1], "best_epoch": best_epoch,
+                   "best_macro_ap": best_ranking[0], "best_micro_ap": best_ranking[1], "best_epoch": best_epoch,
                    "early_stopping_count": stale, "peak_cuda_memory_bytes": epoch_peak}
+        if "metric_suite" in settings:
+            history.update(metric_suite=suite, selection_key=list(key), best_selection_key=list(best_key),
+                           selection_threshold=selection_threshold, selection_metrics=selection_report,
+                           best_selection_threshold=best_selection_threshold)
         if gradient_records:
             valid = [r for r in gradient_records if r["finite"]]
             history["reconstruction_gradient"] = {
@@ -449,6 +471,7 @@ def train(config, name, resume=None):
                     "scheduler_state": scheduler.state_dict(), "best_model_state": best_state,
                     "scaler_state": scaler.state_dict(), "global_step": global_step,
                     "best_key": best_key, "best_epoch": best_epoch, "epoch": epoch, "stale": stale,
+                    "best_ranking": best_ranking, "best_selection_threshold": best_selection_threshold,
                     "python_rng": random.getstate(), "numpy_rng": (numpy_rng[0], numpy_rng[1].tolist(), *numpy_rng[2:]),
                     "torch_rng": torch.get_rng_state(), "loader_rng": generator.get_state(),
                     "cuda_rng": torch.cuda.get_rng_state(device) if device.type=="cuda" else None,
@@ -458,6 +481,9 @@ def train(config, name, resume=None):
         with (run/"history.jsonl").open("a", encoding="utf-8") as f:
             f.write(json.dumps(history, allow_nan=False)+"\n")
         print(format_epoch(config["model_name"], source.data.track, settings["seed"], settings["epochs"], history, settings["patience"]), flush=True)
+        if "metric_suite" in settings:
+            print(f"Selection | suite={suite} key={key} best={best_key}@{best_epoch} "
+                  f"threshold={selection_threshold} | {format_primary(suite, selection_report)}", flush=True)
         if branch_supervision == "shared_private":
             print(f"Branches | mode=shared_private stage=pre_feedback "
                   f"shared={history['losses']['branch_shared']:.6f} private={history['losses']['branch_private']:.6f} "
@@ -518,6 +544,8 @@ def train(config, name, resume=None):
               "final_metrics_scope": "best_checkpoint_with_validation_fitted_threshold",
               "annotation_based_metrics": True,
               "checkpoint": str(run/"best.pt")}
+    result.update(metric_protocol=protocol, primary_metrics=primary_metrics(result["validation"], suite),
+                  best_selection_key=list(best_key))
     if ema is not None:
         model.load_state_dict(online_best_state)
         raw_y, raw_p, raw_loss = predict_loader(model, loaders[1], device, precision, config["loss"])
@@ -588,6 +616,10 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
             'threshold_refit': False}
     if decision is not None:
         result['decision'] = decision
+    settings = checkpoint["config"]["train"]
+    suite = settings.get("metric_suite", "task_specific")
+    result["metric_protocol"] = protocol_description(suite, settings.get("threshold_strategy", "global"))
+    result["primary_metrics"] = primary_metrics(result["metrics"], suite)
     Path(output).parent.mkdir(parents=True, exist_ok=True)
     with Path(output).open("x", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2, allow_nan=False)

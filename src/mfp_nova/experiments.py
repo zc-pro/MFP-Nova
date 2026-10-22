@@ -10,13 +10,35 @@ from pathlib import Path
 
 import yaml
 
+from .models import RESEARCH_MODELS
 
-MODELS = ("trirelay", "geofactor", "protoroute")
+MODELS = RESEARCH_MODELS
 TASKS = ("major15", "fine39")
 SEEDS = (42, 101, 202, 303, 404)
 PROJECT = Path(__file__).resolve().parents[2]
 ALIASES = {"accuracy": "sample_jaccard", "precision": "sample_precision", "coverage": "sample_recall",
            "absolute_true": "exact_match", "absolute_false": "hamming_loss"}
+
+
+def training_settings(model, config=None):
+    """Preserve the original three-model plan and HelixSet's own YAML defaults."""
+    config = config or yaml.safe_load((PROJECT/f"configs/{model}.yaml").read_text(encoding="utf-8"))
+    settings = config["train"]
+    return {"batch_size": settings["batch_size"] if model == "helixset" else 64,
+            "precision": settings.get("precision", "fp32"),
+            "accumulation_steps": settings.get("accumulation_steps", 1),
+            "metric_suite": settings.get("metric_suite", "task_specific"),
+            "threshold_strategy": settings.get("threshold_strategy", "global"),
+            "ema_decay": settings.get("ema_decay"),
+            "ema_start_epoch": settings.get("ema_start_epoch")}
+
+
+def run_family(model, task, seed):
+    settings = training_settings(model)
+    tag = f"{settings['precision']}_b{settings['batch_size']}"
+    if model == "helixset":
+        tag += f"_a{settings['accumulation_steps']}_ema_{settings['metric_suite']}"
+    return f"{model}_{task}_esm650m_seed{seed}_rtx5070_{tag}"
 
 
 def metric_aliases(score):
@@ -79,37 +101,42 @@ def live_training_runs():
     return found
 
 
-def compatibility_issues(metadata, result, directory):
+def compatibility_issues(metadata, result, directory, identity=None):
     issues = []
+    identity = metadata or result or identity
+    expected = yaml.safe_load((PROJECT/f"configs/{identity['model']}.yaml").read_text(encoding="utf-8"))
+    fixed = training_settings(identity["model"], expected)
+    defaults = {"precision": "fp32", "accumulation_steps": 1, "threshold_strategy": "global",
+                "metric_suite": "task_specific", "ema_decay": None}
     if result:
-        for key, expected in (("precision", "fp32"), ("accumulation_steps", 1), ("threshold_strategy", "global")):
-            if result.get(key, expected)!=expected:
-                issues.append(f"{key} differs from {expected}")
+        for key in ("precision", "accumulation_steps", "threshold_strategy", "metric_suite"):
+            if result.get(key, defaults[key]) != fixed[key]:
+                issues.append(f"{key} differs from {fixed[key]}")
     if metadata:
         config = metadata["config"]
-        expected = yaml.safe_load((PROJECT/f"configs/{metadata['model']}.yaml").read_text(encoding="utf-8"))
         if metadata["encoder"]["name"]!="facebook/esm2_t33_650M_UR50D":
             issues.append("encoder is not ESM-650M")
         for key in ("model", "loss"):
             if config[key]!=expected[key]:
                 issues.append(f"{key} configuration differs from the fixed protocol")
         settings = config["train"]
-        if settings.get("ema_decay") is not None:
-            issues.append("train.ema_decay differs from the fixed protocol")
         if settings.get("reconstruction_decay") is not None:
             issues.append("train.reconstruction_decay differs from the fixed protocol")
         if settings.get("reconstruction_gradient", "sum") != "sum":
             issues.append("train.reconstruction_gradient differs from the fixed protocol")
-        for key, value in {"batch_size": 64, "precision": "fp32", "accumulation_steps": 1,
-                           "threshold_strategy": "global", **{k: expected["train"][k] for k in (
+        for key, value in {**fixed, **{k: expected["train"][k] for k in (
                            "epochs", "learning_rate", "weight_decay", "patience", "warmup_epochs",
                            "aux_warmup_epochs", "gradient_clip")}}.items():
-            if settings.get(key, value)!=value:
+            actual = settings.get(key, defaults.get(key, value))
+            if actual != value:
                 issues.append(f"train.{key} differs from {value}")
         if settings.get("limit_samples") or settings.get("max_steps") or config["data"].get("augment", False):
             issues.append("diagnostic/augmented training is not the original-row formal protocol")
         if metadata.get("cohort") not in (None, "original_resolved_backbone"):
             issues.append("training cohort differs")
+    elif identity["model"] == "helixset":
+        if not directory.name.startswith(run_family(identity["model"], identity["task"], identity["seed"])):
+            issues.append("results-only directory does not identify the HelixSet training settings")
     elif "esm650m" not in directory.name or "fp32_b64" not in directory.name:
         issues.append("results-only directory does not identify ESM-650M / FP32 / batch 64")
     return issues
@@ -125,7 +152,7 @@ def discover_runs(root):
         result = json.loads(result_path.read_text(encoding="utf-8")) if result_path.exists() else None
         identity = result or metadata
         if identity is None:
-            match = re.match(r"^(trirelay|geofactor|protoroute)_(major15|fine39)_esm650m_seed(\d+)_", directory.name)
+            match = re.match(r"^(trirelay|geofactor|protoroute|helixset)_(major15|fine39)_esm650m_seed(\d+)_", directory.name)
             if not match:
                 continue
             identity = {"model": match[1], "task": match[2], "seed": int(match[3])}
@@ -133,8 +160,8 @@ def discover_runs(root):
             continue
         if identity.get("diagnostic_subset"):
             continue
-        issues = compatibility_issues(metadata, result, directory)
-        family = f"{identity['model']}_{identity['task']}_esm650m_seed{identity['seed']}_rtx5070_fp32_b64"
+        issues = compatibility_issues(metadata, result, directory, identity)
+        family = run_family(identity["model"], identity["task"], identity["seed"])
         if issues and not (directory.name==family or directory.name.startswith(family+"_")):
             # Other encoders and intentional ablations are separate experiments,
             # not corrupt attempts at this fixed five-seed job.
@@ -155,14 +182,15 @@ def make_plan(root="runs", models=MODELS, tasks=TASKS, seeds=SEEDS, running=None
     for model in models:
         for task in tasks:
             for seed in seeds:
-                base = f"{model}_{task}_esm650m_seed{seed}_rtx5070_fp32_b64"
+                base = run_family(model, task, seed)
                 matches = [r for r in records if (r["model"], r["task"], r["seed"])==(model, task, seed)]
                 compatible = [r for r in matches if not r["issues"]]
                 complete = [r for r in compatible if r["result"]]
                 active = {name: pid for name, pid in running.items() if name==base or name.startswith(base+"_") or
                           any(name==r["directory"].name for r in matches)}
                 job = {"model": model, "task": task, "seed": seed, "run_name": base, "resume": None,
-                       "result_path": None, "running": active, "issues": []}
+                       "result_path": None, "running": active, "issues": [],
+                       "train_settings": training_settings(model)}
                 if complete:
                     # Count one result per seed. Prefer the furthest completed
                     # continuation, never choose a repeat by its Validation score.
@@ -234,6 +262,7 @@ def summarize(plan, label=None, group=None):
             scalars = [scalar_metrics(r["metrics"]) for r in records]
             keys = sorted(set().union(*(s.keys() for s in scalars))) if scalars else []
             comparisons.append({"model": model, "task": task, "seeds": [r["seed"] for r in records],
+                "metric_suite": training_settings(model)["metric_suite"],
                 "seed_count": len(records), "complete_five_seed": set(r["seed"] for r in records)==set(SEEDS),
                 "metrics": {k: aggregate([r.get(k) for r in scalars]) for k in keys},
                 "resources": {k: aggregate([r[k] for r in records]) for k in ("best_epoch", "epochs_completed",
@@ -257,6 +286,7 @@ def print_plan(plan):
 def print_summary(report):
     for item in report["comparisons"]:
         print(f"\n{item['task']} / {item['model']} | n={item['seed_count']}/5 seeds={item['seeds']} | "
+              + f"metric_suite={item['metric_suite']} | "
               + ("five-seed" if item["complete_five_seed"] else "provisional"))
         def value(key, resource=False):
             stat = item["resources" if resource else "metrics"].get(key)

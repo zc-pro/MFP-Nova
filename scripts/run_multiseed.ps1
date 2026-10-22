@@ -1,10 +1,10 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('all', 'trirelay', 'geofactor', 'protoroute')][string]$Model = 'all',
+    [ValidateSet('all', 'trirelay', 'geofactor', 'protoroute', 'helixset')][string]$Model = 'all',
     [ValidateSet('all', 'major15', 'fine39')][string]$Task = 'all',
     [string]$Seeds = '42,101,202,303,404',
     [string]$Device = 'cuda:0',
-    [ValidateRange(1, 30)][int]$MaxRuns = 1,
+    [ValidateRange(1, 40)][int]$MaxRuns = 1,
     [switch]$All,
     [switch]$DryRun,
     [string]$Python = 'python'
@@ -53,9 +53,16 @@ try {
         $job = $fresh.jobs | Where-Object { $_.model -eq $job.model -and $_.task -eq $job.task -and $_.seed -eq $job.seed }
         if ($job.status -eq 'completed') { continue }
         if ($job.status -eq 'incompatible') { throw ($job.issues -join '; ') }
+        $settings = $job.train_settings
         $arguments = @('-m', 'mfp_nova.cli', 'train', '--model', $job.model, '--task', $job.task,
                        '--esm', '650m', '--seed', [string]$job.seed, '--device', $Device,
-                       '--precision', 'fp32', '--batch-size', '64', '--name', $job.run_name)
+                       '--precision', $settings.precision, '--batch-size', [string]$settings.batch_size,
+                       '--accumulation-steps', [string]$settings.accumulation_steps,
+                       '--metric-suite', $settings.metric_suite, '--name', $job.run_name)
+        if ($null -ne $settings.ema_decay) {
+            $arguments += @('--ema-decay', [string]$settings.ema_decay,
+                            '--ema-start-epoch', [string]$settings.ema_start_epoch)
+        }
         if ($job.resume) { $arguments += @('--resume', $job.resume) }
         Write-Host ('[{0}/{1}] {2}' -f ($executed+1), $limit, $job.run_name)
         & $pythonCommand.Source @arguments

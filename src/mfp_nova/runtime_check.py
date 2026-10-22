@@ -49,7 +49,11 @@ PROBES = {
                  "feedback.0.attention.in_proj_weight", "relations.factor.0.0.weight"],
     "geofactor": ["sequence.plm.weight", "layers.0.member_up.weight", "layers.0.residue.contact.attention.in_proj_weight",
                   "factors.shared_factor.0.weight", "factors.damping"],
-    "protoroute": ["sequence.plm.weight", "collaboration.0.links.0.attention.in_proj_weight", "prototypes.bank", "prototypes.residual", "route.0.weight"]}
+    "protoroute": ["sequence.plm.weight", "collaboration.0.links.0.attention.in_proj_weight", "prototypes.bank", "prototypes.residual", "route.0.weight"],
+    "helixset": ["sequence.plm.weight", "geometry_blocks.0.read.attention.in_proj_weight",
+                 "pair_geometry.weight", "pair_blocks.0.left.weight", "pair_blocks.0.triangle_left.weight",
+                 "pair_blocks.0.geometry_left.weight",
+                 "latent_blocks.0.combine.0.weight", "decoder.0.pair_read.queries.weight", "label_weights"]}
 
 
 @torch.inference_mode()

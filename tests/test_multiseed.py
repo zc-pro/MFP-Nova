@@ -113,7 +113,8 @@ def test_checkpoint_ties_and_terminal_resume_do_not_add_an_epoch(tmp_path, monke
 
 
 def finished_run(root, model='trirelay', task='major15', seed=42, macro_ap=.4, metadata=False):
-    name = f'{model}_{task}_esm650m_seed{seed}_rtx5070_fp32_b64'
+    settings = experiments.training_settings(model)
+    name = experiments.run_family(model, task, seed)
     path = root/name
     path.mkdir(parents=True)
     score = evaluate_metrics(np.eye(2), np.array([[.8, .1], [.2, .7]]))
@@ -121,7 +122,8 @@ def finished_run(root, model='trirelay', task='major15', seed=42, macro_ap=.4, m
     # Exercise aliases from the real old seed=42 schema.
     for field in ('accuracy', 'precision', 'coverage', 'absolute_true', 'absolute_false'):
         score.pop(field)
-    result = {'model': model, 'task': task, 'seed': seed, 'precision': 'fp32', 'accumulation_steps': 1,
+    result = {'model': model, 'task': task, 'seed': seed, 'precision': settings['precision'],
+              'accumulation_steps': settings['accumulation_steps'], 'metric_suite': settings['metric_suite'],
               'diagnostic_subset': False, 'threshold_strategy': 'global', 'threshold_fit_split': 'val',
               'threshold': .65, 'best_epoch': 12, 'epochs_completed': 27, 'global_step': 16659,
               'validation': score, 'labels': ['alpha', 'beta'], 'trainable_parameters': 100,
@@ -129,19 +131,19 @@ def finished_run(root, model='trirelay', task='major15', seed=42, macro_ap=.4, m
     (path/'results.json').write_text(json.dumps(result))
     if metadata:
         config = yaml.safe_load((experiments.PROJECT/f'configs/{model}.yaml').read_text(encoding='utf-8'))
-        config['train'].update(batch_size=64, precision='fp32', seed=seed)
+        config['train'].update(settings, seed=seed)
         meta = {'model': model, 'task': task, 'seed': seed, 'config': config, 'labels': ['alpha', 'beta'],
                 'encoder': {'name': 'facebook/esm2_t33_650M_UR50D'}, 'cohort': 'original_resolved_backbone'}
         (path/'metadata.json').write_text(json.dumps(meta))
     return path
 
 
-def test_fixed_plan_reuses_six_legacy_results_and_identifies_live_resume(tmp_path):
+def test_fixed_plan_reuses_four_model_results_and_identifies_live_resume(tmp_path):
     for model in experiments.MODELS:
         for task in experiments.TASKS:
             finished_run(tmp_path, model, task)
     plan = experiments.make_plan(tmp_path, running={})
-    assert plan['total'] == 30 and plan['counts']['completed'] == 6 and plan['counts']['not_started'] == 24
+    assert plan['total'] == 40 and plan['counts']['completed'] == 8 and plan['counts']['not_started'] == 32
     job = next(j for j in plan['jobs'] if j['seed']==101)
     interrupted = tmp_path/job['run_name']; interrupted.mkdir()
     (interrupted/'last.pt').write_bytes(b'not loaded by planner')
@@ -219,7 +221,8 @@ def test_powershell_resume_failure_and_live_process(tmp_path, shell, scenario):
     jobs = [{'model': 'trirelay', 'task': 'major15', 'seed': seed,
              'status': 'unfinished_checkpoint' if seed==101 else 'not_started',
              'run_name': f'trirelay_major15_seed{seed}_new_attempt',
-             'resume': checkpoint if seed==101 else None, 'issues': [], 'running': {}}
+             'resume': checkpoint if seed==101 else None, 'issues': [], 'running': {},
+             'train_settings': experiments.training_settings('trirelay')}
             for seed in (101, 202)]
     if scenario=='live':
         # Even a completed seed being rerun must prevent a second GPU job.
@@ -255,7 +258,7 @@ exit CODE
 
 @pytest.mark.parametrize('shell', ['powershell', 'pwsh'])
 @pytest.mark.parametrize('arguments,expected', [(['-DryRun'], 0), ([], 1), (['-MaxRuns', '3'], 3),
-                                               (['-All'], 24), (['-All', '-MaxRuns', '1'], -1)])
+                                               (['-All'], 32), (['-All', '-MaxRuns', '1'], -1)])
 def test_powershell_limits_with_fake_python(tmp_path, shell, arguments, expected):
     executable = shutil.which(shell)
     if executable is None:
@@ -266,9 +269,10 @@ def test_powershell_limits_with_fake_python(tmp_path, shell, arguments, expected
         for task in experiments.TASKS:
             for seed in experiments.SEEDS:
                 jobs.append({'model': model, 'task': task, 'seed': seed, 'status': 'completed' if seed==42 else 'not_started',
-                             'run_name': f'{model}_{task}_seed{seed}', 'resume': None, 'issues': []})
+                             'run_name': f'{model}_{task}_seed{seed}', 'resume': None, 'issues': [],
+                             'train_settings': experiments.training_settings(model)})
     plan = tmp_path/'plan.json'
-    plan.write_text(json.dumps({'total': 30, 'counts': {'completed': 6}, 'jobs': jobs}))
+    plan.write_text(json.dumps({'total': 40, 'counts': {'completed': 8}, 'jobs': jobs}))
     fake = tmp_path/'fake_python.ps1'
     fake.write_text("""param([Parameter(ValueFromRemainingArguments=$true)][string[]]$CallArgs)
 if ($CallArgs -contains 'mfp_nova.experiments') {
