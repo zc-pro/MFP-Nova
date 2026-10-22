@@ -106,9 +106,10 @@ def export(runs, output, device='cpu', batch_size=64, data_root='data/therapeuti
                   'threshold_fit':False, 'weight_updates':False, 'inference_intervention':False,
                   'scope':'First read before mixed-label feedback; final follows the unchanged complete model',
                   'head_definitions':{
-                      'shared_*':'Per-modality unmixed shared evidence after relay, before feedback; RMS-normalized in normalized_competitive mode; existing classifier',
-                      'private_*':'Per-modality unmixed private evidence, ungated, before feedback; RMS-normalized in normalized_competitive mode; existing classifier',
+                      'shared_*':'Per-modality unmixed shared evidence after relay, before feedback; RMS-normalized in normalized_competitive/normalized_residual modes; existing classifier',
+                      'private_*':'Per-modality unmixed private evidence, ungated, before feedback; RMS-normalized in normalized_competitive/normalized_residual modes; existing classifier',
                       'mixed_*':('(1-g)*normalized_shared + g*normalized_private' if model.evidence_partition.fusion=='normalized_competitive' else
+                                 'normalized_shared + g*normalized_private' if model.evidence_partition.fusion=='normalized_residual' else
                                  'shared + gated private')+' before feedback; diagnostic, not a separately supervised first-read mixed branch',
                       'direct':'Original first-read learned multimodal fusion classifier, supervised by direct loss',
                       'final':'Original final prediction after feedback and label relations'},

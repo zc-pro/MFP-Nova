@@ -50,8 +50,8 @@ def main(argv=None):
                              help="TriRelay: preserve private pre-relay evidence alongside shared interactions")
             sub.add_argument("--branch-supervision", choices=("mixed_private", "shared_private"),
                              help="TriRelay: original mixed/private branches or symmetric pre-feedback shared/private supervision")
-            sub.add_argument("--evidence-fusion", choices=("residual", "normalized_competitive"),
-                             help="Shared-private TriRelay: original additive residual or RMS-normalized competitive mixing")
+            sub.add_argument("--evidence-fusion", choices=("residual", "normalized_competitive", "normalized_residual"),
+                             help="Shared-private TriRelay: original addition, RMS competition, or RMS addition")
             sub.add_argument("--name")
             sub.add_argument("--seed", type=int)
             sub.add_argument("--epochs", type=int)

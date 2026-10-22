@@ -156,8 +156,8 @@ def train(config, name, resume=None):
     if branch_supervision == "shared_private" and (config["model_name"] != "trirelay" or not config["model"].get("shared_private")):
         raise ValueError("Shared/private branch supervision requires shared-private TriRelay")
     evidence_fusion = config["model"].get("evidence_fusion", "residual")
-    if evidence_fusion not in ("residual", "normalized_competitive"):
-        raise ValueError("Evidence fusion must be residual or normalized_competitive")
+    if evidence_fusion not in ("residual", "normalized_competitive", "normalized_residual"):
+        raise ValueError("Evidence fusion must be residual, normalized_competitive or normalized_residual")
     if evidence_fusion != "residual" and (config["model_name"] != "trirelay" or not config["model"].get("shared_private")):
         raise ValueError("Non-residual evidence fusion requires shared-private TriRelay")
     consistency = settings.get("consistency_weight", 0)
@@ -289,6 +289,8 @@ def train(config, name, resume=None):
         metadata["branch_supervision_scope"] = "First read before mixed-label feedback: shared/private equally share the original branch weight; no extra parameters"
     if evidence_fusion == "normalized_competitive":
         metadata["evidence_fusion_scope"] = "Both reads: parameter-free RMS(shared/private), same normalized evidence for branch supervision, convex (1-g)*shared+g*private; no extra parameters"
+    elif evidence_fusion == "normalized_residual":
+        metadata["evidence_fusion_scope"] = "Both reads: same parameter-free RMS, gate inputs and branch supervision as normalized_competitive; only mixing changes to shared+g*private; no extra parameters"
     write_json(run/"metadata.json", metadata)
     static = {"model_name": config["model_name"], "model_args": args, "config": config, "statistics": source.statistics,
               "labels": source.data.labels, "track": source.data.track, "encoder": datasets[0].meta, "planned_epochs": planned_epochs}
@@ -559,13 +561,14 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
               "annotation_based_metrics": True, "experimental_structure_group": None}
     if hasattr(model, "evidence_partition"):
         fusion_mode = model.evidence_partition.fusion
+        ablation_scope = {
+            'residual':'Zero private evidence residual in both reads; feedback/context and fusion recomputed; weights unchanged',
+            'normalized_residual':'Zero normalized private residual in both reads; normalized shared coefficient remains 1; feedback/context and fusion recomputed; weights unchanged',
+            'normalized_competitive':'Use normalized shared evidence alone in both reads (g=0, shared coefficient=1); feedback/context and fusion recomputed; weights unchanged'}
         result['inference_ablation'] = {
             'private_evidence_enabled': not without_private_evidence,
             'evidence_fusion': fusion_mode,
-            'scope': (('Use normalized shared evidence alone in both reads (g=0, shared coefficient=1); feedback/context and fusion recomputed; weights unchanged'
-                       if fusion_mode == 'normalized_competitive' else
-                       'Zero private evidence residual in both reads; feedback/context and fusion recomputed; weights unchanged')
-                      if without_private_evidence else 'Unmodified shared-private checkpoint inference'),
+            'scope': ablation_scope[fusion_mode] if without_private_evidence else 'Unmodified shared-private checkpoint inference',
             'threshold_refit': False}
     if decision is not None:
         result['decision'] = decision

@@ -12,8 +12,8 @@ class SharedPrivateEvidence(nn.Module):
 
     def __init__(self, dim, heads, dropout, fusion="residual"):
         super().__init__()
-        if fusion not in ("residual", "normalized_competitive"):
-            raise ValueError("Evidence fusion must be residual or normalized_competitive")
+        if fusion not in ("residual", "normalized_competitive", "normalized_residual"):
+            raise ValueError("Evidence fusion must be residual, normalized_competitive or normalized_residual")
         self.fusion = fusion
         self.shared = nn.ModuleList([FeedForward(dim, 2, dropout) for _ in range(3)])
         self.private = nn.ModuleList([nn.ModuleList([FeedForward(dim, 2, dropout) for _ in range(2)])
@@ -36,7 +36,7 @@ class SharedPrivateEvidence(nn.Module):
         qmask = torch.ones(query.shape[:2], dtype=torch.bool, device=query.device)
         private_evidence = torch.stack([attention(query, x, qmask, mask)
                                        for attention, x, mask in zip(self.readers, private, masks)], 2)
-        if self.fusion == "normalized_competitive":
+        if self.fusion != "residual":
             # Parameter-free RMS scaling, shared by pure-branch supervision and
             # mixing. FP32 reduction also works under V100 FP16 autocast.
             def normalize(x):
