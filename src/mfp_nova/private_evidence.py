@@ -25,6 +25,21 @@ def difference(left, right):
     return None if left is None or right is None else left-right
 
 
+def package_export(runs, output):
+    """Package diagnostic outputs and the original small training records."""
+    output = Path(output)
+    archive = output.with_name(output.name+'.zip')
+    with zipfile.ZipFile(archive,'x',zipfile.ZIP_DEFLATED) as zipped:
+        for file in sorted(output.rglob('*')):
+            if file.is_file():
+                zipped.write(file,file.relative_to(output))
+        for directory in runs:
+            directory=Path(directory)
+            for name in ('metadata.json','results.json','history.jsonl'):
+                zipped.write(directory/name,Path(directory.name)/name)
+    return archive
+
+
 def export(runs, output, device='cpu', batch_size=64, data_root='data/therapeutic_2025', feature_root=None):
     """Two deterministic Val passes per run; no fitting, training or Test access."""
     output = Path(output)
@@ -75,15 +90,7 @@ def export(runs, output, device='cpu', batch_size=64, data_root='data/therapeuti
                'scope':'Inference intervention on the same trained weights; not a retrained no-private baseline',
                'comparisons':comparisons}
     (output/'summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2,allow_nan=False),encoding='utf-8')
-    archive = output.with_name(output.name+'.zip')
-    with zipfile.ZipFile(archive,'x',zipfile.ZIP_DEFLATED) as zipped:
-        for file in sorted(output.rglob('*')):
-            if file.is_file():
-                zipped.write(file,file.relative_to(output))
-        for directory in runs:
-            directory=Path(directory)
-            for name in ('metadata.json','results.json','history.jsonl'):
-                zipped.write(directory/name,Path(directory.name)/name)
+    archive = package_export(runs, output)
     print(f'Completed Val only. Transfer: {archive}', flush=True)
     return summary
 

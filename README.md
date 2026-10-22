@@ -1139,3 +1139,60 @@ printf 'PID=%s\n日志=runs/%s.log\n回传=runs/%s_val.zip\n' "$!" "$run" "$run"
 导出后回传每任务的`*_val.zip`：同时含训练三份记录、完整Val与同权重私有残差消融的JSON/NPZ和summary，不需再单独压缩。对照为前一轮shared-private候选；原EMA-only及fine39 cap继续保留作参照。
 
 本地6项相关检查覆盖Loss预算和mask、共享目标的私有梯度隔离、参数/前向输出不变、两任务短训练、EMA/精确恢复/独立Val及导出打包；真实650M缓存另作两任务各8样本2步的完整规模CPU检查，关键路径均有有限梯度和参数更新。记录在`runs/diagnostics/trirelay_branch_supervision_20261021/real_cache_check.json`。未启动远端GPU或正式Test，模型收益仍待本轮完整训练。
+
+### 当前诊断：首次读取的共享／私有／混合证据
+
+对等监督完整Val结果已回传：fine39 MacroAP=0.540201、Jaccard=0.567590、MFP-F1=0.515029，优于前轮共享私有；major15 MacroAP=0.561389、Jaccard=0.622325，尚未优于原EMA-only。private-off的最终输出会改变反馈分布，不能当成首次读取共享头的性能。
+
+`python -m mfp_nova.branch_evidence`直接读取现有`best.pt`，一次完整Val前向同时观察11个真实读出：三模态各自的`shared_*`、未乘门控的`private_*`、`mixed_*`（共享＋门控私有），以及原`direct`融合分类和`final`最终分类。前9个均发生在标签反馈之前；共享流此时已完成跨模态relay，不能解释成原始单模态编码器。复用既有分类器，不构造未经训练的“纯共享融合分类器”，不删除私有路径或关闭完整模型机制。
+
+输出`branches.json`、`readouts.npz`、总`summary.json`，自动打包并附原metadata/results/history，不含权重。NPZ概率轴为`[Val行, 11个head_names, 标签]`，附`head_available`、首次门控和融合权重；无效模态行保留对齐但不计入该head指标，不能忽略mask后直接统计。每头同时报告自身可用行和三模态共同可用行指标，后者便于比较同一批样本。没有共同可用行时指标明确为null。结构可用不等于可靠；门控幅值不等于因果贡献。
+
+所有头沿用checkpoint原保存阈值，**不拟合分支阈值、不更新权重、不使用Test**。分支分数未单独校准，优先比较Macro/Micro-AP及逐标签AP；F1、MFP和五指标只作统一阈值下诊断。`final_reproduction_deltas`显示最终输出相对原results的差异，不自动改写原成绩。需同时诊断前轮与本轮四个checkpoint才能判断共享头是否改善；不需要重训。
+
+RTX5070 PowerShell，在项目无运行中训练时更新代码后执行：
+
+```powershell
+Set-Location 'D:\Data\ChatGPT\mfp\MFP-Nova'
+git pull --ff-only
+if ($LASTEXITCODE -ne 0) { throw 'Git更新失败。' }
+$mfpPython = 'D:\App\Code\Anaconda\envs\MFP-Nova\python.exe'
+$runs = @(
+    'runs/trirelay_major15_esm650m_ema_sharedprivate_seed42_rtx5070_20261021_155324'
+    'runs/trirelay_fine39_esm650m_ema_sharedprivate_seed42_rtx5070_20261021_171644'
+    'runs/trirelay_major15_esm650m_ema_sharedsupervision_seed42_rtx5070_20261022_002000'
+    'runs/trirelay_fine39_esm650m_ema_sharedsupervision_seed42_rtx5070_20261022_002000'
+)
+$out = 'runs/trirelay_firstread_seed42_rtx5070_' + (Get-Date -Format 'yyyyMMdd_HHmmss')
+& $mfpPython -u -m mfp_nova.branch_evidence --runs $runs `
+    --device cuda:0 --batch-size 64 --cpu-threads 4 --output $out
+if ($LASTEXITCODE -ne 0) { throw '首次读取Val诊断失败。' }
+Write-Host "回传压缩包：${out}.zip"
+```
+
+V100 Bash：仅当**上述四组相同RTX5070权重和原metadata/results/history已通过现有大文件中转放在同名目录**时执行；没有则优先在RTX5070运行，不为此重训。V100独立训练的权重不能冒充RTX同权重复现。选择空闲GPU和CPU线程；断开SSH后继续：
+
+```bash
+(
+set -e
+cd ~/wuzhencheng/projects/MFP-Nova
+git pull --ff-only
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate MFP-Nova
+GPU_ID=1
+CPU_THREADS=4
+out="runs/trirelay_firstread_seed42_v100_$(date +%Y%m%d_%H%M%S)"
+nohup env CUDA_VISIBLE_DEVICES="$GPU_ID" OMP_NUM_THREADS="$CPU_THREADS" \
+    MKL_NUM_THREADS="$CPU_THREADS" OPENBLAS_NUM_THREADS="$CPU_THREADS" \
+    "$(command -v python)" -u -m mfp_nova.branch_evidence --runs \
+    runs/trirelay_major15_esm650m_ema_sharedprivate_seed42_rtx5070_20261021_155324 \
+    runs/trirelay_fine39_esm650m_ema_sharedprivate_seed42_rtx5070_20261021_171644 \
+    runs/trirelay_major15_esm650m_ema_sharedsupervision_seed42_rtx5070_20261022_002000 \
+    runs/trirelay_fine39_esm650m_ema_sharedsupervision_seed42_rtx5070_20261022_002000 \
+    --device cuda:0 --batch-size 64 --cpu-threads "$CPU_THREADS" --output "$out" \
+    > "${out}.log" 2>&1 < /dev/null &
+printf 'PID=%s\n日志=%s.log\n回传=%s.zip\n' "$!" "$out" "$out"
+)
+```
+
+本地相关检查覆盖15/39标签、默认预测/参数不变、前反馈张量取值、D/L与缺结构、阈值不变、无可用结构、完整Val导出及ZIP。另对真实650M缓存各6条Val输入进行完整容量CPU前向，记录在`runs/diagnostics/trirelay_first_read_20261022/real_cache_check.json`；使用未训练模型验证输入链路，不报告性能。正式checkpoint的完整GPU诊断仍需在服务器执行。

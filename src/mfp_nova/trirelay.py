@@ -77,7 +77,7 @@ class TriRelay(nn.Module):
         if shared_private:
             self.evidence_partition = SharedPrivateEvidence(dim, heads, dropout)
 
-    def forward(self, batch, unmixed_branches=False):
+    def forward(self, batch, unmixed_branches=False, first_readouts=False):
         prop, pmask = self.properties(batch)
         seq, smask = self.sequence(batch)
         geo, gmask = self.geometry(batch, masked_mean(prop, pmask) if self.property_geometry else None, self.quality_aware)
@@ -91,11 +91,14 @@ class TriRelay(nn.Module):
             direct, evidence, fusion, private_evidence, private_gate, shared_evidence = self.evidence_partition.read(
                 self.reader, streams, private, masks, batch["quality"], quality_aware=self.quality_aware,
                 private_enabled=self.private_evidence_enabled)
-            if unmixed_branches:
+            if unmixed_branches or first_readouts:
                 # First read has no relation context derived from mixed evidence.
                 # Reuse these same reads: no extra attention or learned classifier.
                 shared_branch = torch.stack([self.classifier(shared_evidence[:, :, m]) for m in range(3)], 1)
                 unmixed_private_branch = torch.stack([self.classifier(private_evidence[:, :, m]) for m in range(3)], 1)
+            if first_readouts:
+                first_mixed_branch = torch.stack([self.classifier(evidence[:, :, m]) for m in range(3)], 1)
+                first_fusion, first_private_gate = fusion, private_gate
         else:
             direct, evidence, fusion = self.reader(streams, masks, batch["quality"], quality_aware=self.quality_aware)
         relation = self.relations(direct, self.high_order) if self.relations_enabled else direct
@@ -127,9 +130,13 @@ class TriRelay(nn.Module):
         if partitioned:
             output["private_branch"] = torch.stack([self.classifier(private_evidence[:, :, m]) for m in range(3)], 1)
             output["private_gate"] = private_gate
-            if unmixed_branches:
+            if unmixed_branches or first_readouts:
                 output["shared_branch"] = shared_branch
                 output["unmixed_private_branch"] = unmixed_private_branch
+            if first_readouts:
+                output["first_mixed_branch"] = first_mixed_branch
+                output["first_fusion"] = first_fusion
+                output["first_private_gate"] = first_private_gate
         if hasattr(self, "function_auxiliary"):
             output["function_aux"] = self.function_auxiliary(final+relation_weight*(relation-final))
         return output
