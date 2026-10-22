@@ -276,15 +276,26 @@ class LabelRelations(nn.Module):
         self.gates = nn.ModuleList([nn.Linear(2*dim, dim) for _ in range(depth)])
         self.heads = heads
 
-    def forward(self, x, high_order=True):
+    def forward(self, x, high_order=True, view_dropout=0.):
         mask = torch.ones(x.shape[:2], dtype=torch.bool, device=x.device)
         prior = self.prior[None, None].expand(x.shape[0], self.heads, -1, -1)
+        if view_dropout:
+            # Mask learned pair attention as well as the empirical bias. Each
+            # label keeps its self edge, including when all other edges drop.
+            keep = torch.rand(x.shape[0], 1, x.shape[1], x.shape[1], device=x.device) >= view_dropout
+            keep |= torch.eye(x.shape[1], dtype=torch.bool, device=x.device)[None, None]
+            prior = prior.masked_fill(~keep, -1e4)
         for pair, factor, ff, gate in zip(self.pair, self.factor, self.ff, self.gates):
             message = pair(x, x, mask, mask, prior)
             if high_order:
                 h = self.incidence/self.incidence.sum(-1, keepdim=True).clamp_min(1)
                 membership = torch.cat([h, self.latent_membership.softmax(-1)], 0)
                 factor_states = factor(torch.einsum("kc,bcd->bkd", membership, x))
+                if view_dropout:
+                    # Empirical and shared latent factors are both perturbed;
+                    # surviving factors retain their original support shrinkage.
+                    keep_factor = torch.rand(*factor_states.shape[:2], 1, device=x.device) >= view_dropout
+                    factor_states = factor_states * keep_factor
                 shrink = torch.cat([self.factor_shrink, torch.ones(len(self.latent_membership), device=x.device)])
                 returns = membership*shrink[:, None]
                 returns = returns/returns.sum(0, keepdim=True).clamp_min(1e-6)

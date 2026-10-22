@@ -107,6 +107,9 @@ def epoch_loss_settings(config, epoch):
     if settings.get("function_aux_weight", 0) > 0:
         loss["function_aux"] = settings["function_aux_weight"]*ramp
         loss["function_hierarchy"] = settings.get("function_hierarchy_weight", .02)*ramp
+    if settings.get("relation_view_weight", 0) > 0:
+        loss["relation_view"] = settings["relation_view_weight"]*min(1., max(0., (epoch-settings.get("warmup_epochs", 5))/5))
+        loss["relation_dropout"] = settings.get("relation_dropout", .2)
     return loss
 
 
@@ -143,6 +146,9 @@ def train(config, name, resume=None):
         for key, default in (("reconstruction_gradient", "sum"), ("reconstruction_grad_ratio", 1.)):
             if key in settings and settings[key] != original["train"].get(key, default):
                 raise ValueError("Reconstruction gradient optimization changes the experiment; start a new run")
+        for key, default in (("relation_view_weight", 0.), ("relation_dropout", .2)):
+            if key in settings and settings[key] != original["train"].get(key, default):
+                raise ValueError("Relation-view supervision changes the experiment; start a new run")
         if config["model_name"] != original["model_name"] or config["data"]["track"] != original["data"]["track"]:
             raise ValueError("Resume model/task differs from checkpoint")
         for key in ("model", "loss", "encoder"):
@@ -174,6 +180,12 @@ def train(config, name, resume=None):
     elif any(key in settings for key in ("consistency_start_epoch", "consistency_ramp_epochs")):
         raise ValueError("Consistency scheduling requires a positive consistency_weight")
     function_aux = settings.get("function_aux_weight", 0)
+    relation_view_weight = settings.get("relation_view_weight", 0.)
+    relation_dropout = settings.get("relation_dropout", .2)
+    if not math.isfinite(relation_view_weight) or relation_view_weight < 0 or not 0 < relation_dropout < 1:
+        raise ValueError("Relation-view weight must be finite/nonnegative and dropout between 0 and 1")
+    if relation_view_weight and (config["model_name"] != "trirelay" or not config["model"].get("relations", True)):
+        raise ValueError("Relation views require TriRelay with relations enabled")
     hierarchy = settings.get("function_hierarchy_weight", .02)
     if not math.isfinite(function_aux) or function_aux < 0 or not math.isfinite(hierarchy) or hierarchy < 0:
         raise ValueError("Function auxiliary weights must be finite and nonnegative")
@@ -343,7 +355,7 @@ def train(config, name, resume=None):
                 # from total leaves zero-but-present gradients on its private head.
                 main = (components["classification"]+loss_settings.get("direct", .2)*components["direct"]
                         +loss_settings.get("branch", .1)*components["branch"])
-                for key in ("function_aux", "function_hierarchy", "consistency"):
+                for key in ("function_aux", "function_hierarchy", "consistency", "relation_view"):
                     if key in components:
                         main = main+loss_settings.get(key, 0)*components[key]
                 gradient_records.append(backward_reconstruction(scaler.scale(main/group_size),
@@ -467,6 +479,10 @@ def train(config, name, resume=None):
                   f"loss={history['losses']['function_aux']:.6f} "
                   f"hierarchy_weight={loss_settings['function_hierarchy']:.4f} "
                   f"hierarchy={history['losses']['function_hierarchy']:.6f}", flush=True)
+        if relation_view_weight:
+            print(f"RelationView | weight={loss_settings.get('relation_view', 0):.4f} "
+                  f"stability={history['losses'].get('relation_stability', 0):.6f} "
+                  f"anchor={history['losses'].get('relation_anchor', 0):.6f} dropout={relation_dropout:g}", flush=True)
         if gradient_records:
             g = history["reconstruction_gradient"]
             fmt = lambda value: "NA" if value is None else f"{value:.4f}"

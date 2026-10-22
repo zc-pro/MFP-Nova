@@ -1291,3 +1291,37 @@ printf 'PID=%s\n日志=runs/trirelay_rmsadd_seed42_v100_%s.log\n回传=runs/trir
 ```
 
 本轮7项相关检查覆盖两任务、两轮归一化加法/范围、数值与梯度、D/L及缺失输入、默认residual兼容、EMA/精确恢复、独立评价和11头打包。同权重首次读取还确认归一化分支与门控与竞争式完全一致，只在组合处产生差异。另对真实650M Train输入各8样本执行完整容量CPU两步更新，关键路径有有限非零梯度、门控参数更新；记录在`runs/diagnostics/trirelay_normalized_residual_20261022/real_cache_check.json`，未覆盖前次记录。这些检查不报告性能；本轮正式GPU收敛、最终指标和资源成本仍待服务器运行，未自动启动远端任务。
+
+## TriRelay 关系视图鲁棒性（2026-10-22）
+
+不再追加融合公式试验，本轮以已完成的 RMS 竞争融合为对照，实现改进书第 7.2 节的关系视图一致性与证据锚定候选。完整三模态编码、三轮交互、两轮读取、关系反馈和高阶机制均保留；不增加可训练参数。
+
+`--relation-view-weight 0.1 --relation-dropout 0.2` 启用：一次完整模型计算后，复用第二轮证据，仅重算最后的标签关系层。遮蔽 20% 非自环的成对注意力边及经验/潜在因子；自环保留，原始支持度收缩不变。原完整关系视图停止梯度，监督遮蔽视图；关系前证据概率 ≤0.2 或 ≥0.8 时，额外约束最终预测。目标为 `L_view = KL(full → masked) + 0.25 KL(confident evidence → full)`，系数从第 6 轮起用 5 轮升至 0.1。
+
+两项 KL 均使用既有逐标签 Bernoulli 一致性：仅作用于未标注项，教师高/低分预算为 1/0.1，已知正例仍由原分类目标监督，不被低教师分反向覆盖。不更改标签，不估计 PU 类别先验。锚点已经包含此前的反馈，是最后关系层之前的证据，不声称完全没有关系信息。遮蔽视图只用于训练；推理保持完整模型，不能把它描述为完整反馈图的两次独立前向。
+
+旧配置默认关闭，旧 checkpoint 不增加 state key。恢复保留新目标设置；主辅梯度优化也包含新 Loss。记录 `relation_stability`、`relation_anchor`、`relation_view`，控制台每轮显示 `RelationView`。主实验仍使用原 AP 选模与 Val 全局 Jaccard 阈值，不采用另一候选模型的传统指标选模模式。
+
+同步源码后，RTX5070 PowerShell：
+
+```powershell
+Set-Location 'D:\Data\ChatGPT\mfp\MFP-Nova'
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\run_relation_views.ps1 -CpuThreads 4
+```
+
+V100 Bash：先激活 MFP-Nova；GPU_ID 为获准使用的物理卡，CPU_THREADS 可调整，nohup 支持关闭 SSH 后继续运行：
+
+```bash
+cd ~/wuzhencheng/projects/MFP-Nova
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate MFP-Nova
+GPU_ID=1
+CPU_THREADS=4
+tag=$(date +%Y%m%d_%H%M%S)
+mkdir -p runs
+nohup env CUDA_VISIBLE_DEVICES="$GPU_ID" CPU_THREADS="$CPU_THREADS" PYTHON_BIN="$(command -v python)" \
+    bash scripts/run_relation_views.sh > "runs/relationview_${tag}.log" 2>&1 < /dev/null &
+printf 'PID=%s  Log=runs/relationview_%s.log\n' "$!" "$tag"
+```
+
+两个脚本默认串行训练完整 major15/fine39、seed42、650M、FP32、batch64、EMA0.999，其他候选 Loss 关闭；自动导出完整 Val 11 头并打包 metadata/results/history/概率，不含权重。只跑一项时 PowerShell 加 `-Tasks fine39`，Bash 在脚本路径后加 `fine39`。不自动启动服务器任务、不使用 Test，不覆盖历史运行目录。

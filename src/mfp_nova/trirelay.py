@@ -93,7 +93,7 @@ class TriRelay(nn.Module):
         if shared_private:
             self.evidence_partition = SharedPrivateEvidence(dim, heads, dropout, evidence_fusion)
 
-    def forward(self, batch, unmixed_branches=False, first_readouts=False):
+    def forward(self, batch, unmixed_branches=False, first_readouts=False, relation_view_dropout=0.):
         prop, pmask = self.properties(batch)
         seq, smask = self.sequence(batch)
         geo, gmask = self.geometry(batch, masked_mean(prop, pmask) if self.property_geometry else None, self.quality_aware)
@@ -143,6 +143,13 @@ class TriRelay(nn.Module):
         output = {"logits": logits, "direct": direct_logits, "branch": branch, "fusion": fusion,
                 "available": torch.stack([m.any(1) for m in masks], 1),
                 "reconstruction": self.reconstruction(streams[0][:, :-1], streams[2])}
+        if relation_view_dropout:
+            # Reuse final evidence: only the last label-reasoning stage is run
+            # again. Encoders, relay and feedback are neither repeated nor cut.
+            view_relation = self.relations(final, self.high_order, relation_view_dropout)
+            view_weight = torch.sigmoid(self.relation_gate(torch.cat([final, view_relation], -1)))
+            output["relation_view_logits"] = evidence_logits + view_weight.squeeze(-1)*(self.classifier(view_relation)-evidence_logits)
+            output["evidence_logits"] = evidence_logits
         if partitioned:
             output["private_branch"] = torch.stack([self.classifier(private_evidence[:, :, m]) for m in range(3)], 1)
             output["private_gate"] = private_gate
@@ -162,7 +169,9 @@ class TriRelay(nn.Module):
         if symmetric and not hasattr(self, "evidence_partition"):
             raise ValueError("Shared/private branch supervision requires shared-private TriRelay")
         view, hidden = training_views(batch, settings.get("modality_dropout", .1), settings.get("mask_ratio", .15))
-        output = self(view, unmixed_branches=symmetric)
+        relation_view = settings.get("relation_view", 0)
+        output = self(view, unmixed_branches=symmetric,
+                      relation_view_dropout=settings.get("relation_dropout", .2) if relation_view else 0.)
         loss = lambda logits, target: observed_label_loss(logits, target, self.statistics, settings.get("unlabeled_weight", .3))
         terms = {"classification": loss(output["logits"], batch["y"]), "direct": loss(output["direct"], batch["y"])}
         def branch_loss(branch):
@@ -182,6 +191,17 @@ class TriRelay(nn.Module):
             terms["branch"] = torch.stack(branches).mean()
         terms["reconstruction"] = reconstruction_loss(output["reconstruction"], batch, hidden)
         total = terms["classification"]+settings.get("direct", .2)*terms["direct"]+settings.get("branch", .1)*terms["branch"]+settings.get("reconstruction", .05)*terms["reconstruction"]
+        if relation_view:
+            from .consistency import bernoulli_consistency
+            stable, _ = bernoulli_consistency(output["relation_view_logits"], output["logits"], batch["y"])
+            # Anchor confident pre-final-relation evidence only. It already
+            # contains earlier feedback, so this is not a relation-free teacher.
+            probability = output["evidence_logits"].detach().float().sigmoid()
+            confident = (probability <= .2) | (probability >= .8)
+            anchor, _ = bernoulli_consistency(output["logits"], output["evidence_logits"], batch["y"], confident)
+            terms.update(relation_stability=stable, relation_anchor=anchor,
+                         relation_view=stable+.25*anchor)
+            total = total+relation_view*terms["relation_view"]
         if hasattr(self, "function_auxiliary"):
             auxiliary = self.function_auxiliary.loss(output["logits"], output["function_aux"], batch, settings)
             terms.update(auxiliary)

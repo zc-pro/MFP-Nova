@@ -44,6 +44,8 @@ def main(argv=None):
             sub.add_argument("--consistency-ramp-epochs", type=int, help="Consistency weight ramp length (default: 5)")
             sub.add_argument("--function-aux-weight", type=float, help="TriRelay: real paired major15/fine39 auxiliary supervision (candidate: 0.1)")
             sub.add_argument("--function-hierarchy-weight", type=float, help="Soft subtype <= parent constraint (default: 0.02 when auxiliary is enabled)")
+            sub.add_argument("--relation-view-weight", type=float, help="TriRelay: masked label-relation consistency plus confident evidence anchoring (candidate: 0.1)")
+            sub.add_argument("--relation-dropout", type=float, help="Pair edges/factors removed in the auxiliary relation view (default: 0.2)")
             sub.add_argument("--reconstruction-gradient", choices=("sum", "cap", "project"), help="TriRelay: sum=original; cap=shared auxiliary norm cap; project=conflict projection plus norm cap")
             sub.add_argument("--reconstruction-grad-ratio", type=float, help="Maximum shared reconstruction/main gradient norm ratio (default: 1)")
             sub.add_argument("--shared-private", action=argparse.BooleanOptionalAction, default=None,
@@ -127,6 +129,8 @@ def main(argv=None):
                 raise ValueError("Branch supervision is a TriRelay training option")
             if args.evidence_fusion is not None and args.model != "trirelay":
                 raise ValueError("Evidence fusion is a TriRelay model option")
+            if (args.relation_view_weight is not None or args.relation_dropout is not None) and args.model != "trirelay":
+                raise ValueError("Relation views are a TriRelay training option")
             if args.model != "sequence":
                 from .research import train
                 config["model_name"] = args.model
@@ -150,7 +154,8 @@ def main(argv=None):
                 for key in ("precision", "accumulation_steps", "max_steps", "reconstruction_decay", "reconstruction_floor", "ema_decay", "ema_start_epoch",
                             "consistency_weight", "consistency_start_epoch", "consistency_ramp_epochs",
                             "function_aux_weight", "function_hierarchy_weight",
-                            "reconstruction_gradient", "reconstruction_grad_ratio", "branch_supervision"):
+                            "reconstruction_gradient", "reconstruction_grad_ratio", "branch_supervision",
+                            "relation_view_weight", "relation_dropout"):
                     value = getattr(args, key)
                     if value is not None:
                         config["train"][key] = value
