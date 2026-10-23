@@ -279,7 +279,7 @@ class HelixSet(nn.Module):
                  heads=8, dropout=.2, sequence_depth=3, property_depth=2,
                  pair_dim=48, pair_depth=4, latent_count=32, latent_depth=6,
                  decoder_depth=3, triangles=True, label_context=True,
-                 pair_readout=True, fine_evidence=True, geometry_depth=2,
+                 pair_readout=True, fine_evidence=True, geometry_depth=4,
                  geometry_context=True, geometry_quality=True, distance_multiscale=True,
                  scale_balance=True, pair_interactions=True):
         super().__init__()

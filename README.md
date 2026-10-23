@@ -2,7 +2,7 @@
 
 独立的治疗肽多标签预测科研项目。当前专注 **`data/therapeutic_2025/`**，任务为 `major15` 和 `fine39`；同类论文的数据集仅作后续补充基准准备。
 
-项目统一维护四个研究模型：**TriRelay、GeoFactor、ProtoRoute、HelixSet**。前三模型已完成两任务各五 Seed 的首轮训练及独立 Test；HelixSet 已完成源码接入，尚未运行或验证性能。
+项目统一维护四个研究模型：**TriRelay、GeoFactor、ProtoRoute、HelixSet**。前三模型已完成两任务各五 Seed 的首轮训练及独立 Test；HelixSet 两层几何上下文版已完成 major15、seed42 的 Train/Val，当前四层几何上下文配置待运行。
 
 ## 四模型入口
 
@@ -11,7 +11,7 @@
 | TriRelay | [models/trirelay.py](src/mfp_nova/models/trirelay.py) | [trirelay.yaml](configs/trirelay.yaml) | 多模态交互、标签反馈、共享/私有证据 |
 | GeoFactor | [models/geofactor.py](src/mfp_nova/models/geofactor.py) | [geofactor.yaml](configs/geofactor.yaml) | 异构图与高阶因子推断 |
 | ProtoRoute | [models/protoroute.py](src/mfp_nova/models/protoroute.py) | [protoroute.yaml](configs/protoroute.yaml) | 标签条件专家路由与多原型 |
-| HelixSet | [models/helixset.py](src/mfp_nova/models/helixset.py) | [helixset.yaml](configs/helixset.yaml) | 两层几何上下文、质量调制残基对、多尺度平衡记忆与标签条件解码 |
+| HelixSet | [models/helixset.py](src/mfp_nova/models/helixset.py) | [helixset.yaml](configs/helixset.yaml) | 四层几何上下文、质量调制残基对、多尺度平衡记忆与标签条件解码 |
 
 四个模型共用 `research.py` 的训练、恢复、评价和推理流程，使用同一套数据加载与基础神经网络层。`sequence` 仍是独立的轻量对照基线。
 
@@ -22,7 +22,7 @@
 
 四模型都支持 `--metric-suite traditional5|task_specific`。HelixSet 当前默认传统五指标，前三模型保留原 AP 选模协议；批量计划会记录模式。跨模型正式比较时须明确统一的选模和阈值协议，不能将不同模式混成同一组结果。
 
-原三模型的历史五 Seed 批量设置仍为 FP32、batch64、无累积；HelixSet 批量设置沿用其配置的 FP32、microbatch16 × 累积4、EMA0.999。HelixSet 的显存、吞吐和性能尚待实测。
+原三模型的历史五 Seed 批量设置仍为 FP32、batch64、无累积；HelixSet 批量设置沿用其配置的 FP32、microbatch16 × 累积4、EMA0.999。两层几何上下文版在 RTX 5070、batch32×累积2 下峰值 allocated 为7.49 GiB、EMA阶段约249.7秒/轮；当前四层版的资源与性能待实测。
 
 ## 项目结构
 
@@ -76,4 +76,4 @@ runs/                         # 训练输出、权重和分析，不提交 Git
 - [真实 GPU 验证记录](docs/MFP-Real-Data-GPU-Validation.md)：已取得的检查与性能记录。
 - [主数据统计](docs/data_summary.json)、[原始论文数据说明](data/literature_benchmarks/README.md)、[按数据集归并说明](data/literature_consolidated/README.md)。
 
-HelixSet 当前采用 geometry 2 / pair 4 / latent 6 / decoder 3 层，已补充远距离编码、结构质量权重、多尺度计数校正与对应消融开关。源码与配置仅经静态检查，尚未启动模型、训练、测试或性能评价。
+HelixSet 当前采用 geometry 4 / pair 4 / latent 6 / decoder 3 层。2026-10-23 的两层版 major15、seed42 结果为 Val Acc63.49%、Macro-AP55.18%，第25轮EMA最佳、第40轮早停；第11轮Macro-AP最高57.44%。四层版用于检验几何上下文深度，以microbatch16×累积4从头训练，不能恢复两层版checkpoint进行深度对照。本次深度调整仅做静态检查，未启动训练或测试。
