@@ -36,6 +36,9 @@ def transform_numeric(values, stats):
     observed = np.isfinite(values)
     transformed = (np.where(observed, values, stats["impute"]) - stats["mean"]) / stats["scale"]
     transformed[..., ~np.asarray(stats["active"], bool)] = 0
+    # Saved with Train statistics: old checkpoints retain their original inputs.
+    if stats.get("zero_missing", False):
+        transformed[~observed] = 0
     return transformed.astype(np.float32), observed
 
 
@@ -152,6 +155,7 @@ class MultimodalData:
                           "function_projection": function_projection(self.data.labels, track),
                           "dataset": json.loads((self.root/"manifest.json").read_text(encoding="utf-8"))["version_date"],
                           "cohort": "original_resolved_backbone", "train_rows": len(train)}
+            statistics["phys"]["zero_missing"] = True
             geometry_clusters = [len(set(self.data.clusters[train][(self.data.y[train, j]>0)&self.struct["structure_available"][train]]))
                                  for j in range(len(self.data.labels))]
             statistics["labels"]["geometry_positive_clusters"] = geometry_clusters

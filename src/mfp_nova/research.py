@@ -77,6 +77,40 @@ def metrics(y, probabilities, statistics, threshold=.5):
     return evaluate_metrics(y, probabilities, threshold, statistics["labels"]["support"], statistics["function_projection"])
 
 
+def export_validation(run, stem, source, dataset, y, probabilities, threshold, epoch, weight_source, objective):
+    """Reuse collected Val predictions; no extra model forward or Test access."""
+    rows = dataset.indices
+    path = run/f"{stem}_validation.npz"
+    np.savez_compressed(path, row_id=source.data.rows[rows], ID=source.data.ids[rows],
+                        cluster_id=source.data.clusters[rows], targets=y, probabilities=probabilities,
+                        label_names=np.array(source.data.labels), threshold=threshold, split="val",
+                        task=source.data.track, epoch=epoch, weight_source=weight_source,
+                        selection_objective=objective)
+    actual, predicted = y.astype(bool), probabilities >= threshold
+    from .multimodal import independent_functions
+    projection = source.statistics["function_projection"]
+    actual_functions = independent_functions(actual, projection)
+    predicted_functions = independent_functions(predicted, projection)
+    multifunction = actual_functions.sum(1) >= 2
+    summary = {
+        "split": "val", "epoch": epoch, "weight_source": weight_source, "selection_objective": objective,
+        "threshold": threshold, "rows": len(y), "empty_predictions": int((~predicted.any(1)).sum()),
+        "mean_predicted_labels": float(predicted.sum(1).mean()),
+        "mean_observed_labels": float(actual.sum(1).mean()),
+        "multifunction_support": int(multifunction.sum()),
+        "multifunction_missed_detection": int((multifunction & (predicted_functions.sum(1) < 2)).sum()),
+        "multifunction_with_two_observed_functions_recovered": int(
+            (multifunction & ((actual_functions & predicted_functions).sum(1) >= 2)).sum()),
+        "per_label": [{"label": label, "tp": int((actual[:, j] & predicted[:, j]).sum()),
+                       "observed_fp": int((~actual[:, j] & predicted[:, j]).sum()),
+                       "fn": int((actual[:, j] & ~predicted[:, j]).sum())}
+                      for j, label in enumerate(source.data.labels)],
+        "scope": "Validation-selected checkpoint and threshold; FP means unannotated, not confirmed inactive",
+    }
+    write_json(run/f"{stem}_diagnostics.json", summary)
+    return path.name
+
+
 def validate_cache(dataset, config, reference=None):
     meta = dataset.meta
     if meta["name"] != config["encoder"]["name"] or meta["max_length"] != config["encoder"]["max_length"]:
@@ -133,6 +167,9 @@ def train(config, name, resume=None):
     if checkpoint is not None:
         # Resume preserves the trained model/priors/protocol; only execution controls change.
         original = checkpoint["config"]
+        if ("lr_decay_epochs" in settings and settings["lr_decay_epochs"] !=
+                original["train"].get("lr_decay_epochs", checkpoint["planned_epochs"])):
+            raise ValueError("Changing the LR decay horizon requires a new run, not resume")
         if settings.get("metric_suite", "task_specific") != original["train"].get("metric_suite", "task_specific"):
             raise ValueError("Metric suite changes checkpoint selection; start a new run or resume with its saved suite")
         if "branch_supervision" in settings and settings["branch_supervision"] != original["train"].get("branch_supervision", "mixed_private"):
@@ -239,6 +276,15 @@ def train(config, name, resume=None):
     scaler = torch.amp.GradScaler("cuda", enabled=precision=="fp16", init_scale=1024.)
     planned_epochs = checkpoint.get("planned_epochs", settings["epochs"]) if checkpoint else settings["epochs"]
     warmup = settings.get("warmup_epochs", 5)
+    decay_epochs = settings.get("lr_decay_epochs", planned_epochs)
+    if "lr_decay_epochs" in settings and decay_epochs <= warmup:
+        raise ValueError("lr_decay_epochs must exceed warmup_epochs")
+    save_candidates = settings.get("save_selection_candidates", False)
+    alternate_suite = "task_specific" if suite == "traditional5" else "traditional5"
+    alternate_stem = "best_ap" if suite == "traditional5" else "best_accuracy"
+    alternate_best = checkpoint.get("alternate_best") if checkpoint and save_candidates else None
+    candidate_start = (checkpoint.get("selection_tracking_start_epoch", checkpoint["epoch"]+1)
+                       if checkpoint else 1)
     ema_decay = settings.get("ema_decay")
     ema_start = settings.get("ema_start_epoch", warmup+1)
     if ema_decay is not None and (not 0 < ema_decay < 1 or not 1 <= ema_start <= planned_epochs):
@@ -255,7 +301,7 @@ def train(config, name, resume=None):
     def schedule(epoch):
         if warmup and epoch<warmup:
             return (epoch+1)/warmup
-        return .05+.95*.5*(1+math.cos(math.pi*min(1, max(0, (epoch-warmup)/max(1, planned_epochs-warmup)))))
+        return .05+.95*.5*(1+math.cos(math.pi*min(1, max(0, (epoch-warmup)/max(1, decay_epochs-warmup)))))
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, schedule)
     start, best_key, best_epoch, stale = 1, (-float("inf"), -float("inf")), 0, 0
     best_state = None
@@ -316,6 +362,11 @@ def train(config, name, resume=None):
     elif evidence_fusion == "normalized_residual":
         metadata["evidence_fusion_scope"] = "Both reads: same parameter-free RMS, gate inputs and branch supervision as normalized_competitive; only mixing changes to shared+g*private; no extra parameters"
     metadata["metric_protocol"] = protocol
+    metadata["phys_missing_values"] = "zero_after_scaling" if source.statistics["phys"].get("zero_missing", False) else "legacy_median_after_scaling"
+    if save_candidates:
+        metadata["selection_candidates"] = {"primary": suite, "alternate": alternate_suite,
+                                            "tracking_start_epoch": candidate_start,
+                                            "stopping": "primary suite only; one shared optimizer trajectory"}
     write_json(run/"metadata.json", metadata)
     static = {"model_name": config["model_name"], "model_args": args, "config": config, "statistics": source.statistics,
               "labels": source.data.labels, "track": source.data.track, "encoder": datasets[0].meta, "planned_epochs": planned_epochs}
@@ -433,6 +484,21 @@ def train(config, name, resume=None):
             torch.save({**static, "model_state": best_state, "best_epoch": best_epoch, "weight_source": best_weights}, run/"best.pt")
         else:
             stale += 1
+        if save_candidates:
+            alternate_key, alternate_threshold, _ = selection(
+                y, probabilities, report, alternate_suite, protocol["threshold_strategy"])
+            if alternate_best is None or alternate_key > tuple(alternate_best["key"]):
+                if alternate_threshold is None:
+                    alternate_threshold = (fit_label_thresholds(y, probabilities)
+                                           if protocol["threshold_strategy"] == "per_label"
+                                           else fit_global_threshold(y, probabilities))
+                alternate_best = {
+                    "key": list(alternate_key), "epoch": epoch, "threshold": alternate_threshold,
+                    "weight_source": validation_weights, "validation_loss": validation_loss,
+                    "model_state": {k: v.detach().cpu().clone() for k, v in selected_model.state_dict().items()},
+                    "targets": torch.from_numpy(y.copy()),
+                    "probabilities": torch.from_numpy(probabilities.copy()),
+                }
         epoch_peak = torch.cuda.max_memory_allocated(device) if device.type=="cuda" else None
         peak_memory = max(peak_memory, epoch_peak or 0)
         history = {"epoch": epoch, "losses": {k: v/count for k, v in totals.items()}, "loss_settings": loss_settings,
@@ -448,6 +514,9 @@ def train(config, name, resume=None):
             history.update(metric_suite=suite, selection_key=list(key), best_selection_key=list(best_key),
                            selection_threshold=selection_threshold, selection_metrics=selection_report,
                            best_selection_threshold=best_selection_threshold)
+        if save_candidates:
+            history["alternate_selection"] = {"suite": alternate_suite, "best_epoch": alternate_best["epoch"],
+                                               "best_key": alternate_best["key"]}
         if gradient_records:
             valid = [r for r in gradient_records if r["finite"]]
             history["reconstruction_gradient"] = {
@@ -467,7 +536,9 @@ def train(config, name, resume=None):
             ema_checkpoint = {"ema_state": ema.state_dict(), "online_best_state": online_best_state,
                               "online_best_key": online_best_key, "online_best_epoch": online_best_epoch}
         numpy_rng = np.random.get_state()
-        torch.save({**static, **ema_checkpoint, "best_weights": best_weights, "model_state": model.state_dict(), "optimizer_state": optimizer.state_dict(),
+        candidate_checkpoint = ({"alternate_best": alternate_best, "selection_tracking_start_epoch": candidate_start}
+                                if save_candidates else {})
+        torch.save({**static, **ema_checkpoint, **candidate_checkpoint, "best_weights": best_weights, "model_state": model.state_dict(), "optimizer_state": optimizer.state_dict(),
                     "scheduler_state": scheduler.state_dict(), "best_model_state": best_state,
                     "scaler_state": scaler.state_dict(), "global_step": global_step,
                     "best_key": best_key, "best_epoch": best_epoch, "epoch": epoch, "stale": stale,
@@ -546,6 +617,31 @@ def train(config, name, resume=None):
               "checkpoint": str(run/"best.pt")}
     result.update(metric_protocol=protocol, primary_metrics=primary_metrics(result["validation"], suite),
                   best_selection_key=list(best_key))
+    export_predictions = settings.get("export_validation_predictions", False)
+    if export_predictions:
+        result["validation_predictions"] = export_validation(
+            run, "best", source, datasets[1], y, probabilities, threshold, best_epoch, best_weights, suite)
+    if save_candidates and alternate_best is not None:
+        candidate = alternate_best
+        alternate_path = run/f"{alternate_stem}.pt"
+        torch.save({**static, "model_state": candidate["model_state"], "best_epoch": candidate["epoch"],
+                    "threshold": candidate["threshold"], "weight_source": candidate["weight_source"],
+                    "selection_suite": alternate_suite, "selection_key": candidate["key"]}, alternate_path)
+        alternate_y, alternate_p = candidate["targets"].numpy(), candidate["probabilities"].numpy()
+        result["alternate_selection"] = {
+            "suite": alternate_suite, "best_epoch": candidate["epoch"], "key": candidate["key"],
+            "threshold": candidate["threshold"], "threshold_fit_split": "val",
+            "weight_source": candidate["weight_source"], "validation_loss": candidate["validation_loss"],
+            "validation": metrics(alternate_y, alternate_p, source.statistics, candidate["threshold"]),
+            "validation_groups": evaluate_groups(alternate_y, alternate_p, validation_groups, candidate["threshold"],
+                source.statistics["labels"]["support"], source.statistics["function_projection"]),
+            "checkpoint": str(alternate_path), "tracking_start_epoch": candidate_start,
+            "scope": "Same optimizer trajectory; early stopping follows primary suite; Validation only",
+        }
+        if export_predictions:
+            result["alternate_selection"]["validation_predictions"] = export_validation(
+                run, alternate_stem, source, datasets[1], alternate_y, alternate_p, candidate["threshold"],
+                candidate["epoch"], candidate["weight_source"], alternate_suite)
     if ema is not None:
         model.load_state_dict(online_best_state)
         raw_y, raw_p, raw_loss = predict_loader(model, loaders[1], device, precision, config["loss"])
@@ -560,9 +656,9 @@ def train(config, name, resume=None):
                               source.statistics['labels']['support'], source.statistics['function_projection']),
                           "checkpoint": str(run/"online_best.pt"),
                           "scope": "same optimizer trajectory; stopping follows primary Validation, not an independent baseline training"})
-        result['elapsed_seconds'] = elapsed_before+time.perf_counter()-started
         if device.type == "cuda":
             result['peak_cuda_memory_bytes'] = max(peak_memory, torch.cuda.max_memory_allocated(device))
+    result["elapsed_seconds"] = elapsed_before+time.perf_counter()-started
     write_json(run/"results.json", result)
     return result
 
@@ -617,7 +713,7 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
     if decision is not None:
         result['decision'] = decision
     settings = checkpoint["config"]["train"]
-    suite = settings.get("metric_suite", "task_specific")
+    suite = checkpoint.get("selection_suite", settings.get("metric_suite", "task_specific"))
     result["metric_protocol"] = protocol_description(suite, settings.get("threshold_strategy", "global"))
     result["primary_metrics"] = primary_metrics(result["metrics"], suite)
     Path(output).parent.mkdir(parents=True, exist_ok=True)

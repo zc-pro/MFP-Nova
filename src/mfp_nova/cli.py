@@ -37,6 +37,9 @@ def main(argv=None):
             sub.add_argument("--limit-samples", type=int, help="Diagnostic subset, not a performance experiment")
             sub.add_argument("--precision", choices=("fp32", "fp16", "bf16"))
             sub.add_argument("--accumulation-steps", type=int)
+            sub.add_argument("--lr-decay-epochs", type=int,
+                             help="Research models: cosine reaches its floor at this epoch; independent of maximum epochs")
+            sub.add_argument("--latent-depth", type=int, help="HelixSet latent fusion depth for a controlled ablation")
             sub.add_argument("--max-steps", type=int, help="Bounded diagnostic optimizer steps; no Test access")
             sub.add_argument("--reconstruction-decay", nargs=2, type=int, metavar=("START", "END"),
                              help="Research models: cosine-decay reconstruction weight after warmup")
@@ -142,6 +145,12 @@ def main(argv=None):
             if args.model != "sequence":
                 from .research import train
                 config["model_name"] = args.model
+                if args.latent_depth is not None:
+                    if args.model != "helixset" or args.latent_depth < 1:
+                        raise ValueError("--latent-depth requires HelixSet and a positive depth")
+                    if args.resume:
+                        raise ValueError("A latent-depth comparison requires a fresh run")
+                    config["model"]["latent_depth"] = args.latent_depth
                 if args.shared_private is not None:
                     if args.model != "trirelay":
                         raise ValueError("Shared/private evidence is a TriRelay model option")
@@ -159,7 +168,7 @@ def main(argv=None):
                     config["train"]["threshold_strategy"] = args.threshold_strategy
                 if args.limit_samples:
                     config["train"]["limit_samples"] = args.limit_samples
-                for key in ("precision", "accumulation_steps", "max_steps", "reconstruction_decay", "reconstruction_floor", "ema_decay", "ema_start_epoch",
+                for key in ("precision", "accumulation_steps", "lr_decay_epochs", "max_steps", "reconstruction_decay", "reconstruction_floor", "ema_decay", "ema_start_epoch",
                             "consistency_weight", "consistency_start_epoch", "consistency_ramp_epochs",
                             "function_aux_weight", "function_hierarchy_weight",
                             "reconstruction_gradient", "reconstruction_grad_ratio", "branch_supervision",
@@ -168,6 +177,8 @@ def main(argv=None):
                     if value is not None:
                         config["train"][key] = value
             else:
+                if args.latent_depth is not None or args.lr_decay_epochs is not None:
+                    raise ValueError("Latent depth / LR decay controls require a research model")
                 if args.shared_private is not None:
                     raise ValueError("Shared/private evidence is a TriRelay model option")
                 if args.reconstruction_gradient is not None or args.reconstruction_grad_ratio is not None:

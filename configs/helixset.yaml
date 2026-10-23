@@ -30,6 +30,7 @@ model:
   distance_multiscale: true
   scale_balance: true
   pair_interactions: true
+  structure_evidence: true
 loss:
   unlabeled_weight: 0.3
   direct: 0.2
@@ -53,4 +54,6 @@ train:
   ema_start_epoch: 6
   metric_suite: traditional5
   threshold_strategy: global
+  save_selection_candidates: true
+  export_validation_predictions: true
   output: runs

@@ -281,7 +281,7 @@ class HelixSet(nn.Module):
                  decoder_depth=3, triangles=True, label_context=True,
                  pair_readout=True, fine_evidence=True, geometry_depth=4,
                  geometry_context=True, geometry_quality=True, distance_multiscale=True,
-                 scale_balance=True, pair_interactions=True):
+                 scale_balance=True, pair_interactions=True, structure_evidence=True):
         super().__init__()
         self.statistics = statistics
         self.triangles, self.label_context = triangles, label_context
@@ -289,6 +289,7 @@ class HelixSet(nn.Module):
         self.geometry_context, self.geometry_quality = geometry_context, geometry_quality
         self.distance_multiscale = distance_multiscale
         self.scale_balance, self.pair_interactions = scale_balance, pair_interactions
+        self.structure_evidence = structure_evidence
         self.sequence = SequenceEncoder(input_dim, vocab_size, dim, heads, dropout, sequence_depth)
         self.properties = PropertyEncoder(dim, heads, dropout, property_depth)
         self.geometry = nn.Sequential(nn.Linear(16, dim), nn.GELU(), nn.LayerNorm(dim))
@@ -358,6 +359,12 @@ class HelixSet(nn.Module):
         return pairs, geometry_pairs, pair_quality
 
     def forward(self, batch, return_evidence=False):
+        if not self.structure_evidence:
+            # Remove every explicit structure route, including global descriptors.
+            # Sequence-derived physicochemical features remain available.
+            batch = dict(batch)
+            batch["struct_mask"] = torch.zeros_like(batch["struct_mask"])
+            batch["struct_global_mask"] = torch.zeros_like(batch["struct_global_mask"])
         seq, seq_mask = self.sequence(batch)
         prop, prop_mask = self.properties(batch)
         mask = batch["mask"]
