@@ -106,7 +106,7 @@ HelixSet默认保存主协议最优的 `best.pt`，同时保存另一目标的�
 ```powershell
 Set-Location 'D:\Data\ChatGPT\mfp\MFP-Nova'
 $mfpPython = 'D:\App\Code\Anaconda\envs\MFP-Nova\python.exe'
-$Variant = 'baseline'
+$Variant = 'decay30'
 $Variants = @{
   baseline = @()
   no_structure = @('--ablate', 'structure_evidence')
@@ -123,7 +123,7 @@ $env:MKL_NUM_THREADS = '4'
 $RunName = "helixset_major15_seed42_rtx5070_${Variant}_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
 & $mfpPython -u -m mfp_nova.cli train --model helixset --config configs/helixset.yaml `
   --task major15 --esm 650m --seed 42 --device cuda:0 --precision fp32 `
-  --batch-size 16 --accumulation-steps 4 --ema-decay 0.999 --ema-start-epoch 6 `
+  --batch-size 32 --accumulation-steps 2 --ema-decay 0.999 --ema-start-epoch 6 `
   --metric-suite traditional5 --threshold-strategy global --epochs 100 --name $RunName @Extra
 if ($LASTEXITCODE -ne 0) { throw 'Training failed; inspect the error before packaging.' }
 
@@ -143,7 +143,7 @@ Write-Host $ZipPath
 cd ~/wuzhencheng/projects/MFP-Nova
 conda activate MFP-Nova
 mfpPython="$(command -v python)"
-variant=baseline
+variant=decay30
 case "$variant" in
   baseline) extra=() ;;
   no_structure) extra=(--ablate structure_evidence) ;;
@@ -160,7 +160,7 @@ run_name="helixset_major15_seed42_v100_${variant}_$(date +%Y%m%d_%H%M%S)"
 mkdir -p runs
 nohup "$mfpPython" -u -m mfp_nova.cli train --model helixset --config configs/helixset.yaml \
   --task major15 --esm 650m --seed 42 --device cuda:0 --precision fp32 \
-  --batch-size 16 --accumulation-steps 4 --ema-decay 0.999 --ema-start-epoch 6 \
+  --batch-size 32 --accumulation-steps 2 --ema-decay 0.999 --ema-start-epoch 6 \
   --metric-suite traditional5 --threshold-strategy global --epochs 100 --name "$run_name" \
   "${extra[@]}" > "runs/${run_name}.log" 2>&1 < /dev/null &
 echo "PID=$! Run=$run_name"
@@ -188,3 +188,50 @@ with ZipFile(archive, 'x', ZIP_DEFLATED) as out:
 print(archive.resolve())
 PY
 ```
+
+## HelixSet 验证集阈值研究
+
+对结果ZIP中的 `best_validation.npz` 和 `best_ap_validation.npz` 做CPU分析，不需要加载权重或安装PyTorch。也可传入一份NPZ。当前支持major15；按发布数据核对完整Val样本、标签和簇，拒绝Test输入。
+
+```powershell
+$env:PYTHONPATH = "$PWD\src"
+python -m mfp_nova.threshold_study --predictions 'C:\path\results.zip' `
+  --data-root data/therapeutic_2025 --output runs/analysis/helixset_thresholds
+```
+
+```bash
+PYTHONPATH=src python -m mfp_nova.threshold_study --predictions /path/results.zip \
+  --data-root data/therapeutic_2025 --output runs/analysis/helixset_thresholds
+```
+
+四种方法为全局Jaccard阈值、逐类别F1阈值、向全局收缩的类别阈值、集合联合阈值。默认 `kappa=20`、最大偏移 `radius=0.10`；正例覆盖的序列簇数 `g` 决定收缩强度 `g/(g+20)`。联合方法在收缩范围内进行最多3轮单类别搜索，单类别停滞时尝试拟合集错误互换最多的6对类别，每维7个网格位置并保留当前值。按Acc、AT、Macro-F1、较小偏移依次比较，拟合集约束为Acc/AT/Macro-F1不低于全局、AF不高于全局。约束不保证留出数据不退步。所有方法使用相同的按簇两折划分，每折重新拟合全部阈值和收缩统计；没有根据留出折搜索超参数。
+
+输出 `summary.csv`、每个checkpoint的JSON、联合阈值候选 `*_decision.json` 和交叉拟合预测。候选decision可供现有研究模型 `evaluate --decision` / `predict --decision` 显式使用，不修改checkpoint或默认训练策略。原始概率不变，因此AP不变。全Val拟合成绩有乐观性；交叉拟合只诊断新增阈值选择，checkpoint已经完整Val选轮，不能作为独立Test成绩。0仍为未标注。
+
+2026-10-24，`bb3aca4`/major15/seed42/b32×a2，传统最佳epoch17、AP最佳epoch12。默认设置的簇交叉拟合结果（百分数）：
+
+| checkpoint | 方法 | Acc↑ | AT↑ | Macro-F1↑ | AF↓ | MFP-F1↑ |
+|---|---|---:|---:|---:|---:|---:|
+| epoch17 | global | 63.79 | 53.37 | 55.33 | 5.89 | 54.90 |
+| epoch17 | per_label | 62.77 | 50.90 | 56.11 | 6.05 | 53.86 |
+| epoch17 | shrunk | 63.78 | 53.18 | 55.86 | 5.88 | 54.07 |
+| epoch17 | joint | 64.27 | 53.81 | 55.92 | 5.78 | 53.37 |
+| epoch12 | global | 62.71 | 51.44 | 54.50 | 6.03 | 52.90 |
+| epoch12 | per_label | 62.44 | 49.63 | 55.82 | 6.13 | 53.02 |
+| epoch12 | shrunk | 62.78 | 50.57 | 55.47 | 6.07 | 52.82 |
+| epoch12 | joint | 63.36 | 52.04 | 55.30 | 5.92 | 52.83 |
+
+联合方法在两个checkpoint均改善交叉拟合Acc/AT/Macro-F1/AF，但epoch17的MFP-F1下降约1.53个百分点；尚未实现所有目标共同改善，不替换默认global。此次没有接受任何类别对联合更新，因此尚无类别对搜索的收益证据。原始分析文件位于 `runs/analysis/helixset_thresholds_bb3aca4_20261024/`，不提交运行输出。
+
+后续探索增加 `--protect-functions`：在原拟合约束上，要求独立多功能识别F1、至少恢复两个已标注独立功能的比例均不低于全局基准。抗微生物通用标签与具体抗菌/抗真菌/抗寄生虫/抗病毒证据按项目定义去重，不能用简单标签数代替。该选项输出 `joint_functions`，其余搜索设置保持相同，不更改模型训练。使用新的输出目录，例如 `runs/analysis/helixset_thresholds_functions_bb3aca4_20261024`。
+
+| checkpoint | 方法 | Acc↑ | AT↑ | Macro-F1↑ | AF↓ | MFP-F1↑ | 恢复≥2真实功能的条数↑ |
+|---|---|---:|---:|---:|---:|---:|---:|
+| epoch17 | global | 63.79 | 53.37 | 55.33 | 5.89 | 54.90 | 973 |
+| epoch17 | joint_functions | 64.15 | 53.27 | 55.82 | 5.87 | 53.84 | 940 |
+| epoch12 | global | 62.71 | 51.44 | 54.50 | 6.03 | 52.90 | 941 |
+| epoch12 | joint_functions | 63.22 | 51.54 | 55.42 | 6.02 | 53.43 | 937 |
+
+以上为同一Val的簇交叉拟合探索结果。新约束是在查看上一项研究结果后提出，不能称为全新盲验证；拟合集满足约束不代表留出集满足。epoch17仍损害多功能表现；epoch12虽改善多项指标，真实多功能恢复仍减少4条。因此不默认采用、不继续在该Val上叠加约束调优，也不凭本轮分析改选checkpoint。
+
+下一项GPU对照优先使用现有 `decay30`（`--lr-decay-epochs 30`），其他设置沿用 `bb3aca4`、global、seed42、b32×a2。当前第12/17轮LR仍为峰值的99.1%/96.9%；30轮衰减方案对应87.1%/61.4%，第31轮起达到5%下限。这是待执行的学习率日程消融，不是已经证明有效。首次对照不叠加新损失、解冻ESM或加深网络；训练与打包模板见上文受控实验，RTX/V100均使用同一有效batch和协议。跨设备结果应分开报告，主要对照沿用RTX5070。
