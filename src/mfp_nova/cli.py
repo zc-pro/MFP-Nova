@@ -39,7 +39,7 @@ def main(argv=None):
             sub.add_argument("--accumulation-steps", type=int)
             sub.add_argument("--lr-decay-epochs", type=int,
                              help="Research models: cosine reaches its floor at this epoch; independent of maximum epochs")
-            sub.add_argument("--latent-depth", type=int, help="HelixSet latent fusion depth for a controlled ablation")
+            sub.add_argument("--latent-depth", type=int, help="HelixSet internal latent processing depth after one memory write")
             sub.add_argument("--max-steps", type=int, help="Bounded diagnostic optimizer steps; no Test access")
             sub.add_argument("--reconstruction-decay", nargs=2, type=int, metavar=("START", "END"),
                              help="Research models: cosine-decay reconstruction weight after warmup")

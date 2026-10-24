@@ -2,7 +2,7 @@
 
 独立的治疗肽多标签预测科研项目。当前专注 **`data/therapeutic_2025/`**，任务为 `major15` 和 `fine39`；同类论文的数据集仅作后续补充基准准备。
 
-项目统一维护四个研究模型：**TriRelay、GeoFactor、ProtoRoute、HelixSet**。前三模型已完成两任务各五 Seed 的首轮训练及独立 Test；HelixSet 两层、四层几何上下文版均已完成 major15、seed42 的 Train/Val。最新缺失值修复及诊断输出尚未训练验证。
+项目统一维护四个研究模型：**TriRelay、GeoFactor、ProtoRoute、HelixSet**。前三模型已完成两任务各五 Seed 的首轮训练及独立 Test；HelixSet 已完成旧架构、缺失值修复和 decay30 的 major15/seed42 Train/Val。2026-10-24 集中重构 HelixSet，当前代码尚未进行模型运行或训练验证。
 
 ## 四模型入口
 
@@ -11,7 +11,7 @@
 | TriRelay | [models/trirelay.py](src/mfp_nova/models/trirelay.py) | [trirelay.yaml](configs/trirelay.yaml) | 多模态交互、标签反馈、共享/私有证据 |
 | GeoFactor | [models/geofactor.py](src/mfp_nova/models/geofactor.py) | [geofactor.yaml](configs/geofactor.yaml) | 异构图与高阶因子推断 |
 | ProtoRoute | [models/protoroute.py](src/mfp_nova/models/protoroute.py) | [protoroute.yaml](configs/protoroute.yaml) | 标签条件专家路由与多原型 |
-| HelixSet | [models/helixset.py](src/mfp_nova/models/helixset.py) | [helixset.yaml](configs/helixset.yaml) | 四层几何上下文、质量调制残基对、多尺度平衡记忆与标签条件解码 |
+| HelixSet | [models/helixset.py](src/mfp_nova/models/helixset.py) | [helixset.yaml](configs/helixset.yaml) | 浅层特征跳接、多尺度片段与残基对、局部/全局标签取证、受限几何修正 |
 
 四个模型共用 `research.py` 的训练、恢复、评价和推理流程，使用同一套数据加载与基础神经网络层。`sequence` 仍是独立的轻量对照基线。
 
@@ -22,7 +22,7 @@
 
 四模型都支持 `--metric-suite traditional5|task_specific`。HelixSet 当前默认传统五指标，前三模型保留原 AP 选模协议；批量计划会记录模式。跨模型正式比较时须明确统一的选模和阈值协议，不能将不同模式混成同一组结果。
 
-原三模型的历史五 Seed 批量设置仍为 FP32、batch64、无累积；HelixSet 批量设置沿用其配置的 FP32、microbatch16 × 累积4、EMA0.999。两层版在 RTX 5070、batch32×累积2 下峰值 allocated 为7.49 GiB、EMA阶段约249.7秒/轮；四层版在batch16×累积4下为4.59 GiB、约438.5秒/轮。时间差也包含microbatch变化，不能完全归因于深度。
+原三模型的历史五 Seed 批量设置仍为 FP32、batch64、无累积；HelixSet 当前配置为 FP32、microbatch32 × 累积2、EMA0.999。旧四层模型在 RTX 5070、batch32×累积2 下峰值 allocated 约7.73 GiB、EMA阶段约264秒/轮；这些数字不能当作重构后模型的实测资源占用。
 
 ## 项目结构
 
@@ -76,32 +76,23 @@ runs/                         # 训练输出、权重和分析，不提交 Git
 - [真实 GPU 验证记录](docs/MFP-Real-Data-GPU-Validation.md)：已取得的检查与性能记录。
 - [主数据统计](docs/data_summary.json)、[原始论文数据说明](data/literature_benchmarks/README.md)、[按数据集归并说明](data/literature_consolidated/README.md)。
 
-HelixSet 当前采用 geometry 4 / pair 4 / latent 6 / decoder 3 层。2026-10-23 的两层版 major15、seed42 结果为 Val Acc63.49%、Macro-AP55.18%，第25轮EMA最佳、第40轮早停；四层版为Acc64.05%、Macro-AP55.38%、AT54.28%，第27轮最佳、第42轮早停。全程最高Macro-AP分别为57.44%/57.55%，不支持继续加深作为优先方向。这些是缺失值修复前的Validation成绩。
+旧 HelixSet 采用 geometry4/pair4/latent6/decoder3。缺失值修复后的 `bb3aca4` 基准在第17轮达到 Val Acc63.87%、AT53.89%；`021734d` decay30 为63.26%、52.60%，未改善。当前主干改为 sequence2/property1/geometry2/pair2、一次潜变量写入后3层内部处理、2层双角色标签解码。它不是原架构的 latent3 消融，尚无真实性能结论。
 
-## HelixSet 下一轮受控实验
+## HelixSet 重构后单次训练
 
-修复后的 `baseline` 已完成；当前下一项为 `latent3`：仅将潜变量深度6降至3，保留32个潜变量及原100轮学习率日程。`decay30`已完成单seed对照，未改善主指标，不与latent3叠加。新训练在Train统计中记录 `phys.zero_missing=true`，理化缺失值在训练、验证、外部输入推理时统一标准化后置零，mask保持不变。所有新训练的研究模型均使用此修复；旧checkpoint没有该字段，继续采用原来的填充值，便于复现。恢复旧训练不会获得这项修复，应从头训练建立新参照。
+本轮直接训练完整重构方案，停止安排旧 `latent3` 单项试验。主通路保留浅层序列特征，潜变量只读取一次序列/理化记忆；每类分别读取局部和全局证据，最后读取残基对。显式结构只参与独立的晚期修正，缺结构时修正严格为零；几何logit修正绝对值不超过2，标签关系修正不超过0.5。主分类使用归一化余弦打分，共享尺度初始化10并限制在5–20；类别偏置仍可学习，不声称已校准概率。
+
+保留冻结ESM650M缓存、major15、seed42、FP32、batch32×累积2、EMA0.999/第6轮起、原100轮cosine日程、traditional5/global和修复后的数据划分。ASL与未标注权重0.3不变，辅助损失改为0.1倍主证据分类，取消中间解码监督。**新运行名从头训练，不传 `--resume`，不叠加 `--lr-decay-epochs 30`。旧架构checkpoint需使用其原Git版本评价或恢复，不能用新结构直接加载。** 本轮是整体方案比较，不能将收益单独归因于某一模块。
 
 HelixSet默认保存主协议最优的 `best.pt`，同时保存另一目标的候选：traditional5主协议对应 `best_ap.pt`，task_specific主协议对应 `best_accuracy.pt`。额外候选不控制早停、不独立训练；两者均来自每轮实际用于主选择的online/EMA权重。`last.pt`保存候选状态用于恢复；旧checkpoint恢复后只能从恢复轮次开始追踪额外候选，不能补出历史AP最优权重。候选权重存于CPU，增加约一份模型权重的内存和checkpoint写盘开销；验收ZIP不包含这些权重。
 
 主模型和额外候选自动输出 `*_validation.npz` 与 `*_diagnostics.json`，包含对齐的row_id、ID、cluster_id、标签、目标、概率、阈值，以及空预测、逐类TP/观测FP/FN和多功能漏检统计。`results.json`记录两者指标与分组，`history.jsonl`记录额外候选最佳轮次。无需再跑一次模型来生成这些新增输出；NPZ可直接交给已有 `mfp_nova.decisions` 进行验证集诊断。观测FP不表示实验确认无活性，验证阈值拟合结果不作为独立Test成绩。
 
-所有后续对照保持major15、seed42、FP32、microbatch32×累积2（有效batch64）、相同EMA/损失/主选模协议；每次只改变下表一项，不批量启动。默认配置仍保留latent6作为基准，latent3通过已有CLI覆盖，从头训练。
-
-| Variant | 相对baseline的变化 | 解释 |
-|---|---|---|
-| `baseline` | 无 | 缺失值修复后的四层参照，cosine计划仍为100轮 |
-| `no_structure` | `--ablate structure_evidence` | 同时关闭局部、全局及pair中的显式结构输入；保留序列派生理化特征，不是纯序列模型 |
-| `no_pair_read` | `--ablate pair_interactions` | 关闭标签解码的显式pair状态贡献，保留端点证据与上游pair主干 |
-| `no_triangles` | `--ablate triangles` | 关闭学习/几何两路三角更新，保留其他pair运算 |
-| `latent3` | `--latent-depth 3` | 潜变量融合6层减为3层，其他深度不变 |
-| `decay30` | `--lr-decay-epochs 30` | 最大100轮不变，cosine在30个调度周期后到达5%学习率下限并保持 |
-
-结构与pair开关保留参数，不把关闭计算的模型宣称为等计算量或精简参数模型。`latent3`尚待检验；`decay30`目前不采用。后续不改变未标注标签语义，不解冻ESM。
+两平台命令使用同一配置；有不同设备结果时分别记录。现有消融入口仍可用，但不在本轮批量启动。`--latent-depth` 现在表示一次记忆写入后的潜变量内部处理层数。理化缺失值继续在Train统计标准化后置零，缺失mask保留。
 
 ### RTX 5070：PowerShell
 
-在RTX机器项目目录执行，确认已经同步本次代码。下面每次只运行选定的一组；完成后执行打包段。
+在RTX机器项目目录执行。下面只启动一次训练，成功完成后自动打包。
 
 ```powershell
 Set-Location 'D:\Data\ChatGPT\mfp\MFP-Nova'
@@ -109,25 +100,15 @@ git pull --ff-only origin main
 if ($LASTEXITCODE -ne 0) { throw 'Git同步失败，请处理后再训练。' }
 git log -1 --oneline
 $mfpPython = 'D:\App\Code\Anaconda\envs\MFP-Nova\python.exe'
-$Variant = 'latent3'
-$Variants = @{
-  baseline = @()
-  no_structure = @('--ablate', 'structure_evidence')
-  no_pair_read = @('--ablate', 'pair_interactions')
-  no_triangles = @('--ablate', 'triangles')
-  latent3 = @('--latent-depth', '3')
-  decay30 = @('--lr-decay-epochs', '30')
-}
-if (-not $Variants.ContainsKey($Variant)) { throw "Unknown variant: $Variant" }
-$Extra = $Variants[$Variant]
+$Revision = git rev-parse --short HEAD
 $env:CUDA_VISIBLE_DEVICES = '0'
 $env:OMP_NUM_THREADS = '4'
 $env:MKL_NUM_THREADS = '4'
-$RunName = "helixset_major15_seed42_rtx5070_${Variant}_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+$RunName = "helixset_major15_seed42_rtx5070_${Revision}_evidence_b32_a2_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
 & $mfpPython -u -m mfp_nova.cli train --model helixset --config configs/helixset.yaml `
   --task major15 --esm 650m --seed 42 --device cuda:0 --precision fp32 `
   --batch-size 32 --accumulation-steps 2 --ema-decay 0.999 --ema-start-epoch 6 `
-  --metric-suite traditional5 --threshold-strategy global --epochs 100 --name $RunName @Extra
+  --metric-suite traditional5 --threshold-strategy global --epochs 100 --name $RunName
 if ($LASTEXITCODE -ne 0) { throw 'Training failed; inspect the error before packaging.' }
 
 # 完成后的验收包：JSON、JSONL、NPZ；checkpoint留在训练机器。
@@ -145,31 +126,23 @@ Write-Host $ZipPath
 
 ```bash
 cd ~/wuzhencheng/projects/MFP-Nova
-git pull --ff-only origin main
+git pull --ff-only origin main || exit 1
 git log -1 --oneline
 conda activate MFP-Nova
 mfpPython="$(command -v python)"
-variant=latent3
-case "$variant" in
-  baseline) extra=() ;;
-  no_structure) extra=(--ablate structure_evidence) ;;
-  no_pair_read) extra=(--ablate pair_interactions) ;;
-  no_triangles) extra=(--ablate triangles) ;;
-  latent3) extra=(--latent-depth 3) ;;
-  decay30) extra=(--lr-decay-epochs 30) ;;
-  *) echo "Unknown variant: $variant"; exit 1 ;;
-esac
+revision="$(git rev-parse --short HEAD)"
 gpu=0
 threads=4
 export CUDA_VISIBLE_DEVICES="$gpu" OMP_NUM_THREADS="$threads" MKL_NUM_THREADS="$threads"
-run_name="helixset_major15_seed42_v100_${variant}_$(date +%Y%m%d_%H%M%S)"
+run_name="helixset_major15_seed42_v100_${revision}_evidence_b32_a2_$(date +%Y%m%d_%H%M%S)"
 mkdir -p runs
 nohup "$mfpPython" -u -m mfp_nova.cli train --model helixset --config configs/helixset.yaml \
   --task major15 --esm 650m --seed 42 --device cuda:0 --precision fp32 \
   --batch-size 32 --accumulation-steps 2 --ema-decay 0.999 --ema-start-epoch 6 \
   --metric-suite traditional5 --threshold-strategy global --epochs 100 --name "$run_name" \
-  "${extra[@]}" > "runs/${run_name}.log" 2>&1 < /dev/null &
+  > "runs/${run_name}.log" 2>&1 < /dev/null &
 echo "PID=$! Run=$run_name"
+tail -n 40 -f "runs/${run_name}.log"
 ```
 
 训练完成后打包；重新登录时先恢复 `run_name` 为上面打印的完整名称，在项目目录、MFP-Nova环境中执行：
@@ -240,4 +213,4 @@ PYTHONPATH=src python -m mfp_nova.threshold_study --predictions /path/results.zi
 
 以上为同一Val的簇交叉拟合探索结果。新约束是在查看上一项研究结果后提出，不能称为全新盲验证；拟合集满足约束不代表留出集满足。epoch17仍损害多功能表现；epoch12虽改善多项指标，真实多功能恢复仍减少4条。因此不默认采用、不继续在该Val上叠加约束调优，也不凭本轮分析改选checkpoint。
 
-`decay30`已于2026-10-24完成：29轮、传统最佳14轮，Acc63.26%、AT52.60%、AF5.91%、MFP-F1 53.50%；相对原日程Acc63.87%、AT53.89%、AF5.79%、MFP-F1 54.38%退步。最佳Macro-AP为57.51%，原日程57.33%，小幅上涨主要由37个Val阳性的溶栓类别带动，其他14类平均AP由60.36%降至60.18%。相同epoch29的Train AP99.83%/Val AP52.16%/Val Loss0.11806，对照98.34%/54.80%/0.07361，未缓解过拟合。单seed不推出所有短日程均无效，但当前不采用decay30。下一项只运行 `latent3`，恢复原100轮cosine、global、seed42、b32×a2；上文两平台训练与打包模板已切换到该项。跨设备结果分开报告，主要对照沿用RTX5070。
+`decay30`已于2026-10-24完成：29轮、传统最佳14轮，Acc63.26%、AT52.60%、AF5.91%、MFP-F1 53.50%；相对原日程Acc63.87%、AT53.89%、AF5.79%、MFP-F1 54.38%退步。最佳Macro-AP为57.51%，原日程57.33%，小幅上涨主要由37个Val阳性的溶栓类别带动，其他14类平均AP由60.36%降至60.18%。相同epoch29的Train AP99.83%/Val AP52.16%/Val Loss0.11806，对照98.34%/54.80%/0.07361，未缓解过拟合。单seed不推出所有短日程均无效，但当前不采用decay30。随后用户要求停止小步消融，直接实现完整架构重构；上文命令已切换到新配置，保留原100轮cosine、global、seed42、b32×a2。跨设备结果分开报告，主要对照沿用RTX5070。

@@ -59,9 +59,12 @@ class TransformerBlock(nn.Module):
 
 
 class LocalGlobalBlock(nn.Module):
-    def __init__(self, dim, heads, dropout):
+    def __init__(self, dim, heads, dropout, separable=False):
         super().__init__()
-        self.convs = nn.ModuleList([nn.Conv1d(dim, dim, k, padding=k//2) for k in (3, 5, 7)])
+        # HelixSet separates spatial filtering from the shared pointwise mix.
+        self.convs = nn.ModuleList([
+            nn.Conv1d(dim, dim, k, padding=k//2, groups=dim if separable else 1)
+            for k in (3, 5, 7)])
         self.norm = nn.LayerNorm(dim)
         self.mix = nn.Linear(3*dim, dim)
         self.global_block = TransformerBlock(dim, heads, dropout)
@@ -74,7 +77,7 @@ class LocalGlobalBlock(nn.Module):
 
 
 class SequenceEncoder(nn.Module):
-    def __init__(self, input_dim, vocab_size, dim, heads, dropout, depth=4):
+    def __init__(self, input_dim, vocab_size, dim, heads, dropout, depth=4, separable=False):
         super().__init__()
         self.plm = nn.Linear(input_dim, dim)
         self.aa = nn.Embedding(21, dim, padding_idx=0)
@@ -82,21 +85,23 @@ class SequenceEncoder(nn.Module):
         self.chem = nn.Embedding(vocab_size, dim, padding_idx=0)
         self.position = nn.Embedding(256, dim)
         self.input_gate = nn.Linear(2*dim, dim)
-        self.layers = nn.ModuleList([LocalGlobalBlock(dim, heads, dropout) for _ in range(depth)])
+        self.layers = nn.ModuleList([LocalGlobalBlock(dim, heads, dropout, separable) for _ in range(depth)])
         self.global_layer = nn.Sequential(nn.Linear(2*dim, dim), nn.GELU(), nn.LayerNorm(dim))
 
-    def forward(self, batch):
+    def forward(self, batch, return_shallow=False):
         mask = batch["mask"]
         chemical = self.chem(batch["residue_chem"])
         annotated = self.aa(batch["aa"])+self.d(batch["d"])+chemical
         plm = self.plm(batch["esm"])
         x = plm+torch.sigmoid(self.input_gate(torch.cat([plm, annotated], -1)))*annotated
         x = (x+self.position(torch.arange(x.shape[1], device=x.device)))*mask[..., None]
+        shallow = x
         for layer in self.layers:
             x = layer(x, mask)
         global_chem = masked_mean(self.chem(batch["chemical"]), batch["chemical"]!=0)
         global_token = self.global_layer(torch.cat([masked_mean(x, mask), global_chem], -1))
-        return torch.cat([x, global_token[:, None]], 1), F.pad(mask, (0, 1), value=True)
+        result = torch.cat([x, global_token[:, None]], 1), F.pad(mask, (0, 1), value=True)
+        return (*result, shallow) if return_shallow else result
 
 
 class GeometricLayer(nn.Module):

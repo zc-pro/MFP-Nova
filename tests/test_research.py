@@ -42,7 +42,7 @@ def sample_statistics(n):
     return label_statistics(y, np.arange(450), [f"label{i}" for i in range(n)], min_support=1)
 
 
-@pytest.mark.parametrize("name", ["trirelay", "geofactor", "protoroute"])
+@pytest.mark.parametrize("name", ["trirelay", "geofactor", "protoroute", "helixset"])
 @pytest.mark.parametrize("labels", [15, 39])
 def test_complete_model_masks_gradients(name, labels):
     stats = sample_statistics(labels)

@@ -568,7 +568,7 @@ $$
 | TriRelay | classification + 加权 direct + branch + reconstruction |
 | GeoFactor | classification + 加权 direct + reconstruction + factor |
 | ProtoRoute | classification + 加权 direct + branch + prototype + diversity + balance + reconstruction |
-| HelixSet | classification + 加权 direct（潜变量辅助分类）+ branch（中间解码监督） |
+| HelixSet | classification + 0.1 × direct（几何/关系修正之前的主证据分类）；重构后 branch 恒为0，无中间解码监督 |
 
 `reconstruction` 监督遮蔽特征恢复；`factor` 约束关系因子幅度；`prototype` 促进正例与原型匹配；`diversity` 减少原型过度相似；`balance` 约束可用专家的使用分布。这些数值尺度和目标不同，不能直接按大小判断模块重要性。
 

@@ -13,14 +13,14 @@ model:
   dim: 384
   heads: 8
   dropout: 0.2
-  sequence_depth: 3
-  property_depth: 2
-  geometry_depth: 4
+  sequence_depth: 2
+  property_depth: 1
+  geometry_depth: 2
   pair_dim: 48
-  pair_depth: 4
+  pair_depth: 2
   latent_count: 32
-  latent_depth: 6
-  decoder_depth: 3
+  latent_depth: 3
+  decoder_depth: 2
   triangles: true
   label_context: true
   pair_readout: true
@@ -33,15 +33,15 @@ model:
   structure_evidence: true
 loss:
   unlabeled_weight: 0.3
-  direct: 0.2
-  branch: 0.1
+  direct: 0.1
+  branch: 0.0
   modality_dropout: 0.1
 train:
   device: cpu
   seed: 42
   epochs: 100
-  batch_size: 16
-  accumulation_steps: 4
+  batch_size: 32
+  accumulation_steps: 2
   precision: fp32
   learning_rate: 0.0002
   weight_decay: 0.01

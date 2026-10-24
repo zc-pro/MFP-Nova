@@ -53,7 +53,8 @@ PROBES = {
     "helixset": ["sequence.plm.weight", "geometry_blocks.0.read.attention.in_proj_weight",
                  "pair_geometry.weight", "pair_blocks.0.left.weight", "pair_blocks.0.triangle_left.weight",
                  "pair_blocks.0.geometry_left.weight",
-                 "latent_blocks.0.combine.0.weight", "decoder.0.pair_read.queries.weight", "label_weights"]}
+                 "latent_write.combine.0.weight", "latent_blocks.0.attention.attention.in_proj_weight",
+                 "pair_read.queries.weight", "geometry_output.weight", "label_weights"]}
 
 
 @torch.inference_mode()
