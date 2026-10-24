@@ -80,13 +80,13 @@ HelixSet 当前采用 geometry 4 / pair 4 / latent 6 / decoder 3 层。2026-10-2
 
 ## HelixSet 下一轮受控实验
 
-先运行修复后的 `baseline`。新训练在Train统计中记录 `phys.zero_missing=true`，理化缺失值在训练、验证、外部输入推理时统一标准化后置零，mask保持不变。所有新训练的研究模型均使用此修复；旧checkpoint没有该字段，继续采用原来的填充值，便于复现。恢复旧训练不会获得这项修复，应从头训练建立新参照。
+修复后的 `baseline` 已完成；当前下一项为 `latent3`：仅将潜变量深度6降至3，保留32个潜变量及原100轮学习率日程。`decay30`已完成单seed对照，未改善主指标，不与latent3叠加。新训练在Train统计中记录 `phys.zero_missing=true`，理化缺失值在训练、验证、外部输入推理时统一标准化后置零，mask保持不变。所有新训练的研究模型均使用此修复；旧checkpoint没有该字段，继续采用原来的填充值，便于复现。恢复旧训练不会获得这项修复，应从头训练建立新参照。
 
 HelixSet默认保存主协议最优的 `best.pt`，同时保存另一目标的候选：traditional5主协议对应 `best_ap.pt`，task_specific主协议对应 `best_accuracy.pt`。额外候选不控制早停、不独立训练；两者均来自每轮实际用于主选择的online/EMA权重。`last.pt`保存候选状态用于恢复；旧checkpoint恢复后只能从恢复轮次开始追踪额外候选，不能补出历史AP最优权重。候选权重存于CPU，增加约一份模型权重的内存和checkpoint写盘开销；验收ZIP不包含这些权重。
 
 主模型和额外候选自动输出 `*_validation.npz` 与 `*_diagnostics.json`，包含对齐的row_id、ID、cluster_id、标签、目标、概率、阈值，以及空预测、逐类TP/观测FP/FN和多功能漏检统计。`results.json`记录两者指标与分组，`history.jsonl`记录额外候选最佳轮次。无需再跑一次模型来生成这些新增输出；NPZ可直接交给已有 `mfp_nova.decisions` 进行验证集诊断。观测FP不表示实验确认无活性，验证阈值拟合结果不作为独立Test成绩。
 
-所有对照保持major15、seed42、FP32、microbatch16×累积4、相同EMA/损失/主选模协议；每次只改变下表一项，不批量启动。先查看baseline，再决定执行哪个对照。
+所有后续对照保持major15、seed42、FP32、microbatch32×累积2（有效batch64）、相同EMA/损失/主选模协议；每次只改变下表一项，不批量启动。默认配置仍保留latent6作为基准，latent3通过已有CLI覆盖，从头训练。
 
 | Variant | 相对baseline的变化 | 解释 |
 |---|---|---|
@@ -97,7 +97,7 @@ HelixSet默认保存主协议最优的 `best.pt`，同时保存另一目标的�
 | `latent3` | `--latent-depth 3` | 潜变量融合6层减为3层，其他深度不变 |
 | `decay30` | `--lr-decay-epochs 30` | 最大100轮不变，cosine在30个调度周期后到达5%学习率下限并保持 |
 
-结构与pair开关保留参数，不把关闭计算的模型宣称为等计算量或精简参数模型。`decay30`和`latent3`是待检验候选，不是已证实的改进；不改变未标注标签语义，不解冻ESM。
+结构与pair开关保留参数，不把关闭计算的模型宣称为等计算量或精简参数模型。`latent3`尚待检验；`decay30`目前不采用。后续不改变未标注标签语义，不解冻ESM。
 
 ### RTX 5070：PowerShell
 
@@ -105,8 +105,11 @@ HelixSet默认保存主协议最优的 `best.pt`，同时保存另一目标的�
 
 ```powershell
 Set-Location 'D:\Data\ChatGPT\mfp\MFP-Nova'
+git pull --ff-only origin main
+if ($LASTEXITCODE -ne 0) { throw 'Git同步失败，请处理后再训练。' }
+git log -1 --oneline
 $mfpPython = 'D:\App\Code\Anaconda\envs\MFP-Nova\python.exe'
-$Variant = 'decay30'
+$Variant = 'latent3'
 $Variants = @{
   baseline = @()
   no_structure = @('--ablate', 'structure_evidence')
@@ -129,6 +132,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Training failed; inspect the error before pack
 
 # 完成后的验收包：JSON、JSONL、NPZ；checkpoint留在训练机器。
 $RunDir = Join-Path 'runs' $RunName
+if (-not (Test-Path -LiteralPath (Join-Path $RunDir 'results.json'))) { throw '训练尚未正常完成，未找到results.json。' }
 $PackFiles = Get-ChildItem -LiteralPath $RunDir -File | Where-Object { $_.Extension -in '.json', '.jsonl', '.npz' }
 $ZipPath = Join-Path ([Environment]::GetFolderPath('Desktop')) "${RunName}_results_$(Get-Date -Format 'yyyyMMdd_HHmmss').zip"
 Compress-Archive -LiteralPath $PackFiles.FullName -DestinationPath $ZipPath
@@ -141,9 +145,11 @@ Write-Host $ZipPath
 
 ```bash
 cd ~/wuzhencheng/projects/MFP-Nova
+git pull --ff-only origin main
+git log -1 --oneline
 conda activate MFP-Nova
 mfpPython="$(command -v python)"
-variant=decay30
+variant=latent3
 case "$variant" in
   baseline) extra=() ;;
   no_structure) extra=(--ablate structure_evidence) ;;
@@ -234,4 +240,4 @@ PYTHONPATH=src python -m mfp_nova.threshold_study --predictions /path/results.zi
 
 以上为同一Val的簇交叉拟合探索结果。新约束是在查看上一项研究结果后提出，不能称为全新盲验证；拟合集满足约束不代表留出集满足。epoch17仍损害多功能表现；epoch12虽改善多项指标，真实多功能恢复仍减少4条。因此不默认采用、不继续在该Val上叠加约束调优，也不凭本轮分析改选checkpoint。
 
-下一项GPU对照优先使用现有 `decay30`（`--lr-decay-epochs 30`），其他设置沿用 `bb3aca4`、global、seed42、b32×a2。当前第12/17轮LR仍为峰值的99.1%/96.9%；30轮衰减方案对应87.1%/61.4%，第31轮起达到5%下限。这是待执行的学习率日程消融，不是已经证明有效。首次对照不叠加新损失、解冻ESM或加深网络；训练与打包模板见上文受控实验，RTX/V100均使用同一有效batch和协议。跨设备结果应分开报告，主要对照沿用RTX5070。
+`decay30`已于2026-10-24完成：29轮、传统最佳14轮，Acc63.26%、AT52.60%、AF5.91%、MFP-F1 53.50%；相对原日程Acc63.87%、AT53.89%、AF5.79%、MFP-F1 54.38%退步。最佳Macro-AP为57.51%，原日程57.33%，小幅上涨主要由37个Val阳性的溶栓类别带动，其他14类平均AP由60.36%降至60.18%。相同epoch29的Train AP99.83%/Val AP52.16%/Val Loss0.11806，对照98.34%/54.80%/0.07361，未缓解过拟合。单seed不推出所有短日程均无效，但当前不采用decay30。下一项只运行 `latent3`，恢复原100轮cosine、global、seed42、b32×a2；上文两平台训练与打包模板已切换到该项。跨设备结果分开报告，主要对照沿用RTX5070。
