@@ -53,8 +53,7 @@ PROBES = {
     "helixset": ["sequence.plm.weight", "geometry_blocks.0.read.attention.in_proj_weight",
                  "pair_geometry.weight", "pair_blocks.0.left.weight", "pair_blocks.0.triangle_left.weight",
                  "pair_blocks.0.geometry_left.weight",
-                 "latent_write.combine.0.weight", "latent_blocks.0.attention.attention.in_proj_weight",
-                 "pair_read.queries.weight", "geometry_output.weight", "label_weights"]}
+                 "latent_blocks.0.combine.0.weight", "decoder.0.pair_read.queries.weight", "label_weights"]}
 
 
 @torch.inference_mode()
@@ -96,6 +95,9 @@ def profile(config, source, dataset, device, batches, precisions, measured_steps
         model = make_model(config["model_name"], arguments).to(device).train()
         input_check = check_inputs(model, samples, device, precision)
         parameters = dict(model.named_parameters())
+        probe_keys = list(PROBES[config["model_name"]])
+        if getattr(model, "esm_tail", None) is not None:
+            probe_keys.append("esm_tail.layers.0.attention.self.query.lora_B.weight")
         optimizer = torch.optim.AdamW(model.parameters(), lr=config["train"]["learning_rate"], weight_decay=config["train"]["weight_decay"])
         scaler = torch.amp.GradScaler("cuda", enabled=precision=="fp16", init_scale=1024.)
         for size in batches:
@@ -110,7 +112,7 @@ def profile(config, source, dataset, device, batches, precisions, measured_steps
                     batch = to_device(collate_multimodal(selected), device)
                     events = [torch.cuda.Event(enable_timing=True) for _ in range(4)]
                     optimizer.zero_grad(set_to_none=True)
-                    before = {key: parameters[key].detach().clone() for key in PROBES[config["model_name"]]} if step==1 else {}
+                    before = {key: parameters[key].detach().clone() for key in probe_keys} if step==1 else {}
                     events[0].record()
                     with autocast_context(device, precision):
                         loss, terms = model.compute_loss(batch, config["loss"])

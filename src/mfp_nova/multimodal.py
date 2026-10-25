@@ -265,6 +265,10 @@ class MultimodalPeptides(Dataset):
         esm, _ = self.cache[self.cache_indices[index]]
         i = int(self.indices[index])
         sample = self.source.sample(i, esm)
+        if self.cache.special_tokens is not None:
+            position = self.cache.positions[self.cache_indices[index]]
+            special = torch.from_numpy(np.array(self.cache.special_tokens[position], dtype=np.float32))
+            sample["esm_cls"], sample["esm_eos"] = special.unbind(0)
         if hasattr(self.source, "aux_mask"):
             sample["aux_y"] = torch.from_numpy(self.source.aux_y[i].astype(np.float32))
             sample["aux_mask"] = torch.tensor(bool(self.source.aux_mask[i]))
@@ -372,4 +376,7 @@ def prepare_inputs(raw, statistics):
               "edge_type": edge_type, "confidence_known": known, "phys": phys, "phys_mask": phys_mask,
               "chemical": chemical, "residue_chem": residue_chemical, "quality": quality,
               "struct_global": global_values, "struct_global_mask": global_observed}
+    for key in ("esm_cls", "esm_eos"):
+        if key in raw:
+            arrays[key] = raw[key].astype(np.float32)
     return {key: torch.from_numpy(value) for key, value in arrays.items()}

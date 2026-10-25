@@ -9,18 +9,28 @@ from .data import PeptideData
 
 
 class FrozenEncoder:
-    def __init__(self, name, revision="main", max_length=80, device="cpu"):
+    def __init__(self, name, revision="main", max_length=80, device="cpu", representation_layer=None):
         from transformers import AutoModel, AutoTokenizer
         self.device = torch.device(device)
         self.max_length = max_length
         self.tokenizer = AutoTokenizer.from_pretrained(name, revision=revision)
-        self.model = AutoModel.from_pretrained(name, revision=revision, add_pooling_layer=False).to(self.device).eval()
+        options = {"attn_implementation": "eager"} if representation_layer is not None else {}
+        self.model = AutoModel.from_pretrained(name, revision=revision, add_pooling_layer=False, **options)
+        if representation_layer is not None:
+            if not 0 < representation_layer < self.model.config.num_hidden_layers:
+                raise ValueError("Prefix extraction requires an intermediate ESM layer")
+            self.model.encoder.layer = torch.nn.ModuleList(list(self.model.encoder.layer)[:representation_layer])
+            self.model.encoder.emb_layer_norm_after = torch.nn.Identity()
+        self.model = self.model.to(self.device).eval()
         self.model.requires_grad_(False)
         self.metadata = {"name": name, "requested_revision": revision,
                          "resolved_revision": self.model.config._commit_hash,
                          "sequence_view": "uppercase_resolved_backbone",
                          "max_length": max_length, "input_dim": self.model.config.hidden_size,
                          "extraction_dtype": "float32", "storage_dtype": "float16"}
+        if representation_layer is not None:
+            self.metadata["representation_layer"] = representation_layer
+            self.metadata["special_tokens_cached"] = True
 
     @torch.inference_mode()
     def encode(self, sequences):
@@ -44,7 +54,8 @@ class FrozenEncoder:
 
 def prepare_features(config, splits, device, resume_from=0):
     settings = config["encoder"]
-    encoder = FrozenEncoder(settings["name"], settings["revision"], settings["max_length"], device)
+    prefix = settings.get("representation_layer")
+    encoder = FrozenEncoder(settings["name"], settings["revision"], settings["max_length"], device, prefix)
     data = PeptideData(config["data"]["root"], config["data"]["track"])
     for split in splits:
         # Share one original-row cache between both tasks, including fine39 out-of-scope rows.
@@ -65,10 +76,15 @@ def prepare_features(config, splits, device, resume_from=0):
             values = np.load(root / "residues.npy", mmap_mode="r+")
             if values.shape != shape or values.dtype != np.float16:
                 raise ValueError("Incomplete cache shape/dtype differs from the current extraction")
+            if prefix is not None:
+                special_values = np.load(root / "special_tokens.npy", mmap_mode="r+")
             print(f"{split}: continuing from {start_row}/{len(indices)}", flush=True)
         else:
             root.mkdir(parents=True, exist_ok=False)
             values = np.lib.format.open_memmap(root / "residues.npy", mode="w+", dtype=np.float16, shape=shape)
+            if prefix is not None:
+                special_values = np.lib.format.open_memmap(root / "special_tokens.npy", mode="w+", dtype=np.float16,
+                                                          shape=(len(indices), 2, encoder.metadata["input_dim"]))
         batch_size = settings["batch_size"]
         for start in range(start_row, len(indices), batch_size):
             batch_indices = indices[start:start + batch_size]
@@ -76,8 +92,13 @@ def prepare_features(config, splits, device, resume_from=0):
             for j in range(len(batch_indices)):
                 pos = start + j
                 values[offsets[pos]:offsets[pos + 1]] = states[j, mask[j]].cpu().numpy()
+                if prefix is not None:
+                    special_values[pos, 0] = states[j, 0].cpu().numpy()
+                    special_values[pos, 1] = states[j, len(data.sequences[batch_indices[j]]) + 1].cpu().numpy()
             print(f"{split}: {min(start + batch_size, len(indices))}/{len(indices)}", flush=True)
         values.flush()
+        if prefix is not None:
+            special_values.flush()
         np.save(root / "offsets.npy", offsets)
         np.save(root / "row_ids.npy", data.rows[indices])
         np.save(root / "ids.npy", data.ids[indices])

@@ -117,6 +117,13 @@ def validate_cache(dataset, config, reference=None):
         raise ValueError("Configured ESM differs from cache")
     if config["encoder"]["revision"] not in (meta["requested_revision"], meta["resolved_revision"]):
         raise ValueError("Configured ESM revision differs from cache")
+    layer = config["encoder"].get("representation_layer")
+    if meta.get("representation_layer") != layer or (layer is not None and not meta.get("special_tokens_cached")):
+        raise ValueError("ESM prefix cache differs from config; extract the configured layer including CLS/EOS")
+    tail = config.get("model", {}).get("esm_tail")
+    if tail is not None and (tail["representation_layer"] != layer or tail["name"] != meta["name"]
+                             or tail["revision"] != meta["resolved_revision"]):
+        raise ValueError("Trainable ESM tail must continue the cached layer from the same pretrained revision")
     if reference is not None and any(meta[key] != reference[key] for key in (
             "resolved_revision", "input_dim", "dataset", "extraction_dtype", "storage_dtype")):
         raise ValueError("Split feature definitions differ")
@@ -155,6 +162,24 @@ def update_ema(ema, model, epoch, start_epoch, skipped):
     """Average successful optimizer updates, never microbatches or AMP skips."""
     if ema is not None and epoch >= start_epoch and not skipped:
         ema.update_parameters(model)
+
+
+def frozen_tail_keys(model):
+    """Pretrained tail tensors are reloaded by revision, not saved per checkpoint."""
+    return {key for key, _ in model.named_parameters()
+            if key.removeprefix("module.").startswith("esm_tail.") and ".lora_" not in key}
+
+
+def checkpoint_state(model, cpu=False):
+    omitted = frozen_tail_keys(model)
+    return {key: value.detach().cpu().clone() if cpu else value
+            for key, value in model.state_dict().items() if key not in omitted}
+
+
+def restore_model_state(model, state):
+    result = model.load_state_dict(state, strict=False)
+    if set(result.missing_keys) != frozen_tail_keys(model) - state.keys() or result.unexpected_keys:
+        raise RuntimeError(f"Checkpoint/model mismatch: {result}")
 
 
 def train(config, name, resume=None):
@@ -270,7 +295,14 @@ def train(config, name, resume=None):
     model = make_model(config["model_name"], args).to(device)
     run = Path(settings["output"])/name
     run.mkdir(parents=True, exist_ok=False)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=settings["learning_rate"], weight_decay=settings["weight_decay"])
+    parameters = [(key, value) for key, value in model.named_parameters() if value.requires_grad]
+    if getattr(model, "esm_tail", None) is not None:
+        groups = [{"params": [p for key, p in parameters if not key.startswith("esm_tail.")]},
+                  {"params": [p for key, p in parameters if key.startswith("esm_tail.")],
+                   "lr": settings.get("esm_learning_rate", 1e-5)}]
+    else:
+        groups = [p for _, p in parameters]
+    optimizer = torch.optim.AdamW(groups, lr=settings["learning_rate"], weight_decay=settings["weight_decay"])
     precision = settings.get("precision", "fp32")
     accumulation = settings.get("accumulation_steps", 1)
     scaler = torch.amp.GradScaler("cuda", enabled=precision=="fp16", init_scale=1024.)
@@ -309,7 +341,7 @@ def train(config, name, resume=None):
     best_selection_threshold = None
     global_step = 0
     if checkpoint:
-        model.load_state_dict(checkpoint["model_state"])
+        restore_model_state(model, checkpoint["model_state"])
         optimizer.load_state_dict(checkpoint["optimizer_state"])
         scheduler.load_state_dict(checkpoint["scheduler_state"])
         if "scaler_state" in checkpoint:
@@ -322,7 +354,7 @@ def train(config, name, resume=None):
         best_selection_threshold = checkpoint.get("best_selection_threshold")
         best_weights = checkpoint.get("best_weights", "online")
         if ema is not None:
-            ema.load_state_dict(checkpoint["ema_state"])
+            restore_model_state(ema, checkpoint["ema_state"])
             online_best_state = checkpoint["online_best_state"]
             online_best_key = tuple(checkpoint["online_best_key"])
             online_best_epoch = checkpoint["online_best_epoch"]
@@ -349,6 +381,13 @@ def train(config, name, resume=None):
                 "resume": str(resume) if resume else None, "diagnostic_subset": diagnostic,
                 "monitor_threshold": .5, "train_metrics_scope": "online_augmented_changing_weights",
                 "validation_loss_scope": "main_classification_clean_eval; no stochastic auxiliary reconstruction"}
+    if getattr(model, "esm_tail", None) is not None:
+        metadata["esm_adaptation"] = {
+            "mode": "frozen_prefix_cached_trainable_tail_lora",
+            "prefix_layer": config["encoder"]["representation_layer"],
+            "trainable_parameters": sum(p.numel() for p in model.esm_tail.parameters() if p.requires_grad),
+            "pretrained_weights_in_checkpoint": False,
+            "learning_rate": settings.get("esm_learning_rate", 1e-5)}
     if function_aux:
         aux_stats = source.statistics["function_auxiliary"]
         metadata["function_auxiliary"] = {"task": aux_stats["track"], "labels": aux_stats["labels"],
@@ -459,7 +498,7 @@ def train(config, name, resume=None):
             online_key = online_selection[0]
             if online_key > online_best_key:
                 online_best_key, online_best_epoch = online_key, epoch
-                online_best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                online_best_state = checkpoint_state(model, cpu=True)
             validation_weights = "online_warmup"
             if int(ema.n_averaged) > 0:
                 selected_model, validation_weights = ema.module, "ema"
@@ -479,7 +518,7 @@ def train(config, name, resume=None):
             best_key, best_epoch, stale = key, epoch, 0
             best_ranking = (report["macro_ap"], report["micro_ap"])
             best_selection_threshold = selection_threshold
-            best_state = {k: v.detach().cpu().clone() for k, v in selected_model.state_dict().items()}
+            best_state = checkpoint_state(selected_model, cpu=True)
             best_weights = validation_weights
             torch.save({**static, "model_state": best_state, "best_epoch": best_epoch, "weight_source": best_weights}, run/"best.pt")
         else:
@@ -495,7 +534,7 @@ def train(config, name, resume=None):
                 alternate_best = {
                     "key": list(alternate_key), "epoch": epoch, "threshold": alternate_threshold,
                     "weight_source": validation_weights, "validation_loss": validation_loss,
-                    "model_state": {k: v.detach().cpu().clone() for k, v in selected_model.state_dict().items()},
+                    "model_state": checkpoint_state(selected_model, cpu=True),
                     "targets": torch.from_numpy(y.copy()),
                     "probabilities": torch.from_numpy(probabilities.copy()),
                 }
@@ -510,6 +549,8 @@ def train(config, name, resume=None):
                    "validation_rows": len(y), "validation_groups": groups, "monitor_threshold": .5,
                    "best_macro_ap": best_ranking[0], "best_micro_ap": best_ranking[1], "best_epoch": best_epoch,
                    "early_stopping_count": stale, "peak_cuda_memory_bytes": epoch_peak}
+        if getattr(model, "esm_tail", None) is not None:
+            history["esm_lr"] = optimizer.param_groups[1]["lr"]
         if "metric_suite" in settings:
             history.update(metric_suite=suite, selection_key=list(key), best_selection_key=list(best_key),
                            selection_threshold=selection_threshold, selection_metrics=selection_report,
@@ -533,12 +574,12 @@ def train(config, name, resume=None):
             history.update(online_validation=online_report, online_validation_loss=online_loss,
                            validation_weights=validation_weights, ema_updates=int(ema.n_averaged),
                            online_best_epoch=online_best_epoch)
-            ema_checkpoint = {"ema_state": ema.state_dict(), "online_best_state": online_best_state,
+            ema_checkpoint = {"ema_state": checkpoint_state(ema), "online_best_state": online_best_state,
                               "online_best_key": online_best_key, "online_best_epoch": online_best_epoch}
         numpy_rng = np.random.get_state()
         candidate_checkpoint = ({"alternate_best": alternate_best, "selection_tracking_start_epoch": candidate_start}
                                 if save_candidates else {})
-        torch.save({**static, **ema_checkpoint, **candidate_checkpoint, "best_weights": best_weights, "model_state": model.state_dict(), "optimizer_state": optimizer.state_dict(),
+        torch.save({**static, **ema_checkpoint, **candidate_checkpoint, "best_weights": best_weights, "model_state": checkpoint_state(model), "optimizer_state": optimizer.state_dict(),
                     "scheduler_state": scheduler.state_dict(), "best_model_state": best_state,
                     "scaler_state": scaler.state_dict(), "global_step": global_step,
                     "best_key": best_key, "best_epoch": best_epoch, "epoch": epoch, "stale": stale,
@@ -592,7 +633,7 @@ def train(config, name, resume=None):
             break
         if settings.get("max_steps") and global_step>=settings["max_steps"]:
             break
-    model.load_state_dict(best_state)
+    restore_model_state(model, best_state)
     y, probabilities, validation_loss = predict_loader(model, loaders[1], device, precision, config["loss"])
     threshold = fit_label_thresholds(y, probabilities) if settings.get("threshold_strategy", "global")=="per_label" else fit_global_threshold(y, probabilities)
     torch.save({**static, "model_state": best_state, "best_epoch": best_epoch, "threshold": threshold,
@@ -643,7 +684,7 @@ def train(config, name, resume=None):
                 run, alternate_stem, source, datasets[1], alternate_y, alternate_p, candidate["threshold"],
                 candidate["epoch"], candidate["weight_source"], alternate_suite)
     if ema is not None:
-        model.load_state_dict(online_best_state)
+        restore_model_state(model, online_best_state)
         raw_y, raw_p, raw_loss = predict_loader(model, loaders[1], device, precision, config["loss"])
         raw_threshold = fit_label_thresholds(raw_y, raw_p) if settings.get("threshold_strategy", "global")=="per_label" else fit_global_threshold(raw_y, raw_p)
         torch.save({**static, "model_state": online_best_state, "best_epoch": online_best_epoch,
@@ -666,7 +707,7 @@ def train(config, name, resume=None):
 def load_model(path, device="cpu"):
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     model = make_model(checkpoint["model_name"], checkpoint["model_args"]).to(device)
-    model.load_state_dict(checkpoint["model_state"])
+    restore_model_state(model, checkpoint["model_state"])
     return model.eval(), checkpoint
 
 
@@ -769,7 +810,8 @@ def predict_sequences(checkpoint_path, sequences, device="cpu", decision_path=No
     from .multimodal import prepare_inputs
     model, checkpoint = load_model(checkpoint_path, device)
     info = checkpoint["encoder"]
-    encoder = FrozenEncoder(info["name"], info["resolved_revision"], info["max_length"], device)
+    prefix = info.get("representation_layer")
+    encoder = FrozenEncoder(info["name"], info["resolved_revision"], info["max_length"], device, prefix)
     alphabet = "ACDEFGHIKLMNPQRSTVWY"
     output = []
     size = checkpoint["config"]["encoder"].get("batch_size", 8 if info["input_dim"]==1280 else 32)
@@ -789,6 +831,9 @@ def predict_sequences(checkpoint_path, sequences, device="cpu", decision_path=No
         raw = {"esm": esm, "aa": aa, "d": stereo, "mask": valid,
                "phys_raw": np.full((len(selected), 515), np.nan),
                "residue_chem_tokens": np.array([[c if j<len(s) else "" for j, c in enumerate(s.ljust(length))] for s in selected])}
+        if prefix is not None:
+            raw["esm_cls"] = states[:, 0].half().float().cpu().numpy()
+            raw["esm_eos"] = torch.stack([states[i, len(s) + 1] for i, s in enumerate(selected)]).half().float().cpu().numpy()
         inputs = prepare_inputs(raw, checkpoint["statistics"])
         with torch.inference_mode():
             probs = model(to_device(inputs, device))["logits"].sigmoid().cpu().tolist()

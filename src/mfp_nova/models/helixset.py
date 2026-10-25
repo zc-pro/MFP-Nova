@@ -1,6 +1,6 @@
-"""HelixSet: local/global label evidence with bounded late geometry corrections.
+"""HelixSet: residue-pair reasoning, multiscale memory and latent set decoding.
 
-Consumes the existing frozen-ESM cache and multimodal batch. Inference reads no
+Consumes frozen ESM features or a prefix cache with trainable tail adapters. Inference reads no
 label targets, empirical label graph or retrieved examples and predicts no coordinates.
 """
 import math
@@ -34,6 +34,7 @@ class ResiduePairBlock(nn.Module):
         # No affine offset or output normalization: zero/weak geometric paths
         # must remain zero/weak after triangle aggregation.
         self.geometry_out = nn.Linear(pair_dim, pair_dim, bias=False)
+        self.geometry_bias = nn.Linear(pair_dim, heads, bias=False)
         self.geometry_scale = nn.Parameter(torch.full((pair_dim,), .1))
         self.pair_ff = FeedForward(pair_dim, 2, dropout)
         self.bias = nn.Linear(pair_dim, heads, bias=False)
@@ -68,8 +69,11 @@ class ResiduePairBlock(nn.Module):
                 * pair_quality[..., None] * self.geometry_scale.tanh()
             )
         pairs = self.pair_ff(pairs, valid)
-        # Explicit geometry never enters the sequence/main prediction route.
-        bias = self.bias(self.pair_norm(pairs)).permute(0, 3, 1, 2)
+        # Keep explicit geometry separate from the learned residue-pair state.
+        # Apply quality AFTER normalization/projection, only on the geometry term.
+        bias = (self.bias(self.pair_norm(pairs))
+                + self.geometry_bias(self.geometry_norm(geometry_pairs).tanh()) * pair_quality[..., None])
+        bias = bias.permute(0, 3, 1, 2)
         residues = self.ff(residues + self.read(residues, residues, mask, mask, bias), mask)
         return residues, pairs, geometry_pairs
 
@@ -166,6 +170,7 @@ class LabelPairRead(nn.Module):
         self.query_norm = nn.LayerNorm(dim)
         self.residue_norm = nn.LayerNorm(dim)
         self.pair_norm = nn.LayerNorm(pair_dim)
+        self.geometry_norm = nn.LayerNorm(pair_dim)
         self.queries = nn.Linear(dim, 3 * pair_dim, bias=False)
         self.left = nn.Linear(dim, pair_dim, bias=False)
         self.right = nn.Linear(dim, pair_dim, bias=False)
@@ -175,12 +180,11 @@ class LabelPairRead(nn.Module):
         )
         self.scale = math.sqrt(3 * pair_dim)
 
-    def forward(self, labels, residues, pairs, mask, pair_quality=None, interactions=True):
+    def forward(self, labels, residues, pairs, mask, geometry_pairs, pair_quality, interactions=True):
         queries = self.queries(self.query_norm(labels)).chunk(3, -1)
         residues = self.residue_norm(residues)
-        pairs = self.pair_norm(pairs)
-        if pair_quality is not None:
-            pairs = pairs.tanh() * pair_quality[..., None]
+        pairs = (self.pair_norm(pairs)
+                 + self.geometry_norm(geometry_pairs).tanh() * pair_quality[..., None])
         if not interactions:
             # Keep endpoint scores/values and the same temperature/output size.
             # This ablates only explicit pair-state evidence in the decoder.
@@ -189,14 +193,10 @@ class LabelPairRead(nn.Module):
         valid = mask[:, :, None] & mask[:, None, :]
         # A self-pair is not evidence of interaction between two residues.
         valid = valid & ~torch.eye(mask.shape[1], dtype=torch.bool, device=mask.device)[None]
-        if pair_quality is not None:
-            valid = valid & (pair_quality > 0)
         with torch.autocast(device_type=labels.device.type, enabled=False):
             score = (torch.einsum("bcp,bip->bci", queries[0].float(), left.float())[..., None]
                      + torch.einsum("bcp,bjp->bcj", queries[1].float(), right.float())[:, :, None, :]
                      + torch.einsum("bcp,bijp->bcij", queries[2].float(), pairs.float())) / self.scale
-            if pair_quality is not None:
-                score = score + pair_quality.float().clamp_min(1e-4).log()[:, None]
             score = score.masked_fill(~valid[:, None], torch.finfo(score.dtype).min)
             weights = score.flatten(2).softmax(-1).reshape_as(score) * valid[:, None]
             # Marginals read endpoints; only the narrow pair state is read per pair.
@@ -206,84 +206,98 @@ class LabelPairRead(nn.Module):
             pair_value = torch.einsum("bcij,bijp->bcp", weights, pairs.float())
             values = torch.cat([left_value, right_value, pair_value], -1)
         evidence = self.output(values.to(labels.dtype))
-        if pair_quality is not None:
-            # Preserve absolute pair quality after the output's LayerNorm.
-            strength = (weights * pair_quality[:, None]).sum((2, 3))
-            evidence = evidence * strength[..., None]
         present = valid.flatten(1).any(1)[:, None, None]
         return evidence * present, weights
 
 
-class LatentWrite(nn.Module):
-    """Write sequence/property memory once; subsequent latent blocks are internal."""
+class LatentFusionBlock(nn.Module):
+    """Separate reads prevent long residue streams from crowding out property tokens."""
 
     def __init__(self, dim, heads, dropout):
         super().__init__()
         self.motif_read = QualityRead(dim, heads, dropout)
         self.property_read = Attention(dim, heads, dropout)
-        self.evidence_norms = nn.ModuleList([nn.LayerNorm(dim, elementwise_affine=False) for _ in range(2)])
-        self.combine = nn.Sequential(nn.Linear(2 * dim, dim), nn.Dropout(dropout))
+        self.structure_read = QualityRead(dim, heads, dropout)
+        self.evidence_norms = nn.ModuleList([nn.LayerNorm(dim, elementwise_affine=False) for _ in range(3)])
+        self.combine = nn.Sequential(nn.Linear(3 * dim, dim), nn.Dropout(dropout))
+        self.process = TransformerBlock(dim, heads, dropout)
 
-    def forward(self, latent, latent_mask, memories, masks, motif_weights):
+    def forward(self, latent, latent_mask, memories, masks, reliability, motif_weights):
         evidence = [self.motif_read(latent, memories[0], latent_mask, masks[0], motif_weights),
-                    self.property_read(latent, memories[1], latent_mask, masks[1])]
+                    self.property_read(latent, memories[1], latent_mask, masks[1]),
+                    self.structure_read(latent, memories[2], latent_mask, masks[2], reliability)]
         evidence = [norm(x) for norm, x in zip(self.evidence_norms, evidence)]
-        return latent + self.combine(torch.cat(evidence, -1))
+        # Uniform low reliability cancels inside softmax. Scale after LN so the
+        # absolute source quality survives both attention and normalization.
+        evidence[2] = evidence[2] * structure_strength(reliability, masks[2])
+        return self.process(latent + self.combine(torch.cat(evidence, -1)), latent_mask)
 
 
 class SetDecoderBlock(nn.Module):
-    """Keep local and global label queries distinct; properties condition both."""
-
-    def __init__(self, dim, heads, dropout):
+    def __init__(self, dim, heads, dropout, pair_dim):
         super().__init__()
+        self.context = Attention(dim, heads, dropout)
         self.latent_read = Attention(dim, heads, dropout)
         self.motif_read = QualityRead(dim, heads, dropout)
         self.property_read = Attention(dim, heads, dropout)
-        self.evidence_norms = nn.ModuleList([nn.LayerNorm(dim, elementwise_affine=False) for _ in range(3)])
-        self.property_gate = nn.Linear(2 * dim, 1)
+        self.structure_read = QualityRead(dim, heads, dropout)
+        self.evidence_norms = nn.ModuleList([nn.LayerNorm(dim, elementwise_affine=False) for _ in range(4)])
+        self.combine = nn.Linear(4 * dim, dim)
+        self.pair_read = LabelPairRead(dim, pair_dim, dropout)
+        self.pair_scale = nn.Parameter(torch.full((dim,), .1))
+        self.context_scale = nn.Parameter(torch.full((dim,), .1))
         self.ff = FeedForward(dim, 4, dropout)
 
-    def forward(self, labels, label_mask, global_memory, global_mask, motifs, motif_mask,
-                properties, property_mask, motif_weights, fine_evidence=True):
-        local, global_query = labels.unbind(2)
-        local_read = (self.motif_read(local, motifs, label_mask, motif_mask, motif_weights)
-                      if fine_evidence else torch.zeros_like(local))
-        global_read = self.latent_read(global_query, global_memory, label_mask, global_mask)
-        reads = torch.stack([self.evidence_norms[0](local_read), self.evidence_norms[1](global_read)], 2)
-        flat = labels.flatten(1, 2)
-        flat_mask = label_mask.repeat_interleave(2, 1)
-        prop = (self.property_read(flat, properties, flat_mask, property_mask).reshape_as(labels)
-                if fine_evidence else torch.zeros_like(labels))
-        prop = self.evidence_norms[2](prop)
-        gate = torch.sigmoid(self.property_gate(torch.cat([labels, prop], -1)))
-        labels = labels + reads + gate * prop
-        return self.ff(labels.flatten(1, 2), flat_mask).reshape_as(labels)
+    def forward(self, labels, label_mask, latent, latent_mask, memories, masks, reliability,
+                residues, pairs, residue_mask, geometry_pairs, pair_quality, motif_weights,
+                label_context=True, pair_readout=True, fine_evidence=True, pair_interactions=True):
+        evidence = [self.latent_read(labels, latent, label_mask, latent_mask)]
+        if fine_evidence:
+            evidence.extend([self.motif_read(labels, memories[0], label_mask, masks[0], motif_weights),
+                             self.property_read(labels, memories[1], label_mask, masks[1]),
+                             self.structure_read(labels, memories[2], label_mask, masks[2], reliability)])
+        else:
+            evidence.extend([torch.zeros_like(labels) for _ in range(3)])
+        evidence = [norm(x) for norm, x in zip(self.evidence_norms, evidence)]
+        evidence[3] = evidence[3] * structure_strength(reliability, masks[2])
+        reads = torch.cat(evidence, -1)
+        labels = labels + self.combine(reads)
+        pair_attention = None
+        if pair_readout:
+            pair_evidence, pair_attention = self.pair_read(
+                labels, residues, pairs, residue_mask, geometry_pairs, pair_quality, pair_interactions)
+            labels = labels + self.pair_scale.tanh() * pair_evidence
+        if label_context:
+            # Relation context is conditioned on the peptide before the first
+            # label interaction; its residual starts small but remains trainable.
+            labels = labels + self.context_scale.tanh() * self.context(labels, labels, label_mask, label_mask)
+        return self.ff(labels, label_mask), pair_attention
 
 
 class HelixSet(nn.Module):
     def __init__(self, input_dim, num_labels, vocab_size, statistics, dim=384,
-                 heads=8, dropout=.2, sequence_depth=2, property_depth=1,
-                 pair_dim=48, pair_depth=2, latent_count=32, latent_depth=3,
-                 decoder_depth=2, triangles=True, label_context=True,
-                 pair_readout=True, fine_evidence=True, geometry_depth=2,
+                 heads=8, dropout=.2, sequence_depth=3, property_depth=2,
+                 pair_dim=48, pair_depth=4, latent_count=32, latent_depth=6,
+                 decoder_depth=3, triangles=True, label_context=True,
+                 pair_readout=True, fine_evidence=True, geometry_depth=4,
                  geometry_context=True, geometry_quality=True, distance_multiscale=True,
-                 scale_balance=True, pair_interactions=True, structure_evidence=True):
+                 scale_balance=True, pair_interactions=True, structure_evidence=True,
+                 esm_tail=None):
         super().__init__()
         self.statistics = statistics
+        self.esm_tail = None
         self.triangles, self.label_context = triangles, label_context
         self.pair_readout, self.fine_evidence = pair_readout, fine_evidence
         self.geometry_context, self.geometry_quality = geometry_context, geometry_quality
         self.distance_multiscale = distance_multiscale
         self.scale_balance, self.pair_interactions = scale_balance, pair_interactions
         self.structure_evidence = structure_evidence
-        self.sequence = SequenceEncoder(input_dim, vocab_size, dim, heads, dropout, sequence_depth, separable=True)
+        self.sequence = SequenceEncoder(input_dim, vocab_size, dim, heads, dropout, sequence_depth)
         self.properties = PropertyEncoder(dim, heads, dropout, property_depth)
         self.geometry = nn.Sequential(nn.Linear(16, dim), nn.GELU(), nn.LayerNorm(dim))
         self.dssp = nn.Embedding(10, dim)
         self.structure_global = nn.Sequential(nn.Linear(50, dim), nn.GELU(), nn.LayerNorm(dim))
-        self.shallow_norm = nn.LayerNorm(dim)
-        self.deep_norm = nn.LayerNorm(dim)
-        self.skip_gate = nn.Linear(2 * dim, dim)
+        self.geometry_mix = nn.Sequential(nn.LayerNorm(2 * dim), nn.Linear(2 * dim, dim), nn.Tanh())
         # Keep sequence separation and explicit geometry in separate pair streams.
         self.pair_input = nn.Linear(2, pair_dim)
         self.pair_geometry = nn.Linear(32, pair_dim)
@@ -295,33 +309,26 @@ class HelixSet(nn.Module):
         ])
         self.pyramid = MotifPyramid(dim, dropout)
         self.latents = nn.Parameter(torch.randn(latent_count, dim) * .02)
-        self.latent_write = LatentWrite(dim, heads, dropout)
         self.latent_blocks = nn.ModuleList([
-            TransformerBlock(dim, heads, dropout) for _ in range(latent_depth)
+            LatentFusionBlock(dim, heads, dropout) for _ in range(latent_depth)
         ])
-        self.label_queries = nn.Parameter(torch.randn(num_labels, 2, dim) * .02)
-        self.decoder = nn.ModuleList([SetDecoderBlock(dim, heads, dropout) for _ in range(decoder_depth)])
-        self.role_gate = nn.Linear(2 * dim, 1)
-        self.pair_read = LabelPairRead(dim, pair_dim, dropout)
-        self.pair_scale = nn.Parameter(torch.full((dim,), .1))
-        self.structure_read = QualityRead(dim, heads, dropout)
-        self.structure_norm = nn.LayerNorm(dim, elementwise_affine=False)
-        self.geometry_pair_read = LabelPairRead(dim, pair_dim, dropout)
-        self.geometry_output = nn.Linear(dim, dim, bias=False)
-        self.geometry_gate = nn.Sequential(nn.Linear(2 * dim + 3, dim // 4), nn.GELU(), nn.Linear(dim // 4, 1))
-        nn.init.normal_(self.geometry_output.weight, std=.01)
-        nn.init.constant_(self.geometry_gate[-1].bias, -2.)
-        self.context = Attention(dim, heads, dropout)
-        self.context_norm = nn.LayerNorm(dim, elementwise_affine=False)
-        self.context_scale = nn.Parameter(torch.tensor(.1))
+        self.label_queries = nn.Parameter(torch.randn(num_labels, dim) * .02)
+        self.decoder = nn.ModuleList([SetDecoderBlock(dim, heads, dropout, pair_dim) for _ in range(decoder_depth)])
         self.output_norm = nn.LayerNorm(dim)
         self.label_weights = nn.Parameter(torch.randn(num_labels, dim) / math.sqrt(dim))
-        # Shared cosine scale in (5, 20), initialized to 10; no growing class norms.
-        self.logit_scale = nn.Parameter(torch.tensor(-math.log(2.)))
         self.label_bias = nn.Parameter(torch.zeros(num_labels))
         prior = torch.tensor(statistics["observed_prior"]).clamp(1e-4, 1 - 1e-4)
         with torch.no_grad():
             self.label_bias.copy_(torch.logit(prior))
+        # A pooled latent head teaches the bottleneck without reconstruction losses.
+        self.latent_classifier = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, num_labels))
+        with torch.no_grad():
+            self.latent_classifier[-1].bias.copy_(torch.logit(prior))
+        if esm_tail is not None:
+            from ..esm_tail import ESMTail
+            # Keep the original head initialization/RNG stream when adding LoRA.
+            with torch.random.fork_rng(devices=[]):
+                self.esm_tail = ESMTail(**esm_tail)
 
     def pair_features(self, batch, structural, reliability):
         mask = batch["mask"]
@@ -359,13 +366,15 @@ class HelixSet(nn.Module):
         return pairs, geometry_pairs, pair_quality
 
     def forward(self, batch, return_evidence=False):
+        if self.esm_tail is not None:
+            batch = dict(batch, esm=self.esm_tail(batch))
         if not self.structure_evidence:
             # Remove every explicit structure route, including global descriptors.
             # Sequence-derived physicochemical features remain available.
             batch = dict(batch)
             batch["struct_mask"] = torch.zeros_like(batch["struct_mask"])
             batch["struct_global_mask"] = torch.zeros_like(batch["struct_global_mask"])
-        seq, seq_mask, shallow = self.sequence(batch, return_shallow=True)
+        seq, seq_mask = self.sequence(batch)
         prop, prop_mask = self.properties(batch)
         mask = batch["mask"]
         structural = batch["struct_mask"] & mask
@@ -378,50 +387,22 @@ class HelixSet(nn.Module):
             reliability = torch.ones_like(reliability)
         reliability = reliability * structural
         pairs, geometry_pairs, pair_quality = self.pair_features(batch, structural, reliability)
-        residues = seq[:, :-1]
-        for block in self.pair_blocks:
-            residues, pairs, geometry_pairs = block(
-                residues, pairs, mask, geometry_pairs, pair_quality, structural, self.triangles)
-        shallow, deep = self.shallow_norm(shallow), self.deep_norm(residues)
-        skip = torch.sigmoid(self.skip_gate(torch.cat([shallow, deep], -1)))
-        residues = (skip * shallow + (1 - skip) * deep) * mask[..., None]
-        motifs, motif_mask, motif_weights = self.pyramid(residues, mask)
-        if not self.scale_balance:
-            motif_weights = motif_mask.float()
-        # The global chemical token enters global memory, not the local query.
-        write_memory = torch.cat([motifs, seq[:, -1:]], 1)
-        write_mask = torch.cat([motif_mask, seq_mask[:, -1:]], 1)
-        write_weights = torch.cat([motif_weights, seq_mask[:, -1:].float()], 1)
-        latent = self.latents[None].expand(mask.shape[0], -1, -1)
-        latent_mask = torch.ones(latent.shape[:2], dtype=torch.bool, device=mask.device)
-        latent = self.latent_write(latent, latent_mask, (write_memory, prop), (write_mask, prop_mask), write_weights)
-        for block in self.latent_blocks:
-            latent = block(latent, latent_mask)
-        global_memory = torch.cat([latent, seq[:, -1:]], 1)
-        global_mask = torch.cat([latent_mask, seq_mask[:, -1:]], 1)
-        labels = self.label_queries[None].expand(mask.shape[0], -1, -1, -1)
-        label_mask = torch.ones(labels.shape[:2], dtype=torch.bool, device=mask.device)
-        for block in self.decoder:
-            labels = block(labels, label_mask, global_memory, global_mask, motifs, motif_mask,
-                           prop, prop_mask, motif_weights, self.fine_evidence)
-        local, global_query = labels.unbind(2)
-        role_weight = torch.sigmoid(self.role_gate(torch.cat([local, global_query], -1)))
-        labels = role_weight * local + (1 - role_weight) * global_query
-        pair_attention = None
-        if self.pair_readout:
-            pair_evidence, pair_attention = self.pair_read(
-                labels, residues, pairs, mask, interactions=self.pair_interactions)
-            labels = labels + self.pair_scale.tanh() * pair_evidence
-        features = self.output_norm(labels)
-        weights = F.normalize(self.label_weights, dim=-1)
-        main_logits = (5 + 15 * self.logit_scale.sigmoid()) * (F.normalize(features, dim=-1) * weights).sum(-1)
-        main_logits = main_logits + self.label_bias
-
-        # Geometry is read only after the complete main prediction is formed.
         if self.geometry_context:
             for block in self.geometry_blocks:
                 geometry = block(geometry, structural, geometry_pairs, pair_quality, reliability)
-        geometry_nodes = geometry
+        residues = seq[:, :-1]
+        residues = residues + self.geometry_mix(torch.cat([residues, geometry], -1)) * geometry * reliability[..., None]
+        for block in self.pair_blocks:
+            residues, pairs, geometry_pairs = block(
+                residues, pairs, mask, geometry_pairs, pair_quality, structural, self.triangles)
+        motifs, motif_mask, motif_weights = self.pyramid(residues, mask)
+        # Preserve the sequence encoder's global chemical annotation token.
+        motifs = torch.cat([motifs, seq[:, -1:]], 1)
+        motif_mask = torch.cat([motif_mask, seq_mask[:, -1:]], 1)
+        # The global chemical token is a fifth resolution with one valid token.
+        motif_weights = torch.cat([motif_weights, seq_mask[:, -1:].float()], 1)
+        if not self.scale_balance:
+            motif_weights = motif_mask.float()
         structure_present = structural.any(1, keepdim=True)
         global_structure = self.structure_global(torch.cat([
             batch["struct_global"].masked_fill(~batch["struct_global_mask"], 0),
@@ -432,35 +413,25 @@ class HelixSet(nn.Module):
         geometry_mask = torch.cat([structural, structure_present], 1)
         global_reliability = (reliability * structural).sum(1, keepdim=True) / structural.sum(1, keepdim=True).clamp_min(1)
         reliability = torch.cat([reliability, global_reliability], 1)
-        geometry_evidence = self.structure_norm(self.structure_read(
-            labels, geometry, label_mask, geometry_mask, reliability))
-        geometry_evidence = geometry_evidence * structure_strength(reliability, geometry_mask)
-        geometry_pair_attention = None
-        if self.pair_readout:
-            pair_evidence, geometry_pair_attention = self.geometry_pair_read(
-                labels, geometry_nodes, geometry_pairs, structural, pair_quality, self.pair_interactions)
-            geometry_evidence = geometry_evidence + self.pair_scale.tanh() * pair_evidence
-        coverage = structural.sum(1) / mask.sum(1).clamp_min(1)
-        known_fraction = known.sum(1) / structural.sum(1).clamp_min(1)
-        confidence = batch["geometry"][..., 9].masked_fill(~known, 0).clamp(0, 1)
-        mean_confidence = confidence.sum(1) / known.sum(1).clamp_min(1)
-        if not self.geometry_quality:
-            known_fraction, mean_confidence = torch.zeros_like(coverage), torch.zeros_like(coverage)
-        quality = torch.stack([coverage, known_fraction, mean_confidence], -1)
-        quality = quality[:, None].expand(-1, labels.shape[1], -1)
-        gate = self.geometry_gate(torch.cat([features, geometry_evidence, quality], -1)).sigmoid().squeeze(-1)
-        gate = gate * structure_present
-        correction = (self.geometry_output(geometry_evidence) * weights).sum(-1)
-        geometry_delta = gate * 2 * (correction / 2).tanh()
-        relation_delta = torch.zeros_like(main_logits)
-        if self.label_context:
-            message = self.context_norm(self.context(labels, labels, label_mask, label_mask))
-            relation_delta = .5 * self.context_scale.tanh() * (message * weights).sum(-1).tanh()
-        output = {"logits": main_logits + geometry_delta + relation_delta, "direct": main_logits}
+        memories, masks = (motifs, prop, geometry), (motif_mask, prop_mask, geometry_mask)
+        latent = self.latents[None].expand(mask.shape[0], -1, -1)
+        latent_mask = torch.ones(latent.shape[:2], dtype=torch.bool, device=mask.device)
+        for block in self.latent_blocks:
+            latent = block(latent, latent_mask, memories, masks, reliability, motif_weights)
+        labels = self.label_queries[None].expand(mask.shape[0], -1, -1)
+        label_mask = torch.ones(labels.shape[:2], dtype=torch.bool, device=mask.device)
+        intermediate = []
+        for block in self.decoder:
+            labels, pair_attention = block(
+                labels, label_mask, latent, latent_mask, memories, masks, reliability,
+                residues, pairs, mask, geometry_pairs, pair_quality, motif_weights,
+                self.label_context, self.pair_readout, self.fine_evidence, self.pair_interactions,
+            )
+            intermediate.append((self.output_norm(labels) * self.label_weights).sum(-1) + self.label_bias)
+        output = {"logits": intermediate[-1], "direct": self.latent_classifier(latent.mean(1)),
+                  "decoder_logits": intermediate[:-1]}
         if return_evidence:
-            output.update(pair_attention=pair_attention, geometry_pair_attention=geometry_pair_attention,
-                          role_weight=role_weight.squeeze(-1), geometry_gate=gate,
-                          geometry_delta=geometry_delta, relation_delta=relation_delta)
+            output["pair_attention"] = pair_attention
         return output
 
     def compute_loss(self, batch, settings, return_output=False):
@@ -471,7 +442,7 @@ class HelixSet(nn.Module):
             return observed_label_loss(logits, batch["y"], self.statistics, settings.get("unlabeled_weight", .3))
         terms = {"classification": classification(output["logits"]),
                  "direct": classification(output["direct"])}
-        # Keep the shared trainer's loss-component contract; no intermediate heads.
-        terms["branch"] = output["logits"].sum() * 0
-        total = terms["classification"] + settings.get("direct", .1) * terms["direct"]
+        terms["branch"] = (torch.stack([classification(x) for x in output["decoder_logits"]]).mean()
+                           if output["decoder_logits"] else output["logits"].sum() * 0)
+        total = terms["classification"] + settings.get("direct", .2) * terms["direct"] + settings.get("branch", .1) * terms["branch"]
         return (total, terms, output) if return_output else (total, terms)

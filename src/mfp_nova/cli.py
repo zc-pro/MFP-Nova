@@ -21,7 +21,7 @@ def main(argv=None):
         sub.add_argument("--track", choices=("major15", "fine39"))
         sub.add_argument("--device")
         sub.add_argument("--batch-size", type=int, help="Encoder batch for features; head batch for train")
-        sub.add_argument("--esm", choices=("35m", "650m"), help="Select frozen ESM size and default feature directory")
+        sub.add_argument("--esm", choices=("35m", "650m"), help="Select ESM size and matching feature directory")
         if command == "features":
             sub.add_argument("--splits", nargs="+", choices=("train", "val", "test"), default=["train", "val"])
             sub.add_argument("--resume-from", type=int, default=0,
@@ -39,7 +39,7 @@ def main(argv=None):
             sub.add_argument("--accumulation-steps", type=int)
             sub.add_argument("--lr-decay-epochs", type=int,
                              help="Research models: cosine reaches its floor at this epoch; independent of maximum epochs")
-            sub.add_argument("--latent-depth", type=int, help="HelixSet internal latent processing depth after one memory write")
+            sub.add_argument("--latent-depth", type=int, help="HelixSet latent fusion depth")
             sub.add_argument("--max-steps", type=int, help="Bounded diagnostic optimizer steps; no Test access")
             sub.add_argument("--reconstruction-decay", nargs=2, type=int, metavar=("START", "END"),
                              help="Research models: cosine-decay reconstruction weight after warmup")
@@ -116,8 +116,13 @@ def main(argv=None):
         config_path = args.config or f"configs/{model_name}.yaml"
         config = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
         if args.esm:
+            if config.get("model", {}).get("esm_tail") and args.esm != "650m":
+                raise ValueError("This HelixSet ESM-tail configuration uses ESM650M")
             config["encoder"]["name"] = "facebook/esm2_t12_35M_UR50D" if args.esm=="35m" else "facebook/esm2_t33_650M_UR50D"
             config["data"]["features"] = f"features/esm2_{args.esm}"
+            layer = config["encoder"].get("representation_layer")
+            if layer is not None:
+                config["data"]["features"] += f"_layer{layer}"
             if args.command == "features":
                 config["encoder"]["batch_size"] = 8 if args.esm=="650m" else 32
         for arg, key in ((args.data_root, "root"), (args.feature_root, "features"), (args.track, "track")):

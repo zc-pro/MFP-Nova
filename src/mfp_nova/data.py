@@ -49,6 +49,8 @@ class CachedPeptides(Dataset):
         root = Path(feature_root) / split
         self.meta = json.loads((root / "metadata.json").read_text(encoding="utf-8"))
         self.values = np.load(root / "residues.npy", mmap_mode="r")
+        self.special_tokens = (np.load(root / "special_tokens.npy", mmap_mode="r")
+                               if self.meta.get("special_tokens_cached") else None)
         self.offsets = np.load(root / "offsets.npy")
         rows = np.load(root / "row_ids.npy")
         ids = np.load(root / "ids.npy")
