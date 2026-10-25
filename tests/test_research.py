@@ -47,7 +47,8 @@ def sample_statistics(n):
 def test_complete_model_masks_gradients(name, labels):
     stats = sample_statistics(labels)
     model = make_model(name, {"input_dim": 12, "num_labels": labels, "vocab_size": 10,
-                             "statistics": stats, "dim": 32, "heads": 4, "dropout": 0})
+                             "statistics": stats, "dim": 32, "heads": 4, "dropout": 0,
+                             **({"evidence_readout": True} if name == "helixset" else {})})
     batch = synthetic_batch(labels)
     model.eval()
     with torch.no_grad():

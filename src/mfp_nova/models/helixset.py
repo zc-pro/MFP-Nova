@@ -11,8 +11,50 @@ from torch.nn import functional as F
 
 from ..research_layers import (
     Attention, FeedForward, PropertyEncoder, SequenceEncoder, TransformerBlock,
-    observed_label_loss, training_views,
+    observed_label_loss, training_views, unlabeled_weights,
 )
+
+
+def annotation_set_loss(logits, targets, statistics, unknown_weight=.3):
+    """Per-peptide soft Jaccard with weak unlabeled penalties, not true cardinality.
+
+    Labels remain annotation labels (including the generic antimicrobial label).
+    Empty observed sets supply no negative-only set supervision.
+    """
+    probabilities = logits.float().sigmoid()
+    targets = targets.float()
+    positives = targets.sum(-1)
+    intersection = (probabilities * targets).sum(-1)
+    weak = unlabeled_weights(targets, statistics, unknown_weight)
+    union = positives + (weak * probabilities * (1 - targets)).sum(-1)
+    valid = positives > 0
+    losses = (1 - intersection / union.clamp_min(1)) * valid
+    return losses.sum() / valid.sum().clamp_min(1)
+
+
+class EarlyEvidenceReadout(nn.Module):
+    """Class-conditioned reads before geometry/pair/latent processing."""
+
+    def __init__(self, num_labels, dim, heads, dropout):
+        super().__init__()
+        self.sequence_read = Attention(dim, heads, dropout)
+        self.property_read = Attention(dim, heads, dropout)
+        self.norms = nn.ModuleList([nn.LayerNorm(dim, elementwise_affine=False) for _ in range(2)])
+        self.modality_score = nn.Linear(2 * dim, 1)
+        self.modality_bias = nn.Parameter(torch.zeros(num_labels, 2))
+        self.process = FeedForward(dim, 2, dropout)
+
+    def forward(self, queries, label_mask, sequence, sequence_mask, properties, property_mask):
+        evidence = torch.stack([
+            self.norms[0](self.sequence_read(queries, sequence, label_mask, sequence_mask)),
+            self.norms[1](self.property_read(queries, properties, label_mask, property_mask)),
+        ], 2)
+        query = queries[:, :, None].expand_as(evidence)
+        scores = self.modality_score(torch.cat([evidence, query * evidence], -1)).squeeze(-1) + self.modality_bias
+        available = torch.stack([sequence_mask.any(1), property_mask.any(1)], -1)
+        weights = scores.masked_fill(~available[:, None], float("-inf")).softmax(-1)
+        states = self.process(queries + (evidence * weights[..., None]).sum(2), label_mask)
+        return states, weights
 
 
 class ResiduePairBlock(nn.Module):
@@ -282,7 +324,7 @@ class HelixSet(nn.Module):
                  pair_readout=True, fine_evidence=True, geometry_depth=4,
                  geometry_context=True, geometry_quality=True, distance_multiscale=True,
                  scale_balance=True, pair_interactions=True, structure_evidence=True,
-                 esm_tail=None):
+                 esm_tail=None, evidence_readout=False):
         super().__init__()
         self.statistics = statistics
         self.esm_tail = None
@@ -324,6 +366,15 @@ class HelixSet(nn.Module):
         self.latent_classifier = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, num_labels))
         with torch.no_grad():
             self.latent_classifier[-1].bias.copy_(torch.logit(prior))
+        # Optional so original full-model and ESM-tail checkpoints keep their schema.
+        if evidence_readout:
+            self.early_evidence = EarlyEvidenceReadout(num_labels, dim, heads, dropout)
+            self.depth_gate = nn.Sequential(nn.Linear(2 * dim + 6, dim // 4), nn.GELU(),
+                                            nn.Linear(dim // 4, 1))
+            self.depth_bias = nn.Parameter(torch.zeros(num_labels))
+            # Start both supervised paths equally, with no hand-coded length cutoff.
+            nn.init.zeros_(self.depth_gate[-1].weight)
+            nn.init.zeros_(self.depth_gate[-1].bias)
         if esm_tail is not None:
             from ..esm_tail import ESMTail
             # Keep the original head initialization/RNG stream when adding LoRA.
@@ -377,6 +428,13 @@ class HelixSet(nn.Module):
         seq, seq_mask = self.sequence(batch)
         prop, prop_mask = self.properties(batch)
         mask = batch["mask"]
+        labels = self.label_queries[None].expand(mask.shape[0], -1, -1)
+        label_mask = torch.ones(labels.shape[:2], dtype=torch.bool, device=mask.device)
+        if hasattr(self, "early_evidence"):
+            early, modality_weights = self.early_evidence(labels, label_mask, seq, seq_mask, prop, prop_mask)
+            early_logits = (self.output_norm(early) * self.label_weights).sum(-1) + self.label_bias
+            # Class-specific local evidence conditions the very first deep read.
+            labels = early
         structural = batch["struct_mask"] & mask
         geometry = (self.geometry(batch["geometry"].masked_fill(~structural[..., None], 0))
                     + self.dssp(batch["dssp"])) * structural[..., None]
@@ -418,8 +476,6 @@ class HelixSet(nn.Module):
         latent_mask = torch.ones(latent.shape[:2], dtype=torch.bool, device=mask.device)
         for block in self.latent_blocks:
             latent = block(latent, latent_mask, memories, masks, reliability, motif_weights)
-        labels = self.label_queries[None].expand(mask.shape[0], -1, -1)
-        label_mask = torch.ones(labels.shape[:2], dtype=torch.bool, device=mask.device)
         intermediate = []
         for block in self.decoder:
             labels, pair_attention = block(
@@ -430,8 +486,29 @@ class HelixSet(nn.Module):
             intermediate.append((self.output_norm(labels) * self.label_weights).sum(-1) + self.label_bias)
         output = {"logits": intermediate[-1], "direct": self.latent_classifier(latent.mean(1)),
                   "decoder_logits": intermediate[:-1]}
+        if hasattr(self, "early_evidence"):
+            length = mask.sum(1).clamp_min(1)
+            # All routing inputs are measured inputs, never labels or fitted thresholds.
+            known = batch["confidence_known"] & structural
+            if not self.geometry_quality:
+                known = torch.zeros_like(known)
+            context = torch.stack([
+                length.float().log1p() / math.log(75),
+                structural.sum(1) / length,
+                known.sum(1) / length,
+                batch["geometry"][..., 9].clamp(0, 1).masked_fill(~known, 0).sum(1) / known.sum(1).clamp_min(1),
+                batch["phys_mask"].float().mean(1),
+                (batch["d"] * mask).sum(1) / length,
+            ], -1)
+            context = context[:, None].expand(-1, labels.shape[1], -1).to(labels.dtype)
+            gate_input = torch.cat([self.output_norm(early), self.output_norm(labels), context], -1)
+            deep_weight = (self.depth_gate(gate_input).squeeze(-1) + self.depth_bias).sigmoid()
+            output["shallow_logits"], output["deep_logits"] = early_logits, intermediate[-1]
+            output["logits"] = early_logits + deep_weight * (intermediate[-1] - early_logits)
         if return_evidence:
             output["pair_attention"] = pair_attention
+            if hasattr(self, "early_evidence"):
+                output.update(deep_weight=deep_weight, early_modality_weights=modality_weights)
         return output
 
     def compute_loss(self, batch, settings, return_output=False):
@@ -445,4 +522,12 @@ class HelixSet(nn.Module):
         terms["branch"] = (torch.stack([classification(x) for x in output["decoder_logits"]]).mean()
                            if output["decoder_logits"] else output["logits"].sum() * 0)
         total = terms["classification"] + settings.get("direct", .2) * terms["direct"] + settings.get("branch", .1) * terms["branch"]
+        if "shallow_logits" in output:
+            # Independent supervision keeps either route trainable when fusion favors the other.
+            terms["evidence"] = .5 * (classification(output["shallow_logits"]) + classification(output["deep_logits"]))
+            total = total + settings.get("evidence", .1) * terms["evidence"]
+        if settings.get("annotation_set", 0):
+            terms["annotation_set"] = annotation_set_loss(
+                output["logits"], batch["y"], self.statistics, settings.get("unlabeled_weight", .3))
+            total = total + settings["annotation_set"] * terms["annotation_set"]
         return (total, terms, output) if return_output else (total, terms)

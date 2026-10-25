@@ -464,3 +464,25 @@ ESM650M前29层保持冻结；`FrozenEncoder`只执行这些层，不应用最�
 外部原始张量API在常规字段之外需要`esm_cls`、`esm_eos`，`esm`必须来自相同前缀层。纯序列预测入口自动提取对应前缀并补齐特殊token。GPU检查HelixSet时需显式传入layer29缓存目录，诊断探针增加LoRA B梯度；不在本机执行。已补充随机小型ESM的前缀/尾部数值等价、特殊token对齐、LoRA梯度、紧凑checkpoint恢复测试代码，尚未运行。缓存准备、两平台训练和打包命令集中于README。
 
 研究依据：[Fine-tuning protein language models boosts predictions across diverse tasks](https://www.nature.com/articles/s41467-024-51844-2)支持尝试任务适配，但不证明本多标签肽任务会改善；[ESM的官方实现](https://github.com/huggingface/transformers/blob/v4.44.2/src/transformers/models/esm/modeling_esm.py)用于核对分层、特殊token和最终LayerNorm处理。LoRA和冻结前缀缓存不是本项目首创。本轮未提取特征、未执行模型或训练，不保证70%指标，显存和速度待真实测量。
+
+
+### 9.8 完整主干上的早期类别取证与标注集合监督
+
+`756b707`真实RTX5070实验：29轮、200.3分钟、峰值9.44GiB；传统最佳epoch14 Acc63.43%/AT53.39%/Macro-AP56.75%/Micro-AP72.64%，AP最佳epoch11为57.16%。原版`bb3aca4`为63.87%/53.89%及最佳AP57.33%，每轮约262秒而LoRA约421秒。新版本没有全面改善；2–16aa共5084条Val样本净损失75条完全匹配，17–32aa增加33条。此分组来自反复使用的Val，只作为下一项设计依据，不宣称因果定位或独立泛化成绩。
+
+本次保留原版所有主干层数、三角/pair/几何路径和潜变量辅助监督，默认恢复冻结ESM最终层缓存。`evidence_readout=True`增加以下连接，不能与`0bf2435`删减主干后的局部/全局双查询方案等同：
+
+- **提前读取类别证据**：在序列编码器3层和理化编码器2层之后、几何注入和pair处理之前，类别查询分别交叉读取序列与理化tokens。两个模态分别归一化，按样本/类别在可用模态上softmax融合；理化缺失权重严格为0，序列始终可用。浅层已经经过序列编码，包含手性、修饰及全局化学token，未新增原始ESM分类头。
+- **浅层类别状态进入深层解码**：上述类别状态替代裸类别embedding作为第一个完整SetDecoderBlock的查询。原潜变量6层、几何4层、pair4层及解码3层全部保留。类别条件提早参与取证，仍允许后续关系推理。
+- **深浅联合预测**：两路共用输出LayerNorm、类别权重和偏置，分别产生`z_s,z_d`。`z=z_s+g*(z_d-z_s)`，`g`由两路类别状态及6项输入摘要产生，并带类别偏置；初始为0.5。摘要为log长度、结构覆盖、置信度已知比例/均值、理化覆盖和D残基比例；padding不参与统计，缺结构/未知置信度分别显式编码。没有基于Val长度结果设定硬阈值，没有跨类别softmax竞争。浅层logits在固定序列和理化输入时不受显式结构输入改变影响；深层仍可使用结构。gate可趋近端点，不声称永远保留固定比例的浅层预测。
+- **深浅分支独立监督**：增加`evidence=mean(ASL(z_s),ASL(z_d))`，最终融合另受主分类监督，使路由偏向一路时另一条仍有训练梯度。原潜变量direct与中间decoder监督保留。
+
+集合辅助损失对每个样本使用`1 - sum(p*y)/(sum(y)+sum(w*p*(1-y)))`，仅对至少有一个观测标签的样本取均值。`p=sigmoid(z)`，`w=0.3`；fine39出现某父类`__unknown`时，对同功能未标注具体亚类再乘0.25，与原ASL相同。基础负项权重抽为共享函数，原ASL数值公式未改变。该损失保留标签集合定义，包括泛抗微生物标签；它不是独立功能计数监督，也不是无偏PU风险估计，不把未标注项宣称为实验确认阴性，不更改评价时的Jaccard/AT/AF定义。
+
+默认`L=ASL(z)+0.2*direct+0.1*branch+0.1*evidence+0.05*annotation_set`；四项辅助监督共同沿用5轮warmup。Val loss仍只记录主ASL，选模仍由指定指标协议及Val拟合阈值决定。新增集合项不直接优化完全匹配率，也不保证所有传统指标同时上升。未加入伪标签、监督数量限制或新的类别阈值搜索。
+
+新增模块按d384/major15静态计算约185万参数，总量约7333万；实际以运行metadata为准。显存和性能尚未实测。默认`features/esm2_650m`、FP32、32×2、100轮原日程与EMA保持；LoRA实现仍可由配置启用，旧完整主干/LoRA checkpoint缺省`evidence_readout=False`以保持参数布局。GPU诊断增加早期序列/理化读出和深浅gate梯度探针。CLI新增`--num-workers`以避免两台机器修改共享模型配置，RTX默认0、V100命令4；训练与打包见README。
+
+类别交叉读取可参考[Query2Label](https://arxiv.org/abs/2107.10834)，集合指标代理优化可参考[Lovasz-Softmax](https://openaccess.thecvf.com/content_cvpr_2018/html/Berman_The_LovaSz-Softmax_Loss_CVPR_2018_paper.html)。这些基础思想已有文献；当前实现是弱未标注惩罚的soft-Jaccard，未实现Lovasz排序扩展，也不借用图像任务成绩。研究贡献需要由短肽取证、类别深浅融合与监督设计的实验效果支撑，不能仅靠重新命名宣称创新。
+
+本轮只进行了静态语法/差异检查。新增测试覆盖深浅路径梯度、缺模态/padding、浅层结构独立性、无标签推理、集合损失数值/梯度、fine39未知亚类和旧参数布局，尚未执行forward/backward或训练。

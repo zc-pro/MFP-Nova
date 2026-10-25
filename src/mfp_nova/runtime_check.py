@@ -98,6 +98,10 @@ def profile(config, source, dataset, device, batches, precisions, measured_steps
         probe_keys = list(PROBES[config["model_name"]])
         if getattr(model, "esm_tail", None) is not None:
             probe_keys.append("esm_tail.layers.0.attention.self.query.lora_B.weight")
+        if hasattr(model, "early_evidence"):
+            probe_keys.extend(["early_evidence.sequence_read.attention.in_proj_weight",
+                               "early_evidence.property_read.attention.in_proj_weight",
+                               "depth_gate.2.weight"])
         optimizer = make_optimizer(model, config["train"])
         scaler = torch.amp.GradScaler("cuda", enabled=precision=="fp16", init_scale=1024.)
         for size in batches:

@@ -136,7 +136,8 @@ def epoch_loss_settings(config, epoch):
     if 'branch_supervision' in settings:
         loss['branch_supervision'] = settings['branch_supervision']
     ramp = min(1, epoch/max(1, settings.get('aux_warmup_epochs', 5)))
-    for key in ('direct', 'branch', 'reconstruction', 'prototype', 'diversity', 'balance', 'factor'):
+    for key in ('direct', 'branch', 'reconstruction', 'prototype', 'diversity', 'balance', 'factor',
+                'evidence', 'annotation_set'):
         if key in loss:
             loss[key] *= ramp
     decay = settings.get('reconstruction_decay')

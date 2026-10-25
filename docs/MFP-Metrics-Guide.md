@@ -568,7 +568,9 @@ $$
 | TriRelay | classification + 加权 direct + branch + reconstruction |
 | GeoFactor | classification + 加权 direct + reconstruction + factor |
 | ProtoRoute | classification + 加权 direct + branch + prototype + diversity + balance + reconstruction |
-| HelixSet | classification + 0.2 × direct（潜变量辅助分类）+ 0.1 × branch（中间解码监督）；2026-10-25恢复原版主干，LoRA通过这些损失联合学习 |
+| HelixSet | classification + 0.2 × direct（潜变量）+ 0.1 × branch（中间解码）+ 0.1 × evidence（深浅两路ASL均值）+ 0.05 × annotation_set（弱未标注惩罚的逐样本soft-Jaccard） |
+
+HelixSet的`annotation_set`为`1-sum(p*y)/(sum(y)+sum(w*p*(1-y)))`，未标注权重`w=0.3`，fine39未知亚类的具体同功能标签再降权；无观测标签的样本不提供集合监督。此项针对已标注标签集合，不是真实功能数量或独立功能数量监督，不改变传统五指标定义。
 
 `reconstruction` 监督遮蔽特征恢复；`factor` 约束关系因子幅度；`prototype` 促进正例与原型匹配；`diversity` 减少原型过度相似；`balance` 约束可用专家的使用分布。这些数值尺度和目标不同，不能直接按大小判断模块重要性。
 

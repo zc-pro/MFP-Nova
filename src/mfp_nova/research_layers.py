@@ -379,6 +379,20 @@ def reconstruction_loss(output, original, hidden):
     return total
 
 
+def unlabeled_weights(targets, statistics, unknown_weight=.3):
+    """Shared missing-label semantics for pointwise and annotation-set losses."""
+    weak_weight = torch.full_like(targets, unknown_weight)
+    labels = statistics["labels"]
+    if any(label.endswith("__unknown") for label in labels):
+        from .multimodal import function_projection
+        projection = torch.tensor(function_projection(labels, "fine39"), device=targets.device)
+        unknown = torch.tensor([label.endswith("__unknown") for label in labels], device=targets.device)
+        unknown_parent = (targets*unknown)@projection
+        ambiguous = (unknown_parent@projection.T)>0
+        weak_weight = torch.where(ambiguous & ~unknown, weak_weight*.25, weak_weight)
+    return weak_weight
+
+
 def observed_label_loss(logits, targets, statistics, unknown_weight=.3, mask=None):
     """ASL with explicitly weak unlabeled terms; no confirmed-negative claim."""
     logits = logits.float()
@@ -386,15 +400,7 @@ def observed_label_loss(logits, targets, statistics, unknown_weight=.3, mask=Non
     p = logits.sigmoid()
     negative = (1-p+.03).clamp(max=1)
     pos = -F.logsigmoid(logits)*targets*positive_weight
-    weak_weight = torch.full_like(targets, unknown_weight)
-    labels = statistics["labels"]
-    if any(label.endswith("__unknown") for label in labels):
-        from .multimodal import function_projection
-        projection = torch.tensor(function_projection(labels, "fine39"), device=logits.device)
-        unknown = torch.tensor([label.endswith("__unknown") for label in labels], device=logits.device)
-        unknown_parent = (targets*unknown)@projection
-        ambiguous = (unknown_parent@projection.T)>0
-        weak_weight = torch.where(ambiguous & ~unknown, weak_weight*.25, weak_weight)
+    weak_weight = unlabeled_weights(targets, statistics, unknown_weight)
     neg = -negative.clamp_min(1e-8).log()*(1-negative).square().detach()*(1-targets)*weak_weight
     values = pos+neg
     return (values*mask).sum()/mask.sum().clamp_min(1) if mask is not None else values.mean()

@@ -37,6 +37,7 @@ def main(argv=None):
             sub.add_argument("--limit-samples", type=int, help="Diagnostic subset, not a performance experiment")
             sub.add_argument("--precision", choices=("fp32", "fp16", "bf16"))
             sub.add_argument("--accumulation-steps", type=int)
+            sub.add_argument("--num-workers", type=int, help="DataLoader worker processes; 0 loads in the main process")
             sub.add_argument("--lr-decay-epochs", type=int,
                              help="Research models: cosine reaches its floor at this epoch; independent of maximum epochs")
             sub.add_argument("--latent-depth", type=int, help="HelixSet latent fusion depth")
@@ -197,7 +198,7 @@ def main(argv=None):
                 if args.reconstruction_decay is not None or args.reconstruction_floor is not None:
                     raise ValueError("Reconstruction scheduling is a research-model option")
                 from .trainer import train
-            for key in ("seed", "epochs"):
+            for key in ("seed", "epochs", "num_workers"):
                 value = getattr(args, key)
                 if value is not None:
                     config["train"][key] = value
