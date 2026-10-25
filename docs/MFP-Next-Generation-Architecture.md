@@ -1,6 +1,6 @@
 # MFP 下一代模型架构设想书
 
-2026-10-25 更新：当前实现为恢复原版主干、加入ESM末四层LoRA的HelixSet，见第9.7节。第1–8节及第9.6节保留历史设计和实验背景；其中早期“尚未训练”的叙述按当时版本解释。
+2026-10-25 更新：当前实现为通用ESM650M＋短肽ESM150M双冻结表征、完整主干的HelixSet，见第9.10节；尚未运行新方案。第1–8节及第9.6–9.9节保留历史设计、实验与调研背景；早期状态叙述按当时版本解释。
 
 > 三条完整路线已在现有项目实现，具体接口、实际容量和评价协议见第 8 节。设计机制的性能与创新收益仍待正式训练及消融验证；前文预算是设计时的估计，不能代替实际参数测量。
 
@@ -481,8 +481,40 @@ ESM650M前29层保持冻结；`FrozenEncoder`只执行这些层，不应用最�
 
 默认`L=ASL(z)+0.2*direct+0.1*branch+0.1*evidence+0.05*annotation_set`；四项辅助监督共同沿用5轮warmup。Val loss仍只记录主ASL，选模仍由指定指标协议及Val拟合阈值决定。新增集合项不直接优化完全匹配率，也不保证所有传统指标同时上升。未加入伪标签、监督数量限制或新的类别阈值搜索。
 
-新增模块按d384/major15静态计算约185万参数，总量约7333万；实际以运行metadata为准。显存和性能尚未实测。默认`features/esm2_650m`、FP32、32×2、100轮原日程与EMA保持；LoRA实现仍可由配置启用，旧完整主干/LoRA checkpoint缺省`evidence_readout=False`以保持参数布局。GPU诊断增加早期序列/理化读出和深浅gate梯度探针。CLI新增`--num-workers`以避免两台机器修改共享模型配置，RTX默认0、V100命令4；训练与打包见README。
+新增模块按d384/major15静态计算约185万参数，总量约7333万；`a97957d`真实RTX5070运行确认73,330,637可训练参数、峰值allocated 7.81GiB，结果见9.9。默认`features/esm2_650m`、FP32、32×2、100轮原日程与EMA保持；LoRA实现仍可由配置启用，旧完整主干/LoRA checkpoint缺省`evidence_readout=False`以保持参数布局。GPU诊断增加早期序列/理化读出和深浅gate梯度探针。CLI新增`--num-workers`以避免两台机器修改共享模型配置，RTX默认0、V100命令4；训练与打包见README。
 
 类别交叉读取可参考[Query2Label](https://arxiv.org/abs/2107.10834)，集合指标代理优化可参考[Lovasz-Softmax](https://openaccess.thecvf.com/content_cvpr_2018/html/Berman_The_LovaSz-Softmax_Loss_CVPR_2018_paper.html)。这些基础思想已有文献；当前实现是弱未标注惩罚的soft-Jaccard，未实现Lovasz排序扩展，也不借用图像任务成绩。研究贡献需要由短肽取证、类别深浅融合与监督设计的实验效果支撑，不能仅靠重新命名宣称创新。
 
 本轮只进行了静态语法/差异检查。新增测试覆盖深浅路径梯度、缺模态/padding、浅层结构独立性、无标签推理、集合损失数值/梯度、fine39未知亚类和旧参数布局，尚未执行forward/backward或训练。
+
+### 9.9 实验复盘与外部方法取舍（2026-10-25，研究方案尚未实现）
+
+用户提供的`a97957d`验收包：38轮、174.7分钟，传统最优epoch23，Val Acc63.77%、Prec68.02%、Cov70.74%、AT53.01%、AF5.99%，该轮Macro-AP55.71%；AP最优epoch10为56.75%。原版`bb3aca4`传统最优Acc63.87%、AT53.89%，AP最优57.33%。这些是验证集选模结果，不是独立Test性能，也不是多Seed显著性结论。
+
+epoch10→38，Train Macro-AP81.10%→98.39%，Val Macro-AP56.75%→53.63%，Val主ASL 0.05805→0.15304，首要问题是泛化恶化。最新传统最佳轮的概率中85.74%落在<0.01或>0.99，原版为28.94%；已标注阳性中p<0.1的数量2401对812。集合项虽系数仅0.05，epoch10约占加权训练总损失27.2%；损失占比不等于梯度贡献，尚不能把退步单独归因于它。当前`labels=early`改变了深层解码查询，并非保持原深层函数不变的并行旁路；两分支还共享输出权重，验收包未保存各分支概率和gate，不能判断哪一路单独更强。
+
+| 方法与原始来源 | 对当前项目的判断 |
+| --- | --- |
+| [PepBenchmark / ESM-150M-F](https://arxiv.org/abs/2604.10531)，[公开权重](https://huggingface.co/jiahuizhang/esm-150m-peptide-fine-tune) | 优先研究的新增表征。在约193万条短肽上继续预训练；有提升也有退步，论文任务/训练协议不同，不能把其ROC-AUC当作本项目Acc收益。模型配置确认ESM、30层、640维；现有650M为1280维。保留650M，考虑两份冻结逐残基表征分别归一化后拼接投影到384，共用现有主干；相较原输入投影约增加24.6万权重，避免复制整套网络。新增缓存按原row_id和残基对齐，不混用权重revision。冻结特征迁移收益仍待实测。 |
+| [R-Drop](https://arxiv.org/abs/2106.14448) | 第二优先级：同一样本两次dropout前向，使用逐标签Bernoulli双向KL约束一致性，不能用15类softmax KL。增加训练计算与激活显存；EMA参数平均不能替代它。下一轮不与新表征及多个新损失同时堆叠。 |
+| [AMCL](https://doi.org/10.1186/s12915-025-02273-0)、[MulSupCon](https://ojs.aaai.org/index.php/AAAI/article/view/29619) | 支持研究多标签对比学习，但0=未标注时，标签无交集不证明生物学功能相斥。需要类别条件表征和缺失标签处理，不直接套单标签SupCon；32×累积2也不自动形成64个样本的对比池。 |
+| [TPpred-PepPA](https://doi.org/10.1186/s12915-026-02642-3) | 借鉴共享表征与类别决策分阶段训练。当前AP早峰与集合指标较晚峰提示可研究保留较早表征、后续只训练读出头；这是本项目待验证改造，不是该论文逐项复现，也不是直接把epoch10和23拼成一组成绩。 |
+| [ESM C](https://www.evolutionaryscale.ai/blog/esm-cambrian)、[PeptideCLM-2](https://github.com/AaronFeller/PeptideCLM-2) | ESM C可作为下一表征候选，但需独立适配提取API/依赖；不为试新编码器升级V100既有环境。化学语言模型适合可信SMILES/修饰实体；当前末端注释存在大量冲突，不能凭标准序列臆造完整化学结构后全量应用。 |
+
+下一项集中方案：以原完整HelixSet的查询与ASL辅助监督为参照，引入短肽专用冻结表征的轻量融合；不继续增加latent/decoder深度，不默认沿用未获益的早期查询替换与soft-Jaccard集合项。保留结构/理化/D残基输入与既定major15划分，先判断新信息能否改善排序与集合预测，再决定是否需要R-Drop或分阶段读出训练。该组合的单次比较只能支持整体方案效果，不能宣称某模块的独立因果贡献。
+
+实现边界：当前CLI的`--esm 650m`会覆盖自定义编码器名称与缓存目录；新权重必须使用自己的name/revision，不能沿用facebook 650M的revision。公开模型配置记录Transformers 4.53.2，当前项目加载兼容性尚未运行验证。单编码器缓存可由metadata驱动input_dim；双编码器融合仍需修改数据加载、模型输入及纯序列预测入口，当前代码尚未支持。新方案不使用Val/Test训练、补标签或建立对比样本池；选择仍沿用既定Val协议，Test留作最终独立评价。
+
+本次只读取本地实现、已有结果与网上论文/公开配置，更新此技术说明；未下载模型权重、未提取特征、未运行模型/测试/训练，未修改训练默认值。
+
+### 9.10 双冻结序列表征实现（2026-10-25）
+
+用户确认推进后，将9.9的集中方案写入现有HelixSet及训练流程：保留原完整主干层数，默认`evidence_readout=False`，因此深层查询重新来自原类别embedding；`evidence=0`、`annotation_set=0`，保留主ASL、direct0.2和branch0.1。原早期取证及LoRA实现保留，旧checkpoint按保存的model_args恢复；没有删除旧文件、数据、缓存或权重。
+
+配置新增`peptide_encoder`及`data.peptide_features`。短肽模型为`jiahuizhang/esm-150m-peptide-fine-tune`，固定revision `6d8cebf74c53b1032b6f5917e75e3253cb70f575`，640维；原650M名称/revision与1280维缓存保持。公开配置已读取确认，未下载权重或运行加载。两视图每个残基分别经过无参数LayerNorm，拼接后由1920→384线性层投影；后续AA/手性/修饰输入、理化与几何路径不变。没有新分类旁路或额外主干。预计相较原模型增加245,760个权重，总可训练参数71,723,550，以真实metadata为准。
+
+`features --encoder-view primary|peptide`提取各自缓存，沿用逐残基FP16存储及FP32提取；短肽view禁止同时传入`--esm`以免覆盖编码器。两份缓存均独立按源row_id映射并检查ID/骨架，允许物理存储顺序不同；选取相同源行后再组合，长度必须一致。训练/Val/独立评价检查两套编码器定义，checkpoint记录嵌套的`encoder.peptide_encoder`及`model_args.peptide_input_dim`。训练读取两份缓存，不驻留两套预训练模型；恢复旧单编码器checkpoint时移除新配置的短肽项。
+
+`predict`纯序列入口加载checkpoint指定的两套冻结编码器，分别提取并按缓存精度量化后送入同一模型，缺结构/理化仍明确为缺失。外部原始/预处理NPZ须增加`esm_peptide[B,L,640]`，不在调用方先归一化。`evaluate --peptide-feature-root`支持缓存迁移；多Seed汇总区分短肽编码器身份，GPU profile分别记录输入投影两视图的梯度与参数更新。RTX前台及V100后台的缓存准备、训练、打包命令集中在README。
+
+仅新增相关正确性测试代码：双视图梯度和padding、无标签推理、缓存乱序映射与错配拒绝、分视图特征提取、双视图checkpoint/评价/恢复训练与纯序列推理。遵从用户要求未执行测试、forward/backward或训练；本机仅作静态语法及差异检查。未加入R-Drop、补标签、对比学习或新阈值策略，性能和实际加载兼容性待实测。

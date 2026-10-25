@@ -116,6 +116,8 @@ def compatibility_issues(metadata, result, directory, identity=None):
         config = metadata["config"]
         if metadata["encoder"]["name"]!="facebook/esm2_t33_650M_UR50D":
             issues.append("encoder is not ESM-650M")
+        if config.get("peptide_encoder") != expected.get("peptide_encoder"):
+            issues.append("peptide encoder configuration differs from the fixed protocol")
         for key in ("model", "loss"):
             if config[key]!=expected[key]:
                 issues.append(f"{key} configuration differs from the fixed protocol")

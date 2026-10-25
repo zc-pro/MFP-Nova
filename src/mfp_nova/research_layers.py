@@ -77,9 +77,13 @@ class LocalGlobalBlock(nn.Module):
 
 
 class SequenceEncoder(nn.Module):
-    def __init__(self, input_dim, vocab_size, dim, heads, dropout, depth=4, separable=False):
+    def __init__(self, input_dim, vocab_size, dim, heads, dropout, depth=4, separable=False,
+                 peptide_input_dim=0):
         super().__init__()
-        self.plm = nn.Linear(input_dim, dim)
+        self.plm = nn.Linear(input_dim + peptide_input_dim, dim)
+        if peptide_input_dim:
+            self.plm_norm = nn.LayerNorm(input_dim, elementwise_affine=False)
+            self.peptide_norm = nn.LayerNorm(peptide_input_dim, elementwise_affine=False)
         self.aa = nn.Embedding(21, dim, padding_idx=0)
         self.d = nn.Embedding(2, dim)
         self.chem = nn.Embedding(vocab_size, dim, padding_idx=0)
@@ -92,7 +96,10 @@ class SequenceEncoder(nn.Module):
         mask = batch["mask"]
         chemical = self.chem(batch["residue_chem"])
         annotated = self.aa(batch["aa"])+self.d(batch["d"])+chemical
-        plm = self.plm(batch["esm"])
+        features = batch["esm"]
+        if hasattr(self, "peptide_norm"):
+            features = torch.cat([self.plm_norm(features), self.peptide_norm(batch["esm_peptide"])], -1)
+        plm = self.plm(features)
         x = plm+torch.sigmoid(self.input_gate(torch.cat([plm, annotated], -1)))*annotated
         x = (x+self.position(torch.arange(x.shape[1], device=x.device)))*mask[..., None]
         shallow = x

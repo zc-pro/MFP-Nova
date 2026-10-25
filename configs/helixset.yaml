@@ -3,10 +3,16 @@ data:
   root: data/therapeutic_2025
   track: major15
   features: features/esm2_650m
+  peptide_features: features/esm2_peptide_150m
   augment: false
 encoder:
   name: facebook/esm2_t33_650M_UR50D
   revision: 08e4846e537177426273712802403f7ba8261b6c
+  max_length: 80
+  batch_size: 8
+peptide_encoder:
+  name: jiahuizhang/esm-150m-peptide-fine-tune
+  revision: 6d8cebf74c53b1032b6f5917e75e3253cb70f575
   max_length: 80
   batch_size: 8
 model:
@@ -21,7 +27,7 @@ model:
   latent_count: 32
   latent_depth: 6
   decoder_depth: 3
-  evidence_readout: true
+  evidence_readout: false
   triangles: true
   label_context: true
   pair_readout: true
@@ -37,8 +43,8 @@ loss:
   direct: 0.2
   branch: 0.1
   modality_dropout: 0.1
-  evidence: 0.1
-  annotation_set: 0.05
+  evidence: 0.0
+  annotation_set: 0.0
 train:
   device: cpu
   seed: 42

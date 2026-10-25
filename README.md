@@ -2,7 +2,7 @@
 
 独立的治疗肽多标签预测科研项目。当前专注 **`data/therapeutic_2025/`**，任务为 `major15` 和 `fine39`；同类论文的数据集仅作后续补充基准准备。
 
-项目统一维护四个研究模型：**TriRelay、GeoFactor、ProtoRoute、HelixSet**。前三模型已完成两任务各五 Seed 的首轮训练及独立 Test；HelixSet 原版、decay30、精简版及ESM尾部LoRA均已完成major15/seed42 Train/Val。2026-10-25当前推进完整主干上的早期类别取证、深浅融合与标注集合辅助监督；本轮仅静态检查，尚未执行模型测试或训练。
+项目统一维护四个研究模型：**TriRelay、GeoFactor、ProtoRoute、HelixSet**。前三模型已完成两任务各五 Seed 的首轮训练及独立 Test；HelixSet 原版、decay30、精简版、ESM尾部LoRA及早期取证方案均已完成major15/seed42 Train/Val。2026-10-25当前实现 **通用ESM650M＋短肽ESM150M双冻结表征、完整HelixSet主干**；本轮仅静态检查，尚未执行模型测试、特征提取或训练。
 
 ## 四模型入口
 
@@ -11,7 +11,7 @@
 | TriRelay | [models/trirelay.py](src/mfp_nova/models/trirelay.py) | [trirelay.yaml](configs/trirelay.yaml) | 多模态交互、标签反馈、共享/私有证据 |
 | GeoFactor | [models/geofactor.py](src/mfp_nova/models/geofactor.py) | [geofactor.yaml](configs/geofactor.yaml) | 异构图与高阶因子推断 |
 | ProtoRoute | [models/protoroute.py](src/mfp_nova/models/protoroute.py) | [protoroute.yaml](configs/protoroute.yaml) | 标签条件专家路由与多原型 |
-| HelixSet | [models/helixset.py](src/mfp_nova/models/helixset.py) | [helixset.yaml](configs/helixset.yaml) | 完整残基对/潜变量/集合解码，早期类别取证与深浅融合 |
+| HelixSet | [models/helixset.py](src/mfp_nova/models/helixset.py) | [helixset.yaml](configs/helixset.yaml) | 双冻结序列表征、理化/结构证据与完整残基对/潜变量/集合解码 |
 
 四个模型共用 `research.py` 的训练、恢复、评价和推理流程，使用同一套数据加载与基础神经网络层。`sequence` 仍是独立的轻量对照基线。
 
@@ -22,7 +22,7 @@
 
 四模型都支持 `--metric-suite traditional5|task_specific`。HelixSet 当前默认传统五指标，前三模型保留原 AP 选模协议；批量计划会记录模式。跨模型正式比较时须明确统一的选模和阈值协议，不能将不同模式混成同一组结果。
 
-原三模型的历史五 Seed 批量设置仍为 FP32、batch64、无累积；HelixSet 当前为 FP32、batch32 × 累积2、EMA0.999。RTX5070实测原版约7.73GiB/262秒每轮，ESM尾部LoRA约9.44GiB/421秒每轮；当前新增取证方案的显存和性能待实测，不能直接沿用历史峰值。
+原三模型的历史五 Seed 批量设置仍为 FP32、batch64、无累积；HelixSet 当前为 FP32、batch32 × 累积2、EMA0.999。RTX5070实测原版约7.73GiB/262秒每轮，早期取证版约7.81GiB/276秒每轮；双表征方案的显存和性能待实测，不能直接沿用历史峰值。
 
 ## 项目结构
 
@@ -79,21 +79,23 @@ runs/                         # 训练输出、权重和分析，不提交 Git
 
 `bb3aca4`原版在第17轮达到Val Acc63.87%、AT53.89%；`021734d` decay30为63.26%、52.60%。`0bf2435`精简版第76轮为63.45%、52.85%，最佳Macro-AP56.52%（第13轮）也低于原版57.33%（第12轮）；它没有解决过拟合，不作为性能主线。它的代码和权重仍在Git历史及原运行目录保留，评价需使用`0bf2435`版本。
 
-## HelixSet：完整主干、早期类别取证与集合监督
+## HelixSet：短肽专用表征与通用表征融合
 
 `756b707` ESM尾部LoRA真实实验完成29轮，传统最佳epoch14：Acc63.43%、AT53.39%、Macro-AP56.75%、Micro-AP72.64%；原版`bb3aca4`为63.87%、53.89%、56.90%、71.59%。最佳Macro-AP57.16%也未超过原版57.33%。LoRA每轮慢约61%，本次不继续扩大适配容量。2–16aa验证样本合计损失75条完全匹配，17–32aa增加33条，推动以下针对证据传递的整体改动；这些分组为探索证据，不能替代独立Test确认。
 
-当前保留sequence3/property2/geometry4/pair4/latent6/decoder3、d384和32个latent。在几何/pair融合前，各类别分别读取序列编码器输出（包括修饰、手性和化学token）与理化tokens，按样本和类别融合。这份早期证据初始化深层解码，并通过共享类别打分器形成独立浅层logits。最终`logits = shallow + sigmoid(gate) * (deep - shallow)`；gate读取两路类别状态、长度、结构覆盖/置信度、理化覆盖和D残基比例，初始深浅各0.5。浅层分支不依赖显式结构输入，没有原始ESM直接分类头，也不硬编码短肽的路由方向。
+`a97957d`早期取证方案完成38轮、174.7分钟，传统最佳epoch23：Acc63.77%、AT53.01%，最佳Macro-AP56.75%（epoch10），未超过原版。保留该实现以加载旧checkpoint，当前默认关闭`evidence_readout`，恢复原类别查询；`evidence`及`annotation_set`损失权重归零。
 
-损失保留ASL主项、0.2×潜变量辅助分类、0.1×中间解码监督，增加0.1×深浅两路ASL均值及0.05×逐样本标注集合soft-Jaccard，辅助项沿用5轮warmup。集合项对未标注预测使用0.3弱惩罚，fine39未知亚类沿用额外降权；它优化已观测标签集合，不是实际生物学功能数监督，不强行限定预测标签数，也不改变传统指标定义。
+当前保留sequence3/property2/geometry4/pair4/latent6/decoder3、d384和32个latent。新增[短肽ESM-150M-F](https://huggingface.co/jiahuizhang/esm-150m-peptide-fine-tune)冻结最终层表征：每个残基的650M/150M输出分别做无参数LayerNorm，拼接1280+640维后投影到384，再进入同一套序列、理化、结构及集合解码主干。没有额外ESM直接分类头，也没有复制主干。相较原完整模型增加245,760个投影权重，预计71,723,550个可训练参数，以实际metadata为准。
 
-**下一轮从头训练，复用旧最终层缓存`features/esm2_650m`，不使用layer29缓存。** 默认冻结ESM，已有最终层Train/Val缓存时不需再加载或下载预训练权重。LoRA代码和旧checkpoint加载支持保留，旧LoRA实验恢复时仍按checkpoint保存配置使用layer29与预训练权重。精简版checkpoint仍须在`0bf2435`使用。
+**下一轮从头训练。** 复用`features/esm2_650m`最终层Train/Val缓存，并新增`features/esm2_peptide_150m`；不使用layer29缓存。新编码器使用自己的固定revision，首次提取需下载约150M模型权重，但正式训练只读取两份缓存。两份缓存独立核对row_id、ID和骨架序列；双视图metadata及维度写入checkpoint。旧完整模型/LoRA/早期取证checkpoint仍按保存参数加载，精简版仍须在`0bf2435`使用。
 
-保持major15/seed42、FP32、batch32×累积2、LR2e-4、5轮warmup/100轮cosine、EMA0.999第6轮起、traditional5/global，耐心15轮。`--metric-suite task_specific`仍可切换；`best.pt`为主协议候选，`best_ap.pt`为传统模式下的AP候选，不混用两个checkpoint的指标。结果自动导出NPZ、逐类诊断和分组统计。当前预期参数约7333万，实际以运行metadata为准；测试代码已补充但尚未执行，不承诺指标提升。
+保持major15/seed42、FP32、batch32×累积2、LR2e-4、5轮warmup/100轮cosine、EMA0.999第6轮起、traditional5/global，耐心15轮。损失为ASL主项＋0.2×潜变量辅助分类＋0.1×中间解码监督，未标注权重0.3；`--metric-suite task_specific`仍可切换。`best.pt`与`best_ap.pt`分别保存传统与AP候选，不混用其指标。暂不加入R-Drop、伪标签或新的对比损失。测试代码已补充但未执行，公开权重与现有Transformers构建的实际加载兼容性、显存和收益待用户设备验证；不主动升级两机环境。
+
+`features --encoder-view primary|peptide`分别提取两份缓存；`--encoder-view peptide`不要同时传`--esm`。训练默认读取配置中的两份缓存，`--feature-root`和`--peptide-feature-root`可改路径。纯序列`predict`按checkpoint加载两套编码器，不要求输入结构文件；外部NPZ接口须额外提供`esm_peptide[B,L,640]`，归一化由模型完成。独立Test需要时再分别提取Test缓存，训练命令不访问Test。
 
 ### RTX 5070：PowerShell，前台训练与打包
 
-在当前目录无运行中的训练时同步。提示符应为`PS`，Anaconda Prompt/CMD中先进入`powershell -NoLogo -NoProfile`。以下复用已完成的最终层缓存。
+在当前目录无运行中的训练时同步。提示符应为`PS`，Anaconda Prompt/CMD中先进入`powershell -NoLogo -NoProfile`。以下跳过已完成的缓存，先提取缺少的Train/Val表征再前台训练。若提取中断，同一view/split按日志使用`--resume-from`续提；不要删除原缓存或把不完整目录视为完成。
 
 ```powershell
 Set-Location 'D:\Data\ChatGPT\mfp\MFP-Nova'
@@ -107,13 +109,22 @@ $env:PYTHONPATH = Join-Path $PWD.Path 'src'
 $env:CUDA_VISIBLE_DEVICES = '0'
 $env:OMP_NUM_THREADS = '4'
 $env:MKL_NUM_THREADS = '4'
+foreach ($View in @('primary', 'peptide')) {
+  $FeatureRoot = if ($View -eq 'primary') { 'features/esm2_650m' } else { 'features/esm2_peptide_150m' }
+  foreach ($Split in @('train', 'val')) {
+    if (Test-Path -LiteralPath "$FeatureRoot/$Split/metadata.json") { continue }
+    & $mfpPython -u -m mfp_nova.cli features --config configs/helixset.yaml `
+      --encoder-view $View --splits $Split --device cuda:0 --batch-size 8
+    if ($LASTEXITCODE -ne 0) { throw "特征提取失败：$View/$Split，请查看错误；中断缓存按实际行数续提。" }
+  }
+}
 $Revision = git rev-parse --short HEAD
-$RunName = "helixset_major15_seed42_rtx5070_${Revision}_earlyset_b32_a2_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+$RunName = "helixset_major15_seed42_rtx5070_${Revision}_dualpep_b32_a2_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
 New-Item -ItemType Directory -Path 'runs' -Force | Out-Null
 $LogPath = Join-Path 'runs' "${RunName}.log"
 Write-Host "本次实验：$RunName"
 & $mfpPython -u -m mfp_nova.cli train --model helixset --config configs/helixset.yaml `
-  --task major15 --esm 650m --seed 42 --device cuda:0 --precision fp32 `
+  --task major15 --seed 42 --device cuda:0 --precision fp32 `
   --batch-size 32 --accumulation-steps 2 --num-workers 0 --ema-decay 0.999 --ema-start-epoch 6 `
   --metric-suite traditional5 --threshold-strategy global --epochs 100 --name $RunName `
   2>&1 | Tee-Object -FilePath $LogPath
@@ -129,12 +140,13 @@ Compress-Archive -LiteralPath $PackFiles -DestinationPath $ZipPath
 Write-Host "验收包：$ZipPath"
 ```
 
-若要先测显存，在上述环境设置后自行执行（该命令会运行模型与短训练）：
+若要先测显存，在上述环境设置及两份缓存提取完成后、正式训练启动前自行执行（该命令会运行模型与短训练）：
 
 ```powershell
-$GpuCheckDir = Join-Path 'runs' "gpucheck_helixset_earlyset_b32_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+$GpuCheckDir = Join-Path 'runs' "gpucheck_helixset_dualpep_b32_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
 & $mfpPython -u -m mfp_nova.cli gpu-check --models helixset --tasks major15 --esm 650m `
   --feature-root features/esm2_650m --device cuda:0 --batch-sizes 32 --precisions fp32 `
+  --peptide-feature-root features/esm2_peptide_150m `
   --samples 128 --steps 16 --output $GpuCheckDir `
   2>&1 | Tee-Object -FilePath "${GpuCheckDir}.log"
 ```
@@ -158,18 +170,31 @@ gpu=0
 threads=16
 export CUDA_VISIBLE_DEVICES="$gpu" OMP_NUM_THREADS="$threads" MKL_NUM_THREADS="$threads"
 revision="$(git rev-parse --short HEAD)"
-run_name="helixset_major15_seed42_v100_${revision}_earlyset_b32_a2_$(date +%Y%m%d_%H%M%S)"
+run_name="helixset_major15_seed42_v100_${revision}_dualpep_b32_a2_$(date +%Y%m%d_%H%M%S)"
 mkdir -p runs
-nohup "$mfpPython" -u -m mfp_nova.cli train --model helixset --config configs/helixset.yaml \
-  --task major15 --esm 650m --seed 42 --device cuda:0 --precision fp32 \
+nohup bash -c '
+set -e
+mfpPython="$1"
+run_name="$2"
+for view in primary peptide; do
+  if [ "$view" = primary ]; then feature_root=features/esm2_650m; else feature_root=features/esm2_peptide_150m; fi
+  for split in train val; do
+    if [ -f "$feature_root/$split/metadata.json" ]; then continue; fi
+    "$mfpPython" -u -m mfp_nova.cli features --config configs/helixset.yaml \
+      --encoder-view "$view" --splits "$split" --device cuda:0 --batch-size 8
+  done
+done
+exec "$mfpPython" -u -m mfp_nova.cli train --model helixset --config configs/helixset.yaml \
+  --task major15 --seed 42 --device cuda:0 --precision fp32 \
   --batch-size 32 --accumulation-steps 2 --num-workers 4 --ema-decay 0.999 --ema-start-epoch 6 \
-  --metric-suite traditional5 --threshold-strategy global --epochs 100 --name "$run_name" \
+  --metric-suite traditional5 --threshold-strategy global --epochs 100 --name "$run_name"
+' -- "$mfpPython" "$run_name" \
   > "runs/${run_name}.log" 2>&1 < /dev/null &
 echo "PID=$! Run=$run_name"
 tail -n 40 -f "runs/${run_name}.log"
 ```
 
-正常进入epoch后可关闭SSH；`Ctrl+C`仅结束日志查看。训练完成后打包；重新登录时先进入项目和Conda环境，把`run_name`恢复为启动时打印的完整名称。
+缓存提取与训练都在后台，确认日志正常后可关闭SSH；`Ctrl+C`仅结束日志查看。提取失败会停止，不会继续启动训练。训练完成后打包；重新登录时先进入项目和Conda环境，把`run_name`恢复为启动时打印的完整名称。
 
 ```bash
 python - "$run_name" <<'PY'
@@ -237,4 +262,4 @@ PYTHONPATH=src python -m mfp_nova.threshold_study --predictions /path/results.zi
 
 以上为同一Val的簇交叉拟合探索结果。新约束是在查看上一项研究结果后提出，不能称为全新盲验证；拟合集满足约束不代表留出集满足。epoch17仍损害多功能表现；epoch12虽改善多项指标，真实多功能恢复仍减少4条。因此不默认采用、不继续在该Val上叠加约束调优，也不凭本轮分析改选checkpoint。
 
-`decay30`已于2026-10-24完成：29轮、传统最佳14轮，Acc63.26%、AT52.60%、AF5.91%、MFP-F1 53.50%；相对原日程Acc63.87%、AT53.89%、AF5.79%、MFP-F1 54.38%退步。最佳Macro-AP为57.51%，原日程57.33%，小幅上涨主要由37个Val阳性的溶栓类别带动，其他14类平均AP由60.36%降至60.18%。相同epoch29的Train AP99.83%/Val AP52.16%/Val Loss0.11806，对照98.34%/54.80%/0.07361，未缓解过拟合。单seed不推出所有短日程均无效，但当前不采用decay30。随后精简版也未改善性能；随后ESM尾部适配也未超越原版传统指标；当前转为完整主干上的早期类别取证与集合监督，保持有效batch64，具体配置以上文为准。跨设备结果分开报告，主要对照沿用RTX5070。
+`decay30`已于2026-10-24完成：29轮、传统最佳14轮，Acc63.26%、AT52.60%、AF5.91%、MFP-F1 53.50%；相对原日程Acc63.87%、AT53.89%、AF5.79%、MFP-F1 54.38%退步。最佳Macro-AP为57.51%，原日程57.33%，小幅上涨主要由37个Val阳性的溶栓类别带动，其他14类平均AP由60.36%降至60.18%。相同epoch29的Train AP99.83%/Val AP52.16%/Val Loss0.11806，对照98.34%/54.80%/0.07361，未缓解过拟合。单seed不推出所有短日程均无效，但当前不采用decay30。随后精简版也未改善性能；随后ESM尾部适配也未超越原版传统指标；早期取证随后也未改善整体表现，当前转为完整主干上的双冻结序列表征，保持有效batch64，具体配置以上文为准。跨设备结果分开报告，主要对照沿用RTX5070。

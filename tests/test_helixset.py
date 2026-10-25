@@ -14,6 +14,35 @@ def fixture():
     return model, batch
 
 
+def test_dual_encoder_gradients_padding_and_unlabelled_inference():
+    batch = synthetic_batch()
+    batch['esm'] = batch['esm'].requires_grad_()
+    batch['esm_peptide'] = torch.randn(*batch['esm'].shape[:2], 6, requires_grad=True)
+    model = HelixSet(12, 15, 10, sample_statistics(15), dim=32, heads=4, dropout=0,
+                    sequence_depth=1, property_depth=1, geometry_depth=1, pair_depth=1,
+                    latent_depth=1, decoder_depth=2, pair_dim=8, peptide_input_dim=6)
+    assert not hasattr(model, 'early_evidence')
+    loss, terms = model.compute_loss(batch, {'modality_dropout': 0, 'direct': .2, 'branch': .1})
+    loss.backward()
+    assert 'annotation_set' not in terms and 'evidence' not in terms
+    for key in ('esm', 'esm_peptide'):
+        assert torch.isfinite(batch[key].grad).all()
+        assert batch[key].grad[batch['mask']].abs().sum() > 0
+    gradient = model.sequence.plm.weight.grad
+    assert gradient[:, :12].abs().sum() > 0 and gradient[:, 12:].abs().sum() > 0
+    model.eval()
+    changed = {k: v.detach().clone() for k, v in batch.items() if k != 'y'}
+    for key in ('esm', 'esm_peptide'):
+        changed[key].masked_fill_(~batch['mask'][..., None], 1000)
+    with torch.no_grad():
+        torch.testing.assert_close(model(batch)['logits'], model(changed)['logits'], rtol=1e-4, atol=1e-5)
+        restored = HelixSet(12, 15, 10, sample_statistics(15), dim=32, heads=4, dropout=0,
+                           sequence_depth=1, property_depth=1, geometry_depth=1, pair_depth=1,
+                           latent_depth=1, decoder_depth=2, pair_dim=8, peptide_input_dim=6).eval()
+        restored.load_state_dict(model.state_dict())
+        torch.testing.assert_close(model(batch)['logits'], restored(batch)['logits'])
+
+
 def change_geometry(batch):
     changed = {key: value.clone() for key, value in batch.items()}
     changed['geometry'] = torch.randn_like(batch['geometry'])

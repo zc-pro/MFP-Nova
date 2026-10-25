@@ -156,7 +156,29 @@ def multimodal_fixture(tmp_path):
     return root, features
 
 
-@pytest.mark.parametrize("name", ["trirelay", "geofactor", "protoroute"])
+def peptide_cache_fixture(features):
+    """Different width and reversed physical row order exercise actual row alignment."""
+    import json
+    peptide = features.parent / "peptide_features"
+    for split in ("train", "val"):
+        source, target = features/split, peptide/split
+        target.mkdir(parents=True)
+        offsets = np.load(source/"offsets.npy")
+        values = np.load(source/"residues.npy")[:, :6]
+        rows = np.load(source/"row_ids.npy")
+        order = np.arange(len(rows))[::-1]
+        lengths = np.diff(offsets)[order]
+        for key in ("row_ids", "ids", "sequences"):
+            np.save(target/f"{key}.npy", np.load(source/f"{key}.npy")[order])
+        np.save(target/"offsets.npy", np.r_[0, np.cumsum(lengths)])
+        np.save(target/"residues.npy", np.concatenate([values[offsets[i]:offsets[i+1]] for i in order]))
+        meta = json.loads((source/"metadata.json").read_text())
+        meta.update(name="peptide_fixture", input_dim=6)
+        (target/"metadata.json").write_text(json.dumps(meta))
+    return peptide
+
+
+@pytest.mark.parametrize("name", ["trirelay", "geofactor", "protoroute", "helixset"])
 def test_research_training_resume_inference(tmp_path, name, monkeypatch):
     import json
     from mfp_nova import research
@@ -169,14 +191,24 @@ def test_research_training_resume_inference(tmp_path, name, monkeypatch):
               "loss": {"mask_ratio": .5, "modality_dropout": .2},
               "train": {"device": "cpu", "seed": 42, "epochs": 1, "batch_size": 2, "learning_rate": .001,
                         "weight_decay": 0, "patience": 0, "warmup_epochs": 0, "num_workers": 0, "output": str(tmp_path)}}
+    if name == "helixset":
+        config["data"]["peptide_features"] = str(peptide_cache_fixture(features))
+        config["peptide_encoder"] = {"name": "peptide_fixture", "revision": "main", "max_length": 80}
+        config["model"].update(sequence_depth=1, property_depth=1, geometry_depth=1,
+                               pair_depth=1, pair_dim=8, latent_depth=1, decoder_depth=1)
     result = research.train(config, "first")
     assert result["epochs_completed"] == 1
     checkpoint = tmp_path/"first/best.pt"
     report = research.evaluate(checkpoint, root, features, "val", "cpu", tmp_path/"eval.json", batch_size=2)
     assert "groups" in report and "mfp_detection" in report["metrics"]
     source = MultimodalData(root, "major15", torch.load(checkpoint, weights_only=True)["statistics"])
-    data = MultimodalPeptides(source, features, "val")
+    data = MultimodalPeptides(source, features, "val", peptide_feature_root=config["data"].get("peptide_features"))
     batch = collate_multimodal([data[0], data[1]])
+    if name == "helixset":
+        torch.testing.assert_close(batch["esm_peptide"], batch["esm"][..., :6])
+        saved = torch.load(checkpoint, weights_only=True)
+        assert saved["model_args"]["peptide_input_dim"] == 6
+        assert saved["encoder"]["peptide_encoder"]["name"] == "peptide_fixture"
     np.savez(tmp_path/"inputs.npz", **{k: v.numpy() for k, v in batch.items() if k != "y"})
     prediction = research.predict_inputs(checkpoint, tmp_path/"inputs.npz")
     assert len(prediction)==2
@@ -190,6 +222,8 @@ def test_research_training_resume_inference(tmp_path, name, monkeypatch):
            "angles_degrees": np.stack([source.struct[k][indices] for k in ("phi_degrees", "psi_degrees", "omega_degrees")], -1),
            "chemical_tokens": np.array([source.chemical[i] for i in indices]), "residue_chem_tokens": np.array([source.residue_chemical[i] for i in indices])}
     from mfp_nova.multimodal import prepare_inputs
+    if name == "helixset":
+        raw["esm_peptide"] = batch["esm_peptide"].numpy()
     prepared = prepare_inputs(raw, source.statistics)
     # Fixture edges intentionally only contain backbone edges; compare numeric preprocessing.
     for key in ("phys", "geometry", "quality", "residue_chem", "struct_global"):
@@ -198,11 +232,11 @@ def test_research_training_resume_inference(tmp_path, name, monkeypatch):
     assert len(research.predict_inputs(checkpoint, tmp_path/"raw_inputs.npz"))==2
     class Encoder:
         def __init__(self, *args):
-            pass
+            self.channels = 6 if args[0] == "peptide_fixture" else 12
         def encode(self, sequences):
             length = max(map(len, sequences))
             mask = torch.arange(length)[None]<torch.tensor([len(s) for s in sequences])[:, None]
-            return torch.ones(len(sequences), length, 12), mask
+            return torch.ones(len(sequences), length, self.channels), mask
     monkeypatch.setattr("mfp_nova.encoder.FrozenEncoder", Encoder)
     live = research.predict_sequences(checkpoint, ["AC", "AcD"])
     assert len(live)==2 and live[1]["sequence"]=="AcD"

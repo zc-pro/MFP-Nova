@@ -250,13 +250,19 @@ class MultimodalData:
 
 
 class MultimodalPeptides(Dataset):
-    def __init__(self, source, feature_root, split, limit=None):
+    def __init__(self, source, feature_root, split, limit=None, peptide_feature_root=None):
         self.source = source
         self.cache = CachedPeptides(source.data, feature_root, split)
         self.indices = diagnostic_indices(source, self.cache.indices, limit, split=="train") if limit else self.cache.indices
         lookup = {int(i): j for j, i in enumerate(self.cache.indices)}
         self.cache_indices = [lookup[int(i)] for i in self.indices]
-        self.meta = self.cache.meta
+        self.meta = dict(self.cache.meta)
+        self.peptide_cache = None
+        if peptide_feature_root is not None:
+            # Each cache independently maps row_id to the same source rows and verifies
+            # IDs/backbones; its physical storage order may differ from the other cache.
+            self.peptide_cache = CachedPeptides(source.data, peptide_feature_root, split)
+            self.meta["peptide_encoder"] = self.peptide_cache.meta
 
     def __len__(self):
         return len(self.indices)
@@ -265,6 +271,11 @@ class MultimodalPeptides(Dataset):
         esm, _ = self.cache[self.cache_indices[index]]
         i = int(self.indices[index])
         sample = self.source.sample(i, esm)
+        if self.peptide_cache is not None:
+            peptide, _ = self.peptide_cache[self.cache_indices[index]]
+            if peptide.shape[0] != esm.shape[0]:
+                raise ValueError("Primary and peptide cache residue lengths differ")
+            sample["esm_peptide"] = peptide
         if self.cache.special_tokens is not None:
             position = self.cache.positions[self.cache_indices[index]]
             special = torch.from_numpy(np.array(self.cache.special_tokens[position], dtype=np.float32))
@@ -307,7 +318,7 @@ def collate_multimodal(samples):
     for key in samples[0]:
         if key == "edge_type":
             result[key] = torch.stack([torch.nn.functional.pad(s[key], (0, length-len(s["aa"]), 0, length-len(s["aa"]))) for s in samples])
-        elif key in ("esm", "aa", "d", "residue_chem", "mask", "coords", "geometry", "struct_mask", "dssp", "confidence_known", "chemical"):
+        elif key in ("esm", "esm_peptide", "aa", "d", "residue_chem", "mask", "coords", "geometry", "struct_mask", "dssp", "confidence_known", "chemical"):
             padding = 9 if key == "dssp" else 0
             result[key] = torch.nn.utils.rnn.pad_sequence([s[key] for s in samples], batch_first=True, padding_value=padding)
         else:
@@ -376,7 +387,7 @@ def prepare_inputs(raw, statistics):
               "edge_type": edge_type, "confidence_known": known, "phys": phys, "phys_mask": phys_mask,
               "chemical": chemical, "residue_chem": residue_chemical, "quality": quality,
               "struct_global": global_values, "struct_global_mask": global_observed}
-    for key in ("esm_cls", "esm_eos"):
+    for key in ("esm_cls", "esm_eos", "esm_peptide"):
         if key in raw:
             arrays[key] = raw[key].astype(np.float32)
     return {key: torch.from_numpy(value) for key, value in arrays.items()}

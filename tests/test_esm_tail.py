@@ -10,7 +10,63 @@ from mfp_nova.encoder import FrozenEncoder, prepare_features
 from mfp_nova.esm_tail import ESMTail
 from mfp_nova.multimodal import MultimodalData, MultimodalPeptides, collate_multimodal
 from mfp_nova.research import checkpoint_state, restore_model_state, validate_cache
-from test_research import multimodal_fixture
+from test_research import multimodal_fixture, peptide_cache_fixture
+
+
+def test_dual_cache_identity_and_alignment(tmp_path):
+    import json
+    import numpy as np
+    root, features = multimodal_fixture(tmp_path)
+    peptide = peptide_cache_fixture(features)
+    source = MultimodalData(root, 'major15')
+    data = MultimodalPeptides(source, features, 'train', limit=3, peptide_feature_root=peptide)
+    config = {'model_name': 'helixset', 'model': {},
+              'encoder': {'name': 'fixture', 'revision': 'main', 'max_length': 80},
+              'peptide_encoder': {'name': 'peptide_fixture', 'revision': 'main', 'max_length': 80}}
+    validate_cache(data, config)
+    for sample in data:
+        torch.testing.assert_close(sample['esm_peptide'], sample['esm'][:, :6])
+    reference = json.loads(json.dumps(data.meta))
+    reference['peptide_encoder']['resolved_revision'] = 'another_model'
+    with pytest.raises(ValueError, match='Peptide feature definitions differ'):
+        validate_cache(data, config, reference)
+    sequences = np.load(peptide/'train/sequences.npy')
+    sequences[0] = 'AAAA'
+    np.save(peptide/'train/sequences.npy', sequences)
+    with pytest.raises(ValueError, match='Cached backbones differ'):
+        MultimodalPeptides(source, features, 'train', peptide_feature_root=peptide)
+
+
+def test_peptide_feature_extraction_uses_its_own_config(tmp_path, monkeypatch):
+    import json
+    root, original = multimodal_fixture(tmp_path)
+    local_esm(monkeypatch)
+    peptide = tmp_path/'new_peptide_features'
+    config = {'data': {'root': str(root), 'track': 'major15', 'augment': False,
+                       'features': str(original), 'peptide_features': str(peptide)},
+              'encoder': {'name': 'unused_primary'},
+              'peptide_encoder': {'name': 'fixture', 'revision': 'main', 'max_length': 80, 'batch_size': 2}}
+    prepare_features(config, ['train', 'val'], 'cpu', encoder_view='peptide')
+    assert json.loads((peptide/'train/metadata.json').read_text())['input_dim'] == 32
+    assert json.loads((original/'train/metadata.json').read_text())['input_dim'] == 12
+    assert not (peptide/'test').exists()
+
+
+def test_peptide_cli_routes_batch_and_directory(monkeypatch, tmp_path):
+    from mfp_nova.cli import main
+    captured = {}
+    def prepare(config, splits, device, **options):
+        captured.update(config=config, splits=splits, device=device, options=options)
+    monkeypatch.setattr('mfp_nova.encoder.prepare_features', prepare)
+    main(['features', '--config', 'configs/helixset.yaml', '--encoder-view', 'peptide',
+          '--feature-root', str(tmp_path/'cache'), '--batch-size', '3', '--splits', 'val', '--device', 'cpu'])
+    assert captured['config']['peptide_encoder']['batch_size'] == 3
+    assert captured['config']['encoder']['batch_size'] == 8
+    assert captured['config']['data']['peptide_features'] == str(tmp_path/'cache')
+    assert captured['options']['encoder_view'] == 'peptide'
+    assert captured['splits'] == ['val']
+    with pytest.raises(ValueError, match='omit --esm'):
+        main(['features', '--config', 'configs/helixset.yaml', '--encoder-view', 'peptide', '--esm', '650m'])
 
 
 def local_esm(monkeypatch):

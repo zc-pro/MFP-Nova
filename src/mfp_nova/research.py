@@ -127,6 +127,28 @@ def validate_cache(dataset, config, reference=None):
     if reference is not None and any(meta[key] != reference[key] for key in (
             "resolved_revision", "input_dim", "dataset", "extraction_dtype", "storage_dtype")):
         raise ValueError("Split feature definitions differ")
+    peptide = meta.get("peptide_encoder")
+    settings = config.get("peptide_encoder")
+    if (peptide is None) != (settings is None):
+        raise ValueError("Peptide encoder configuration and cache must be supplied together")
+    if peptide is not None:
+        if config["model_name"] != "helixset":
+            raise ValueError("Dual frozen encoders are supported by HelixSet")
+        if peptide["name"] != settings["name"] or peptide["max_length"] != settings["max_length"]:
+            raise ValueError("Configured peptide encoder differs from cache")
+        if settings["revision"] not in (peptide["requested_revision"], peptide["resolved_revision"]):
+            raise ValueError("Configured peptide encoder revision differs from cache")
+        if peptide.get("representation_layer") is not None:
+            raise ValueError("Peptide view requires final-layer features")
+        if peptide["dataset"] != meta["dataset"]:
+            raise ValueError("Primary and peptide caches use different datasets")
+    if reference is not None:
+        other = reference.get("peptide_encoder")
+        if (peptide is None) != (other is None):
+            raise ValueError("Checkpoint/splits differ in peptide encoder use")
+        if peptide is not None and any(peptide[key] != other[key] for key in (
+                "name", "resolved_revision", "input_dim", "max_length", "dataset", "extraction_dtype", "storage_dtype")):
+            raise ValueError("Peptide feature definitions differ across splits/checkpoint")
 
 
 def epoch_loss_settings(config, epoch):
@@ -233,6 +255,12 @@ def train(config, name, resume=None):
             raise ValueError("Resume model/task differs from checkpoint")
         for key in ("model", "loss", "encoder"):
             config[key] = original[key]
+        if "peptide_encoder" in original:
+            config["peptide_encoder"] = original["peptide_encoder"]
+            config["data"].setdefault("peptide_features", original["data"]["peptide_features"])
+        else:
+            config.pop("peptide_encoder", None)
+            config["data"].pop("peptide_features", None)
         for key, value in original["train"].items():
             if key not in ("device", "output", "epochs", "num_workers", "max_steps"):
                 settings[key] = value
@@ -290,8 +318,9 @@ def train(config, name, resume=None):
     diagnostic = bool(limit or settings.get("max_steps") or (checkpoint and checkpoint["config"]["train"].get("max_steps")))
     # Diagnostic optimization subsets retain full original-Train priors/statistics:
     # shrinking the subset must not erase empirical factors or prototype capacity.
-    datasets = [MultimodalPeptides(source, config["data"]["features"], split, limit) for split in ("train", "val")]
-    validate_cache(datasets[0], config)
+    datasets = [MultimodalPeptides(source, config["data"]["features"], split, limit,
+                                   config["data"].get("peptide_features")) for split in ("train", "val")]
+    validate_cache(datasets[0], config, checkpoint["encoder"] if checkpoint else None)
     validate_cache(datasets[1], config, datasets[0].meta)
     if datasets[0].meta["dataset"] != source.statistics["dataset"]:
         raise ValueError("Cache dataset version differs from multimodal data")
@@ -302,6 +331,8 @@ def train(config, name, resume=None):
     args = {"input_dim": datasets[0].meta["input_dim"], "num_labels": len(source.data.labels),
             "vocab_size": len(source.statistics["chemical_vocab"])+2,
             "statistics": source.statistics["labels"], **config["model"]}
+    if "peptide_encoder" in datasets[0].meta:
+        args["peptide_input_dim"] = datasets[0].meta["peptide_encoder"]["input_dim"]
     if function_aux:
         args["function_aux_statistics"] = source.statistics["function_auxiliary"]
     model = make_model(config["model_name"], args).to(device)
@@ -717,14 +748,15 @@ def load_model(path, device="cpu"):
 
 
 def evaluate(checkpoint_path, data_root, feature_root, split, device, output, predictions=None, batch_size=32, decision_path=None,
-             without_private_evidence=False):
+             without_private_evidence=False, peptide_feature_root=None):
     model, checkpoint = load_model(checkpoint_path, device)
     if without_private_evidence:
         if checkpoint["model_name"] != "trirelay" or not hasattr(model, "evidence_partition"):
             raise ValueError("Private evidence ablation requires a shared-private TriRelay checkpoint")
         model.private_evidence_enabled = False
     source = MultimodalData(data_root, checkpoint["track"], checkpoint["statistics"])
-    dataset = MultimodalPeptides(source, feature_root, split)
+    dataset = MultimodalPeptides(source, feature_root, split,
+                                  peptide_feature_root=peptide_feature_root or checkpoint["config"]["data"].get("peptide_features"))
     validate_cache(dataset, checkpoint["config"], checkpoint["encoder"])
     loader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_multimodal)
     y, probabilities = predict_loader(model, loader, device)
@@ -817,6 +849,9 @@ def predict_sequences(checkpoint_path, sequences, device="cpu", decision_path=No
     info = checkpoint["encoder"]
     prefix = info.get("representation_layer")
     encoder = FrozenEncoder(info["name"], info["resolved_revision"], info["max_length"], device, prefix)
+    peptide = info.get("peptide_encoder")
+    peptide_encoder = (FrozenEncoder(peptide["name"], peptide["resolved_revision"], peptide["max_length"], device)
+                       if peptide is not None else None)
     alphabet = "ACDEFGHIKLMNPQRSTVWY"
     output = []
     size = checkpoint["config"]["encoder"].get("batch_size", 8 if info["input_dim"]==1280 else 32)
@@ -836,6 +871,10 @@ def predict_sequences(checkpoint_path, sequences, device="cpu", decision_path=No
         raw = {"esm": esm, "aa": aa, "d": stereo, "mask": valid,
                "phys_raw": np.full((len(selected), 515), np.nan),
                "residue_chem_tokens": np.array([[c if j<len(s) else "" for j, c in enumerate(s.ljust(length))] for s in selected])}
+        if peptide_encoder is not None:
+            peptide_states, peptide_mask = peptide_encoder.encode(selected)
+            peptide_residues = [peptide_states[i, peptide_mask[i]].half().float().cpu() for i in range(len(selected))]
+            raw["esm_peptide"] = torch.nn.utils.rnn.pad_sequence(peptide_residues, batch_first=True).numpy()
         if prefix is not None:
             raw["esm_cls"] = states[:, 0].half().float().cpu().numpy()
             raw["esm_eos"] = torch.stack([states[i, len(s) + 1] for i, s in enumerate(selected)]).half().float().cpu().numpy()
@@ -866,6 +905,9 @@ def summarize_results(runs, split="val"):
                     "dataset": metadata["dataset"], "cohort": metadata["cohort"], "model_settings": config["model"],
                     "loss": config["loss"], "labels": metadata["labels"], "threshold_strategy": result["threshold_strategy"],
                     "training": {k: v for k, v in config["train"].items() if k not in ("seed", "device", "output", "num_workers")}}
+        if "peptide_encoder" in metadata["encoder"]:
+            protocol["peptide_encoder"] = {key: metadata["encoder"]["peptide_encoder"][key]
+                                            for key in ("name", "resolved_revision")}
         buckets[json.dumps(protocol, sort_keys=True)].append({"run": str(directory), "seed": metadata["seed"], "metrics": score,
             "trainable_parameters": result["trainable_parameters"], "elapsed_seconds": result["elapsed_seconds"],
             "peak_cuda_memory_bytes": result["peak_cuda_memory_bytes"]})

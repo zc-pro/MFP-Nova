@@ -52,8 +52,9 @@ class FrozenEncoder:
         return states, mask
 
 
-def prepare_features(config, splits, device, resume_from=0):
-    settings = config["encoder"]
+def prepare_features(config, splits, device, resume_from=0, encoder_view="primary"):
+    settings = config["peptide_encoder" if encoder_view == "peptide" else "encoder"]
+    feature_root = config["data"]["peptide_features" if encoder_view == "peptide" else "features"]
     prefix = settings.get("representation_layer")
     encoder = FrozenEncoder(settings["name"], settings["revision"], settings["max_length"], device, prefix)
     data = PeptideData(config["data"]["root"], config["data"]["track"])
@@ -66,7 +67,7 @@ def prepare_features(config, splits, device, resume_from=0):
         start_row = resume_from if split == splits[0] else 0
         if not 0 <= start_row <= len(indices):
             raise ValueError("resume_from must be a completed row count within the first split")
-        root = Path(config["data"]["features"]) / split
+        root = Path(feature_root) / split
         lengths = np.array([len(s) for s in data.sequences[indices]])
         offsets = np.concatenate(([0], np.cumsum(lengths)))
         shape = (int(offsets[-1]), encoder.metadata["input_dim"])

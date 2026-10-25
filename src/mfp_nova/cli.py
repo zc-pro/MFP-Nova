@@ -18,11 +18,14 @@ def main(argv=None):
         sub.add_argument("--config")
         sub.add_argument("--data-root")
         sub.add_argument("--feature-root")
+        sub.add_argument("--peptide-feature-root", help="Short-peptide cache directory for dual-encoder HelixSet")
         sub.add_argument("--track", choices=("major15", "fine39"))
         sub.add_argument("--device")
         sub.add_argument("--batch-size", type=int, help="Encoder batch for features; head batch for train")
         sub.add_argument("--esm", choices=("35m", "650m"), help="Select ESM size and matching feature directory")
         if command == "features":
+            sub.add_argument("--encoder-view", choices=("primary", "peptide"), default="primary",
+                             help="Extract primary ESM or the configured short-peptide encoder")
             sub.add_argument("--splits", nargs="+", choices=("train", "val", "test"), default=["train", "val"])
             sub.add_argument("--resume-from", type=int, default=0,
                              help="Completed rows in the first split, from the interrupted extraction log")
@@ -71,6 +74,7 @@ def main(argv=None):
     evaluate.add_argument("--checkpoint", required=True)
     evaluate.add_argument("--data-root", default="data/therapeutic_2025")
     evaluate.add_argument("--feature-root")
+    evaluate.add_argument("--peptide-feature-root")
     evaluate.add_argument("--split", choices=("val", "test"), default="test")
     evaluate.add_argument("--device", default="cpu")
     evaluate.add_argument("--output", required=True)
@@ -96,6 +100,7 @@ def main(argv=None):
     gpu_check.add_argument("--tasks", nargs="+", choices=("major15", "fine39"), default=["major15", "fine39"])
     gpu_check.add_argument("--esm", choices=("35m", "650m"), default="650m")
     gpu_check.add_argument("--feature-root")
+    gpu_check.add_argument("--peptide-feature-root")
     gpu_check.add_argument("--data-root", default="data/therapeutic_2025")
     gpu_check.add_argument("--device", default="cuda:0")
     gpu_check.add_argument("--batch-sizes", nargs="+", type=int, default=[2, 4, 8, 16])
@@ -116,6 +121,9 @@ def main(argv=None):
         model_name = args.model if args.command == "train" else "sequence"
         config_path = args.config or f"configs/{model_name}.yaml"
         config = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
+        peptide_view = args.command == "features" and args.encoder_view == "peptide"
+        if peptide_view and args.esm:
+            raise ValueError("--encoder-view peptide uses peptide_encoder; omit --esm")
         if args.esm:
             if config.get("model", {}).get("esm_tail") and args.esm != "650m":
                 raise ValueError("This HelixSet ESM-tail configuration uses ESM650M")
@@ -126,17 +134,21 @@ def main(argv=None):
                 config["data"]["features"] += f"_layer{layer}"
             if args.command == "features":
                 config["encoder"]["batch_size"] = 8 if args.esm=="650m" else 32
-        for arg, key in ((args.data_root, "root"), (args.feature_root, "features"), (args.track, "track")):
+        feature_key = "peptide_features" if peptide_view else "features"
+        for arg, key in ((args.data_root, "root"), (args.feature_root, feature_key), (args.track, "track")):
             if arg is not None:
                 config["data"][key] = arg
+        if args.peptide_feature_root is not None:
+            config["data"]["peptide_features"] = args.peptide_feature_root
         if args.device is not None:
             config["train"]["device"] = args.device
         if args.batch_size is not None:
-            section = "encoder" if args.command == "features" else "train"
+            section = ("peptide_encoder" if peptide_view else "encoder") if args.command == "features" else "train"
             config[section]["batch_size"] = args.batch_size
         if args.command == "features":
             from .encoder import prepare_features
-            prepare_features(config, args.splits, config["train"]["device"], resume_from=args.resume_from)
+            prepare_features(config, args.splits, config["train"]["device"], resume_from=args.resume_from,
+                             encoder_view=args.encoder_view)
         else:
             if args.branch_supervision is not None and args.model != "trirelay":
                 raise ValueError("Branch supervision is a TriRelay training option")
@@ -227,6 +239,10 @@ def main(argv=None):
         feature_root = args.feature_root or checkpoint["config"]["data"]["features"]
         batch_size = args.batch_size or checkpoint["config"]["train"].get("batch_size", 128)
         extra = {}
+        if args.peptide_feature_root:
+            if "model_name" not in checkpoint:
+                raise ValueError("Peptide cache requires a research model checkpoint")
+            extra['peptide_feature_root'] = args.peptide_feature_root
         if args.without_private_evidence:
             extra['without_private_evidence'] = True
         if args.decision:
@@ -244,7 +260,8 @@ def main(argv=None):
             if not args.output:
                 parser.error("gpu-check requires --output for real measurements")
             run(args.models, args.tasks, feature_root, args.device, args.output, args.esm,
-                args.batch_sizes, args.precisions, args.steps, args.samples, args.data_root)
+                args.batch_sizes, args.precisions, args.steps, args.samples, args.data_root,
+                peptide_feature_root=args.peptide_feature_root)
     elif args.command == "summarize":
         from .research import summarize_results
         result = summarize_results(args.runs, args.split)

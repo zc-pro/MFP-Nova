@@ -64,6 +64,8 @@ def check_inputs(model, samples, device, precision):
         original = model(batch)
         corrupted = dict(batch)
         corrupted["esm"] = batch["esm"].masked_fill(~batch["mask"][..., None], 100)
+        if "esm_peptide" in batch:
+            corrupted["esm_peptide"] = batch["esm_peptide"].masked_fill(~batch["mask"][..., None], 100)
         corrupted["geometry"] = batch["geometry"].masked_fill(~batch["struct_mask"][..., None], 100)
         corrupted["coords"] = batch["coords"].masked_fill(~batch["struct_mask"][..., None], 100)
         padded = model(corrupted)
@@ -89,6 +91,8 @@ def profile(config, source, dataset, device, batches, precisions, measured_steps
     seed_everything(config["train"]["seed"])
     arguments = {"input_dim": dataset.meta["input_dim"], "num_labels": len(source.data.labels),
                  "vocab_size": len(source.statistics["chemical_vocab"])+2, "statistics": source.statistics["labels"], **config["model"]}
+    if "peptide_encoder" in dataset.meta:
+        arguments["peptide_input_dim"] = dataset.meta["peptide_encoder"]["input_dim"]
     samples = [dataset[i] for i in range(len(dataset))]
     records = []
     for precision in precisions:
@@ -140,6 +144,15 @@ def profile(config, source, dataset, device, batches, precisions, measured_steps
                     if step==1:
                         for key in before:
                             module_updates[key]["updated"] = bool((before[key]!=parameters[key]).any())
+                        if "peptide_encoder" in dataset.meta:
+                            key = "sequence.plm.weight"
+                            boundary = dataset.meta["input_dim"]
+                            for view, columns in (("primary", slice(None, boundary)), ("peptide", slice(boundary, None))):
+                                gradient = parameters[key].grad[:, columns]
+                                module_updates[f"{key}:{view}"] = {
+                                    "gradient_finite": bool(torch.isfinite(gradient).all()),
+                                    "gradient_abs_sum": float(gradient.float().abs().sum()),
+                                    "updated": bool((before[key][:, columns] != parameters[key][:, columns]).any())}
                     if step:
                         measurements.append({"loss": float(loss.detach()), "losses": {key: float(value.detach()) for key, value in terms.items()},
                                              "forward_ms": events[0].elapsed_time(events[1]), "backward_ms": events[1].elapsed_time(events[2]),
@@ -172,7 +185,7 @@ def profile(config, source, dataset, device, batches, precisions, measured_steps
 
 
 def run(models, tasks, feature_root, device, output, esm="650m", batches=(2, 4, 8, 16),
-        precisions=("fp32", "fp16"), steps=32, samples=128, data_root="data/therapeutic_2025"):
+        precisions=("fp32", "fp16"), steps=32, samples=128, data_root="data/therapeutic_2025", peptide_feature_root=None):
     environment = inspect(feature_root, device)
     print(json.dumps(environment, ensure_ascii=False, indent=2), flush=True)
     active = environment["gpu"]["other_compute_processes"]
@@ -193,9 +206,11 @@ def run(models, tasks, feature_root, device, output, esm="650m", batches=(2, 4, 
         for task in tasks:
             config = yaml.safe_load(Path(f"configs/{name}.yaml").read_text(encoding="utf-8"))
             config["data"].update(root=str(data_root), track=task, features=str(feature_root))
+            if peptide_feature_root is not None and name == "helixset":
+                config["data"]["peptide_features"] = str(peptide_feature_root)
             config["encoder"]["name"] = "facebook/esm2_t33_650M_UR50D" if esm=="650m" else "facebook/esm2_t12_35M_UR50D"
             source = MultimodalData(config["data"]["root"], task)
-            data = MultimodalPeptides(source, feature_root, "train", samples)
+            data = MultimodalPeptides(source, feature_root, "train", samples, config["data"].get("peptide_features"))
             validate_cache(data, config)
             groups = source.groups(data.indices, source.data.y[data.indices])
             integration = {"rows": len(data), "esm_dim": data.meta["input_dim"], "encoder": data.meta,
@@ -221,7 +236,7 @@ def run(models, tasks, feature_root, device, output, esm="650m", batches=(2, 4, 
             restored = train(continued, f"{name}_{task}_resume", resume=root/f"{name}_{task}"/"last.pt")
             model, checkpoint = load_model(root/f"{name}_{task}_resume"/"best.pt", device)
             source = MultimodalData(config["data"]["root"], task, checkpoint["statistics"])
-            val = MultimodalPeptides(source, feature_root, "val", min(samples, 64))
+            val = MultimodalPeptides(source, feature_root, "val", min(samples, 64), config["data"].get("peptide_features"))
             loader = torch.utils.data.DataLoader(val, batch_size=chosen["batch_size"], collate_fn=collate_multimodal)
             y, p = predict_loader(model, loader, device, chosen["precision"])
             evaluation = metrics(y, p, source.statistics, checkpoint["threshold"])

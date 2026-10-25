@@ -324,7 +324,7 @@ class HelixSet(nn.Module):
                  pair_readout=True, fine_evidence=True, geometry_depth=4,
                  geometry_context=True, geometry_quality=True, distance_multiscale=True,
                  scale_balance=True, pair_interactions=True, structure_evidence=True,
-                 esm_tail=None, evidence_readout=False):
+                 esm_tail=None, evidence_readout=False, peptide_input_dim=0):
         super().__init__()
         self.statistics = statistics
         self.esm_tail = None
@@ -334,7 +334,8 @@ class HelixSet(nn.Module):
         self.distance_multiscale = distance_multiscale
         self.scale_balance, self.pair_interactions = scale_balance, pair_interactions
         self.structure_evidence = structure_evidence
-        self.sequence = SequenceEncoder(input_dim, vocab_size, dim, heads, dropout, sequence_depth)
+        self.sequence = SequenceEncoder(input_dim, vocab_size, dim, heads, dropout, sequence_depth,
+                                        peptide_input_dim=peptide_input_dim)
         self.properties = PropertyEncoder(dim, heads, dropout, property_depth)
         self.geometry = nn.Sequential(nn.Linear(16, dim), nn.GELU(), nn.LayerNorm(dim))
         self.dssp = nn.Embedding(10, dim)
