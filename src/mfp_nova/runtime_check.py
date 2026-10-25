@@ -15,7 +15,7 @@ import yaml
 
 from .multimodal import MultimodalData, MultimodalPeptides, collate_multimodal
 from .research import (autocast_context, make_model, to_device, train, validate_cache,
-                       load_model, predict_loader, metrics)
+                       load_model, predict_loader, metrics, make_optimizer)
 from .trainer import seed_everything, write_json
 
 
@@ -98,7 +98,7 @@ def profile(config, source, dataset, device, batches, precisions, measured_steps
         probe_keys = list(PROBES[config["model_name"]])
         if getattr(model, "esm_tail", None) is not None:
             probe_keys.append("esm_tail.layers.0.attention.self.query.lora_B.weight")
-        optimizer = torch.optim.AdamW(model.parameters(), lr=config["train"]["learning_rate"], weight_decay=config["train"]["weight_decay"])
+        optimizer = make_optimizer(model, config["train"])
         scaler = torch.amp.GradScaler("cuda", enabled=precision=="fp16", init_scale=1024.)
         for size in batches:
             torch.cuda.reset_peak_memory_stats(device)

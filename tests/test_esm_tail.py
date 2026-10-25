@@ -57,7 +57,7 @@ def test_prefix_plus_zero_lora_matches_full_esm_and_ignores_padding(monkeypatch)
              'esm_eos': states[torch.arange(2), lengths + 1].clone()}
     tokens = tokenizer(sequences)
     tokens.pop('special_tokens_mask')
-    with torch.no_grad():
+    with torch.inference_mode():
         expected = full(**tokens).last_hidden_state[:, 1:-1] * batch['mask'][..., None]
         torch.testing.assert_close(tail(batch), expected, atol=1e-5, rtol=1e-4)
         corrupted = dict(batch, esm=batch['esm'].masked_fill(~batch['mask'][..., None], 100))

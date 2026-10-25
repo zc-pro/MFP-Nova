@@ -60,6 +60,12 @@ class ESMTail(nn.Module):
         valid = torch.arange(length + 2, device=mask.device)[None] < lengths[:, None] + 2
         attention_mask = (~valid[:, None, None]).to(hidden.dtype) * torch.finfo(hidden.dtype).min
         for layer in self.layers:
+            rotary = layer.attention.self.rotary_embeddings
+            # Validation caches made under inference_mode cannot be saved for
+            # backward. Refresh them when gradient-enabled execution resumes.
+            if (torch.is_grad_enabled() and rotary is not None and rotary._cos_cached is not None
+                    and rotary._cos_cached.is_inference()):
+                rotary._seq_len_cached = None
             output = layer(hidden, attention_mask=attention_mask, head_mask=None, output_attentions=False)
             # Transformers 4.44 returns a tuple; newer ESM layers return a tensor.
             hidden = output[0] if isinstance(output, tuple) else output

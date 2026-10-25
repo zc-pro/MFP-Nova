@@ -182,6 +182,17 @@ def restore_model_state(model, state):
         raise RuntimeError(f"Checkpoint/model mismatch: {result}")
 
 
+def make_optimizer(model, settings):
+    parameters = [(key, value) for key, value in model.named_parameters() if value.requires_grad]
+    if getattr(model, "esm_tail", None) is not None:
+        groups = [{"params": [p for key, p in parameters if not key.startswith("esm_tail.")]},
+                  {"params": [p for key, p in parameters if key.startswith("esm_tail.")],
+                   "lr": settings.get("esm_learning_rate", 1e-5)}]
+    else:
+        groups = [p for _, p in parameters]
+    return torch.optim.AdamW(groups, lr=settings["learning_rate"], weight_decay=settings["weight_decay"])
+
+
 def train(config, name, resume=None):
     settings = config["train"]
     device = torch.device(settings["device"])
@@ -295,14 +306,7 @@ def train(config, name, resume=None):
     model = make_model(config["model_name"], args).to(device)
     run = Path(settings["output"])/name
     run.mkdir(parents=True, exist_ok=False)
-    parameters = [(key, value) for key, value in model.named_parameters() if value.requires_grad]
-    if getattr(model, "esm_tail", None) is not None:
-        groups = [{"params": [p for key, p in parameters if not key.startswith("esm_tail.")]},
-                  {"params": [p for key, p in parameters if key.startswith("esm_tail.")],
-                   "lr": settings.get("esm_learning_rate", 1e-5)}]
-    else:
-        groups = [p for _, p in parameters]
-    optimizer = torch.optim.AdamW(groups, lr=settings["learning_rate"], weight_decay=settings["weight_decay"])
+    optimizer = make_optimizer(model, settings)
     precision = settings.get("precision", "fp32")
     accumulation = settings.get("accumulation_steps", 1)
     scaler = torch.amp.GradScaler("cuda", enabled=precision=="fp16", init_scale=1024.)
