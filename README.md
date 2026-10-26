@@ -2,7 +2,7 @@
 
 独立的治疗肽多标签预测科研项目。当前专注 **`data/therapeutic_2025/`**，任务为 `major15` 和 `fine39`；同类论文的数据集仅作后续补充基准准备。
 
-项目统一维护四个研究模型：**TriRelay、GeoFactor、ProtoRoute、HelixSet**。前三模型已完成两任务各五 Seed 的首轮训练及独立 Test；HelixSet 原版、decay30、精简版、ESM尾部LoRA及早期取证方案均已完成major15/seed42 Train/Val。双冻结表征版已完成真实训练，传统最佳Val Acc64.50%/AT54.94%，AP候选Macro-AP57.84%。2026-10-26当前在完整主干上加入 **逐标签Bernoulli R-Drop**；新方案本机只作静态检查，尚未执行模型或训练。
+项目统一维护四个研究模型：**TriRelay、GeoFactor、ProtoRoute、HelixSet**。前三模型已完成两任务各五 Seed 的首轮训练及独立 Test；HelixSet 原版、decay30、精简版、ESM尾部LoRA及早期取证方案均已完成major15/seed42 Train/Val。双表征R-Drop版已完成major15/seed42真实训练，传统最佳Val Acc64.96%/AT54.73%，AP候选Macro-AP58.43%。2026-10-26暂选此架构为汇报候选，准备fine39独立训练及两任务Test；实际Test尚未执行，命令见本文末节。
 
 ## 四模型入口
 
@@ -22,7 +22,7 @@
 
 四模型都支持 `--metric-suite traditional5|task_specific`。HelixSet 当前默认传统五指标，前三模型保留原 AP 选模协议；批量计划会记录模式。跨模型正式比较时须明确统一的选模和阈值协议，不能将不同模式混成同一组结果。
 
-原三模型的历史五 Seed 批量设置仍为 FP32、batch64、无累积；HelixSet 当前为 FP32、batch16 × 累积4、EMA0.999，启用R-Drop后仍为64条不同样本/更新。上一轮双表征单路训练实测7.76GiB/263秒每轮；双路R-Drop的显存和速度需重新测量。
+原三模型的历史五 Seed 批量设置仍为 FP32、batch64、无累积；HelixSet 当前为 FP32、batch16 × 累积4、EMA0.999，启用R-Drop后仍为64条不同样本/更新。双表征单路训练实测7.76GiB/263秒每轮，R-Drop双路16×4实测7.78GiB/763秒每轮；fine39仍需检查显存。
 
 ## 项目结构
 
@@ -275,3 +275,173 @@ PYTHONPATH=src python -m mfp_nova.threshold_study --predictions /path/results.zi
 以上为同一Val的簇交叉拟合探索结果。新约束是在查看上一项研究结果后提出，不能称为全新盲验证；拟合集满足约束不代表留出集满足。epoch17仍损害多功能表现；epoch12虽改善多项指标，真实多功能恢复仍减少4条。因此不默认采用、不继续在该Val上叠加约束调优，也不凭本轮分析改选checkpoint。
 
 `decay30`已于2026-10-24完成：29轮、传统最佳14轮，Acc63.26%、AT52.60%、AF5.91%、MFP-F1 53.50%；相对原日程Acc63.87%、AT53.89%、AF5.79%、MFP-F1 54.38%退步。最佳Macro-AP为57.51%，原日程57.33%，小幅上涨主要由37个Val阳性的溶栓类别带动，其他14类平均AP由60.36%降至60.18%。相同epoch29的Train AP99.83%/Val AP52.16%/Val Loss0.11806，对照98.34%/54.80%/0.07361，未缓解过拟合。单seed不推出所有短日程均无效，但当前不采用decay30。随后精简版也未改善性能；随后ESM尾部适配也未超越原版传统指标；早期取证随后也未改善整体表现，当前转为完整主干上的双冻结序列表征，保持有效batch64，具体配置以上文为准。跨设备结果分开报告，主要对照沿用RTX5070。
+
+
+## 汇报候选：major15与fine39独立Test（2026-10-26）
+
+当前候选为`7505336`双冻结表征＋R-Drop。major15固定使用RTX5070恢复实验的`best.pt`：epoch18、EMA、Val阈值0.73、Val Acc64.96%/AT54.73%。fine39沿用架构和超参数，独立从头训练39类模型，使用自己的Val选出`best.pt`及阈值。只评价事先选定的传统候选，不按Test选择checkpoint、阈值或设备上的不同训练结果。
+
+已按发布数组确认fine39各split均为major15对应队列的子集，可共用两套最终层ESM缓存。major15 Train/Val/Test=39478/8534/8187，fine39=39455/8529/8180。Test各提取一次，评价加载checkpoint保存的Train预处理统计与Val阈值，不重新拟合。以下操作需由用户在训练机器执行；本机没有权重，未启动训练或Test，实际Test结果尚未产生。
+
+### RTX5070汇报命令：major15 Test、fine39训练/Test、统一打包
+
+PowerShell前台执行。确保其他训练已结束；复用现有Train/Val缓存，不重新训练major15，不使用`best_ap.pt`替换已经选定的模型。若输出`test.json`已存在，保留已有结果，不覆盖重测。
+
+```powershell
+Set-Location 'D:\Data\ChatGPT\mfp\MFP-Nova'
+$mfpPython = 'D:\App\Code\Anaconda\envs\MFP-Nova\python.exe'
+$env:PYTHONPATH = Join-Path $PWD.Path 'src'
+$env:CUDA_VISIBLE_DEVICES = '0'
+$env:OMP_NUM_THREADS = '4'
+$env:MKL_NUM_THREADS = '4'
+$MajorRun = 'helixset_major15_seed42_rtx5070_7505336_dualpep_rdrop_b16_a4_20261026_101951_resume_20261026_131448'
+$MajorDir = Join-Path 'runs' $MajorRun
+
+foreach ($View in @('primary', 'peptide')) {
+    $Root = if ($View -eq 'primary') { 'features/esm2_650m' } else { 'features/esm2_peptide_150m' }
+    if (Test-Path -LiteralPath "$Root/test/metadata.json") { continue }
+    & $mfpPython -u -m mfp_nova.cli features --config configs/helixset.yaml `
+      --track major15 --encoder-view $View --splits test --device cuda:0 --batch-size 8
+    if ($LASTEXITCODE -ne 0) { throw "Test特征提取失败：$View" }
+}
+
+& $mfpPython -u -m mfp_nova.cli evaluate `
+  --checkpoint "$MajorDir/best.pt" --data-root data/therapeutic_2025 `
+  --feature-root features/esm2_650m --peptide-feature-root features/esm2_peptide_150m `
+  --split test --device cuda:0 --batch-size 16 `
+  --output "$MajorDir/test.json" --predictions "$MajorDir/test_predictions.npz"
+if ($LASTEXITCODE -ne 0) { throw 'major15 Test失败。' }
+(Get-Content -LiteralPath "$MajorDir/test.json" -Raw | ConvertFrom-Json).primary_metrics
+```
+
+fine39查询数增加，先测完整R-Drop显存；该诊断只读Train/Val，不读取Test。中断的特征提取需按日志使用`--resume-from`续提，不删除缓存。随后独立从头训练fine39并评价其最佳传统候选：
+
+```powershell
+$CheckDir = "runs/gpucheck_helixset_fine39_rdrop_b16_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+& $mfpPython -u -m mfp_nova.cli gpu-check --models helixset --tasks fine39 `
+  --feature-root features/esm2_650m --peptide-feature-root features/esm2_peptide_150m `
+  --device cuda:0 --batch-sizes 16 --precisions fp32 --samples 128 --steps 16 --output $CheckDir
+if ($LASTEXITCODE -ne 0) { throw 'fine39显存检查失败。' }
+
+$Revision = (git rev-parse --short HEAD).Trim()
+$FineRun = "helixset_fine39_seed42_rtx5070_${Revision}_dualpep_rdrop_b16_a4_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+$FineDir = Join-Path 'runs' $FineRun
+$FineLog = Join-Path 'runs' "${FineRun}.log"
+Write-Host "fine39实验：$FineRun"
+& $mfpPython -u -m mfp_nova.cli train --model helixset --config configs/helixset.yaml `
+  --task fine39 --seed 42 --device cuda:0 --precision fp32 `
+  --batch-size 16 --accumulation-steps 4 --num-workers 0 `
+  --ema-decay 0.999 --ema-start-epoch 6 --metric-suite traditional5 `
+  --threshold-strategy global --epochs 100 --name $FineRun `
+  2>&1 | Tee-Object -FilePath $FineLog
+if ($LASTEXITCODE -ne 0) { throw 'fine39训练异常退出，暂不执行Test。' }
+
+& $mfpPython -u -m mfp_nova.cli evaluate `
+  --checkpoint "$FineDir/best.pt" --data-root data/therapeutic_2025 `
+  --feature-root features/esm2_650m --peptide-feature-root features/esm2_peptide_150m `
+  --split test --device cuda:0 --batch-size 16 `
+  --output "$FineDir/test.json" --predictions "$FineDir/test_predictions.npz"
+if ($LASTEXITCODE -ne 0) { throw 'fine39 Test失败。' }
+(Get-Content -LiteralPath "$FineDir/test.json" -Raw | ConvertFrom-Json).primary_metrics
+```
+
+同一窗口打包两任务的小型结果及major15恢复前记录，不含checkpoint或特征。重新打开窗口后须先恢复`$MajorRun`、`$FineRun`和Python路径。
+
+```powershell
+$PreviousMajorRun = 'helixset_major15_seed42_rtx5070_7505336_dualpep_rdrop_b16_a4_20261026_101951'
+$ZipPath = Join-Path ([Environment]::GetFolderPath('Desktop')) `
+    "helixset_major15_fine39_report_$(Get-Date -Format 'yyyyMMdd_HHmmss').zip"
+@"
+from pathlib import Path
+from zipfile import ZipFile, ZIP_DEFLATED
+import sys
+archive, major, fine, previous = sys.argv[1:]
+for name in (major, fine):
+    if not (Path('runs') / name / 'test.json').is_file():
+        raise SystemExit(f'Test结果尚未生成：{name}')
+with ZipFile(archive, 'x', ZIP_DEFLATED) as out:
+    for name in (major, fine, previous):
+        directory = Path('runs') / name
+        if not directory.is_dir():
+            continue
+        for path in sorted(directory.iterdir()):
+            if path.is_file() and path.suffix in ('.json', '.jsonl', '.npz', '.log'):
+                out.write(path, f'{name}/{path.name}')
+        log = Path('runs') / f'{name}.log'
+        if log.is_file():
+            out.write(log, f'{name}/console.log')
+print(Path(archive).resolve())
+"@ | & $mfpPython - $ZipPath $MajorRun $FineRun $PreviousMajorRun
+```
+
+### V100汇报备用命令：fine39训练与Test
+
+主汇报建议沿用RTX5070；若在V100训练fine39，明确记录环境，不同时训练两份后按Test择优。先准备两套Train/Val/Test缓存：若V100联网仍失败，完整传入RTX生成的`features/esm2_650m/test`及`features/esm2_peptide_150m/test`。下面不下载权重，采用相同16×4协议，CPU线程和GPU可调整，后台运行支持断开SSH。
+
+```bash
+cd ~/wuzhencheng/projects/MFP-Nova
+conda activate MFP-Nova
+mfpPython="$(command -v python)"
+export PYTHONPATH="$PWD/src"
+gpu=0
+threads=16
+export CUDA_VISIBLE_DEVICES="$gpu" OMP_NUM_THREADS="$threads" MKL_NUM_THREADS="$threads"
+revision="$(git rev-parse --short HEAD)"
+fine_run="helixset_fine39_seed42_v100_${revision}_dualpep_rdrop_b16_a4_$(date +%Y%m%d_%H%M%S)"
+mkdir -p runs
+nohup bash -c '
+set -e
+mfpPython="$1"
+fine_run="$2"
+"$mfpPython" -u -m mfp_nova.cli gpu-check --models helixset --tasks fine39 \
+  --feature-root features/esm2_650m --peptide-feature-root features/esm2_peptide_150m \
+  --device cuda:0 --batch-sizes 16 --precisions fp32 --samples 128 --steps 16 \
+  --output "runs/${fine_run}_gpucheck"
+"$mfpPython" -u -m mfp_nova.cli train --model helixset --config configs/helixset.yaml \
+  --task fine39 --seed 42 --device cuda:0 --precision fp32 \
+  --batch-size 16 --accumulation-steps 4 --num-workers 4 \
+  --ema-decay 0.999 --ema-start-epoch 6 --metric-suite traditional5 \
+  --threshold-strategy global --epochs 100 --name "$fine_run"
+"$mfpPython" -u -m mfp_nova.cli evaluate \
+  --checkpoint "runs/$fine_run/best.pt" --data-root data/therapeutic_2025 \
+  --feature-root features/esm2_650m --peptide-feature-root features/esm2_peptide_150m \
+  --split test --device cuda:0 --batch-size 16 \
+  --output "runs/$fine_run/test.json" --predictions "runs/$fine_run/test_predictions.npz"
+' -- "$mfpPython" "$fine_run" > "runs/${fine_run}.log" 2>&1 < /dev/null &
+echo "PID=$! Run=$fine_run"
+tail -n 40 -f "runs/${fine_run}.log"
+```
+
+在V100评价同一个RTX major15候选，须先传入该运行目录的`best.pt`（结果ZIP没有权重）及两套Test缓存。若要一并打包Val与环境，请同时传入该运行的小型结果；不能用另一个V100训练的checkpoint冒充同权重评价。
+
+```bash
+major_run=helixset_major15_seed42_rtx5070_7505336_dualpep_rdrop_b16_a4_20261026_101951_resume_20261026_131448
+"$mfpPython" -u -m mfp_nova.cli evaluate \
+  --checkpoint "runs/$major_run/best.pt" --data-root data/therapeutic_2025 \
+  --feature-root features/esm2_650m --peptide-feature-root features/esm2_peptide_150m \
+  --split test --device cuda:0 --batch-size 16 \
+  --output "runs/$major_run/test.json" --predictions "runs/$major_run/test_predictions.npz"
+```
+
+V100 fine39完成后的打包命令，重新登录需先恢复`fine_run`为启动时打印的名称：
+
+```bash
+python - "$fine_run" <<'PY'
+from pathlib import Path
+from datetime import datetime
+from zipfile import ZipFile, ZIP_DEFLATED
+import sys
+run = Path('runs') / sys.argv[1]
+if not (run / 'test.json').is_file():
+    raise SystemExit('fine39 Test尚未完成。')
+archive = run.parent / f'{run.name}_train_test_{datetime.now():%Y%m%d_%H%M%S}.zip'
+with ZipFile(archive, 'x', ZIP_DEFLATED) as out:
+    for path in sorted(run.iterdir()):
+        if path.is_file() and path.suffix in ('.json', '.jsonl', '.npz', '.log'):
+            out.write(path, f'{run.name}/{path.name}')
+    log = run.parent / f'{run.name}.log'
+    if log.is_file():
+        out.write(log, f'{run.name}/console.log')
+print(archive.resolve())
+PY
+```

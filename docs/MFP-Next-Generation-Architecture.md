@@ -532,3 +532,7 @@ epoch10→38，Train Macro-AP81.10%→98.39%，Val Macro-AP56.75%→53.63%，Val
 默认microbatch16×累积4，保持64条不同样本/更新。启用R-Drop后每条样本被两次随机前向处理，不把有效独立batch称为128。两份激活图同时参与backward，不能沿用上一版batch32/7.76GiB的显存结论。GPU profile直接用完整λ=0.1，短训练另按正式调度启用；日志标注profile作用范围。参数量和推理图不变，训练耗时预计增加，实际峰值与速度待用户设备实测。
 
 配置`loss.rdrop`与`train.rdrop_start_epoch/rdrop_ramp_epochs`控制；`train --rdrop-weight 0`可关闭。缺少rdrop字段的旧checkpoint恢复原单次前向训练语义，预测/评价不做双路。补充两方向Bernoulli KL恒等、极端logit数值与梯度、类别独立性、同输入双路监督均值、关闭/eval单路及调度测试代码，本机未运行。两平台同步、显存检查、正式训练和打包命令集中于README；正式实验从头开始，复用两份最终层缓存。
+
+`7505336`随后由用户在RTX5070完成major15/seed42真实训练，前8轮后因窗口关闭中断，从第9轮恢复至第33轮正常早停，历史与EMA连续。传统最佳epoch18/EMA/阈值0.73：Val Acc64.96%、Prec69.27%、Cov70.99%、AT54.73%、AF5.71%，Macro-AP57.57%、Micro-AP72.10%；AP候选epoch11为58.43%/73.25%。多功能检测F1为56.14%、独立功能集合F1为65.12%、恢复至少两个观测功能999条；相较`d26f60c`分别为54.18%/63.68%/925条。33轮累计393.2分钟，双路中位762.6秒/轮、峰值allocated7.78GiB，参数量不变。单seed与microbatch改变限制了独立因果解释；Test尚未评价。
+
+2026-10-26用户暂选当前架构为汇报候选，下一步使用上述major15 `best.pt`直接评价Test，fine39沿用同一架构、seed与协议独立从头训练，再评价其Val所选`best.pt`。不在Test选择checkpoint或阈值、不测试AP候选后择优。已按本地发布数组确认fine39 Train/Val/Test=39455/8529/8180，分别均为major15对应队列39478/8534/8187的子集，因此共享两套最终层缓存。两平台命令与两任务打包集中于README末节；本机没有训练机checkpoint，未执行训练或实际Test，不能将本节Val成绩当作Test结果。
