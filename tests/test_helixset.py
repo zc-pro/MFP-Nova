@@ -14,6 +14,73 @@ def fixture():
     return model, batch
 
 
+def test_bernoulli_rdrop_matches_kl_and_has_two_sided_labelwise_gradients():
+    from mfp_nova.consistency import bernoulli_rdrop
+    from torch.distributions import Bernoulli, kl_divergence
+    first = torch.tensor([[1., -2., .3], [-1., 2., -.3]], requires_grad=True)
+    second = torch.tensor([[-1., -2., .3], [1., 2., -.3]], requires_grad=True)
+    p, q = Bernoulli(logits=first), Bernoulli(logits=second)
+    expected = .5 * (kl_divergence(p, q) + kl_divergence(q, p)).mean()
+    loss = bernoulli_rdrop(first, second)
+    torch.testing.assert_close(loss, expected)
+    torch.testing.assert_close(loss, bernoulli_rdrop(second, first))
+    assert bernoulli_rdrop(first, first).item() == 0
+    loss.backward()
+    for gradient in (first.grad, second.grad):
+        assert torch.isfinite(gradient).all() and gradient[:, 0].abs().sum() > 0
+        assert gradient[:, 1:].count_nonzero() == 0
+    extremes = torch.tensor([[1000., -1000.]], requires_grad=True)
+    extreme_loss = bernoulli_rdrop(extremes, -extremes)
+    extreme_loss.backward()
+    assert torch.isfinite(extreme_loss) and torch.isfinite(extremes.grad).all()
+
+
+def test_rdrop_supervises_both_forwards_of_the_same_modality_view():
+    from mfp_nova.research_layers import observed_label_loss
+    from mfp_nova.consistency import bernoulli_rdrop
+    batch = synthetic_batch()
+    batch['esm_peptide'] = torch.randn(*batch['esm'].shape[:2], 6)
+    model = HelixSet(12, 15, 10, sample_statistics(15), dim=32, heads=4, dropout=.2,
+                    sequence_depth=1, property_depth=1, geometry_depth=1, pair_depth=1,
+                    latent_depth=1, decoder_depth=2, pair_dim=8, peptide_input_dim=6).train()
+    outputs, inputs = [], []
+    def record(module, arguments, result):
+        inputs.append(arguments[0])
+        outputs.append(result)
+    hook = model.register_forward_hook(record)
+    settings = {'modality_dropout': .2, 'rdrop': .1, 'direct': .2, 'branch': .1}
+    loss, terms, reported = model.compute_loss(batch, settings, return_output=True)
+    assert len(outputs) == 2 and inputs[0] is inputs[1]
+    assert reported is outputs[0]
+    expected = sum(observed_label_loss(x['logits'], batch['y'], model.statistics) for x in outputs)/2
+    torch.testing.assert_close(terms['classification'], expected)
+    torch.testing.assert_close(terms['rdrop'], bernoulli_rdrop(outputs[0]['logits'], outputs[1]['logits']))
+    torch.testing.assert_close(loss, terms['classification'] + .2*terms['direct'] + .1*terms['branch'] + .1*terms['rdrop'])
+    for output in outputs:
+        output['logits'].retain_grad()
+    loss.backward()
+    assert all(x['logits'].grad.abs().sum() > 0 for x in outputs)
+    assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
+    outputs.clear(); inputs.clear()
+    model.compute_loss(batch, dict(settings, rdrop=0))
+    assert len(outputs) == 1
+    outputs.clear(); inputs.clear()
+    model.eval()
+    model.compute_loss(batch, settings)
+    assert len(outputs) == 1
+    hook.remove()
+
+
+def test_rdrop_weight_ramps_after_warmup_and_old_configs_stay_off():
+    config = {'loss': {'rdrop': .1}, 'train': {'rdrop_start_epoch': 6, 'rdrop_ramp_epochs': 5}}
+    assert epoch_loss_settings(config, 5)['rdrop'] == 0
+    assert abs(epoch_loss_settings(config, 6)['rdrop'] - .02) < 1e-8
+    assert abs(epoch_loss_settings(config, 8)['rdrop'] - .06) < 1e-8
+    assert epoch_loss_settings(config, 10)['rdrop'] == .1
+    assert epoch_loss_settings(config, 30)['rdrop'] == .1
+    assert 'rdrop' not in epoch_loss_settings({'loss': {}, 'train': {}}, 10)
+
+
 def test_dual_encoder_gradients_padding_and_unlabelled_inference():
     batch = synthetic_batch()
     batch['esm'] = batch['esm'].requires_grad_()

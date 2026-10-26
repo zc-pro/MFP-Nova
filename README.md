@@ -2,7 +2,7 @@
 
 独立的治疗肽多标签预测科研项目。当前专注 **`data/therapeutic_2025/`**，任务为 `major15` 和 `fine39`；同类论文的数据集仅作后续补充基准准备。
 
-项目统一维护四个研究模型：**TriRelay、GeoFactor、ProtoRoute、HelixSet**。前三模型已完成两任务各五 Seed 的首轮训练及独立 Test；HelixSet 原版、decay30、精简版、ESM尾部LoRA及早期取证方案均已完成major15/seed42 Train/Val。2026-10-25当前实现 **通用ESM650M＋短肽ESM150M双冻结表征、完整HelixSet主干**；本轮仅静态检查，尚未执行模型测试、特征提取或训练。
+项目统一维护四个研究模型：**TriRelay、GeoFactor、ProtoRoute、HelixSet**。前三模型已完成两任务各五 Seed 的首轮训练及独立 Test；HelixSet 原版、decay30、精简版、ESM尾部LoRA及早期取证方案均已完成major15/seed42 Train/Val。双冻结表征版已完成真实训练，传统最佳Val Acc64.50%/AT54.94%，AP候选Macro-AP57.84%。2026-10-26当前在完整主干上加入 **逐标签Bernoulli R-Drop**；新方案本机只作静态检查，尚未执行模型或训练。
 
 ## 四模型入口
 
@@ -22,7 +22,7 @@
 
 四模型都支持 `--metric-suite traditional5|task_specific`。HelixSet 当前默认传统五指标，前三模型保留原 AP 选模协议；批量计划会记录模式。跨模型正式比较时须明确统一的选模和阈值协议，不能将不同模式混成同一组结果。
 
-原三模型的历史五 Seed 批量设置仍为 FP32、batch64、无累积；HelixSet 当前为 FP32、batch32 × 累积2、EMA0.999。RTX5070实测原版约7.73GiB/262秒每轮，早期取证版约7.81GiB/276秒每轮；双表征方案的显存和性能待实测，不能直接沿用历史峰值。
+原三模型的历史五 Seed 批量设置仍为 FP32、batch64、无累积；HelixSet 当前为 FP32、batch16 × 累积4、EMA0.999，启用R-Drop后仍为64条不同样本/更新。上一轮双表征单路训练实测7.76GiB/263秒每轮；双路R-Drop的显存和速度需重新测量。
 
 ## 项目结构
 
@@ -79,7 +79,7 @@ runs/                         # 训练输出、权重和分析，不提交 Git
 
 `bb3aca4`原版在第17轮达到Val Acc63.87%、AT53.89%；`021734d` decay30为63.26%、52.60%。`0bf2435`精简版第76轮为63.45%、52.85%，最佳Macro-AP56.52%（第13轮）也低于原版57.33%（第12轮）；它没有解决过拟合，不作为性能主线。它的代码和权重仍在Git历史及原运行目录保留，评价需使用`0bf2435`版本。
 
-## HelixSet：短肽专用表征与通用表征融合
+## HelixSet：双冻结表征与Bernoulli R-Drop
 
 `756b707` ESM尾部LoRA真实实验完成29轮，传统最佳epoch14：Acc63.43%、AT53.39%、Macro-AP56.75%、Micro-AP72.64%；原版`bb3aca4`为63.87%、53.89%、56.90%、71.59%。最佳Macro-AP57.16%也未超过原版57.33%。LoRA每轮慢约61%，本次不继续扩大适配容量。2–16aa验证样本合计损失75条完全匹配，17–32aa增加33条，推动以下针对证据传递的整体改动；这些分组为探索证据，不能替代独立Test确认。
 
@@ -87,9 +87,11 @@ runs/                         # 训练输出、权重和分析，不提交 Git
 
 当前保留sequence3/property2/geometry4/pair4/latent6/decoder3、d384和32个latent。新增[短肽ESM-150M-F](https://huggingface.co/jiahuizhang/esm-150m-peptide-fine-tune)冻结最终层表征：每个残基的650M/150M输出分别做无参数LayerNorm，拼接1280+640维后投影到384，再进入同一套序列、理化、结构及集合解码主干。没有额外ESM直接分类头，也没有复制主干。相较原完整模型增加245,760个投影权重，预计71,723,550个可训练参数，以实际metadata为准。
 
+`d26f60c`已完成62轮，传统最佳47轮Acc64.50%、AT54.94%、AF5.82%；AP最佳12轮Macro-AP57.84%/Micro-AP73.07%。第12→62轮Train AP88.90%→99.79%、Val AP57.84%→51.76%，因此下一轮针对泛化增加R-Drop。上述均为单seed Val结果，独立Test尚未评价。
+
 **下一轮从头训练。** 复用`features/esm2_650m`最终层Train/Val缓存，并新增`features/esm2_peptide_150m`；不使用layer29缓存。新编码器使用自己的固定revision，首次提取需下载约150M模型权重，但正式训练只读取两份缓存。两份缓存独立核对row_id、ID和骨架序列；双视图metadata及维度写入checkpoint。旧完整模型/LoRA/早期取证checkpoint仍按保存参数加载，精简版仍须在`0bf2435`使用。
 
-保持major15/seed42、FP32、batch32×累积2、LR2e-4、5轮warmup/100轮cosine、EMA0.999第6轮起、traditional5/global，耐心15轮。损失为ASL主项＋0.2×潜变量辅助分类＋0.1×中间解码监督，未标注权重0.3；`--metric-suite task_specific`仍可切换。`best.pt`与`best_ap.pt`分别保存传统与AP候选，不混用其指标。暂不加入R-Drop、伪标签或新的对比损失。测试代码已补充但未执行，公开权重与现有Transformers构建的实际加载兼容性、显存和收益待用户设备验证；不主动升级两机环境。
+保持major15/seed42、FP32、LR2e-4、5轮warmup/100轮cosine、EMA0.999第6轮起、traditional5/global，耐心15轮。默认改为batch16×累积4。第1–5轮仍单路监督；第6–10轮R-Drop权重0.02→0.1，之后0.1。同一输入两次独立网络dropout，ASL主项＋0.2×潜变量辅助分类＋0.1×中间解码监督取两路均值，再加逐标签Bernoulli对称KL；未标注权重仍为0.3。Train指标取第一路预测，Val为单次干净eval与主ASL，原始R和权重写入history。`--metric-suite task_specific`仍可切换；传统默认保存best.pt及best_ap.pt两个候选。参数量及推理计算不变，双路训练耗时/显存待实测，必须重新测显存；本机不执行。
 
 `features --encoder-view primary|peptide`分别提取两份缓存；`--encoder-view peptide`不要同时传`--esm`。训练默认读取配置中的两份缓存，`--feature-root`和`--peptide-feature-root`可改路径。纯序列`predict`按checkpoint加载两套编码器，不要求输入结构文件；外部NPZ接口须额外提供`esm_peptide[B,L,640]`，归一化由模型完成。独立Test需要时再分别提取Test缓存，训练命令不访问Test。
 
@@ -118,14 +120,31 @@ foreach ($View in @('primary', 'peptide')) {
     if ($LASTEXITCODE -ne 0) { throw "特征提取失败：$View/$Split，请查看错误；中断缓存按实际行数续提。" }
   }
 }
+```
+
+先完成上述环境及缓存准备，然后在正式训练前执行以下显存检查。profile直接启用完整R-Drop权重0.1与两份激活图；第1–5轮单路训练的显存不能代表正式双路峰值。该命令会执行真实前后向与短训练，本机未执行：
+
+```powershell
+$GpuCheckDir = Join-Path 'runs' "gpucheck_helixset_dualpep_rdrop_b16_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+& $mfpPython -u -m mfp_nova.cli gpu-check --models helixset --tasks major15 --esm 650m `
+  --feature-root features/esm2_650m --device cuda:0 --batch-sizes 16 --precisions fp32 `
+  --peptide-feature-root features/esm2_peptide_150m `
+  --samples 128 --steps 16 --output $GpuCheckDir `
+  2>&1 | Tee-Object -FilePath "${GpuCheckDir}.log"
+if ($LASTEXITCODE -ne 0) { throw "R-Drop显存检查未通过，请查看${GpuCheckDir}.log。" }
+```
+
+显存检查通过后，在同一个窗口前台训练并打包：
+
+```powershell
 $Revision = git rev-parse --short HEAD
-$RunName = "helixset_major15_seed42_rtx5070_${Revision}_dualpep_b32_a2_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+$RunName = "helixset_major15_seed42_rtx5070_${Revision}_dualpep_rdrop_b16_a4_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
 New-Item -ItemType Directory -Path 'runs' -Force | Out-Null
 $LogPath = Join-Path 'runs' "${RunName}.log"
 Write-Host "本次实验：$RunName"
 & $mfpPython -u -m mfp_nova.cli train --model helixset --config configs/helixset.yaml `
   --task major15 --seed 42 --device cuda:0 --precision fp32 `
-  --batch-size 32 --accumulation-steps 2 --num-workers 0 --ema-decay 0.999 --ema-start-epoch 6 `
+  --batch-size 16 --accumulation-steps 4 --num-workers 0 --ema-decay 0.999 --ema-start-epoch 6 `
   --metric-suite traditional5 --threshold-strategy global --epochs 100 --name $RunName `
   2>&1 | Tee-Object -FilePath $LogPath
 if ($LASTEXITCODE -ne 0) { throw '训练异常退出，请查看日志。' }
@@ -138,17 +157,6 @@ $PackFiles += $LogPath
 $ZipPath = Join-Path ([Environment]::GetFolderPath('Desktop')) "${RunName}_results_$(Get-Date -Format 'yyyyMMdd_HHmmss').zip"
 Compress-Archive -LiteralPath $PackFiles -DestinationPath $ZipPath
 Write-Host "验收包：$ZipPath"
-```
-
-若要先测显存，在上述环境设置及两份缓存提取完成后、正式训练启动前自行执行（该命令会运行模型与短训练）：
-
-```powershell
-$GpuCheckDir = Join-Path 'runs' "gpucheck_helixset_dualpep_b32_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
-& $mfpPython -u -m mfp_nova.cli gpu-check --models helixset --tasks major15 --esm 650m `
-  --feature-root features/esm2_650m --device cuda:0 --batch-sizes 32 --precisions fp32 `
-  --peptide-feature-root features/esm2_peptide_150m `
-  --samples 128 --steps 16 --output $GpuCheckDir `
-  2>&1 | Tee-Object -FilePath "${GpuCheckDir}.log"
 ```
 
 ### V100：Ubuntu Bash，后台训练与打包
@@ -170,7 +178,7 @@ gpu=0
 threads=16
 export CUDA_VISIBLE_DEVICES="$gpu" OMP_NUM_THREADS="$threads" MKL_NUM_THREADS="$threads"
 revision="$(git rev-parse --short HEAD)"
-run_name="helixset_major15_seed42_v100_${revision}_dualpep_b32_a2_$(date +%Y%m%d_%H%M%S)"
+run_name="helixset_major15_seed42_v100_${revision}_dualpep_rdrop_b16_a4_$(date +%Y%m%d_%H%M%S)"
 mkdir -p runs
 nohup bash -c '
 set -e
@@ -184,9 +192,13 @@ for view in primary peptide; do
       --encoder-view "$view" --splits "$split" --device cuda:0 --batch-size 8
   done
 done
+"$mfpPython" -u -m mfp_nova.cli gpu-check --models helixset --tasks major15 --esm 650m \
+  --feature-root features/esm2_650m --peptide-feature-root features/esm2_peptide_150m \
+  --device cuda:0 --batch-sizes 16 --precisions fp32 --samples 128 --steps 16 \
+  --output "runs/${run_name}_gpucheck"
 exec "$mfpPython" -u -m mfp_nova.cli train --model helixset --config configs/helixset.yaml \
   --task major15 --seed 42 --device cuda:0 --precision fp32 \
-  --batch-size 32 --accumulation-steps 2 --num-workers 4 --ema-decay 0.999 --ema-start-epoch 6 \
+  --batch-size 16 --accumulation-steps 4 --num-workers 4 --ema-decay 0.999 --ema-start-epoch 6 \
   --metric-suite traditional5 --threshold-strategy global --epochs 100 --name "$run_name"
 ' -- "$mfpPython" "$run_name" \
   > "runs/${run_name}.log" 2>&1 < /dev/null &

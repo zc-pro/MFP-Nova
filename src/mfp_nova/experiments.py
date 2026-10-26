@@ -122,6 +122,10 @@ def compatibility_issues(metadata, result, directory, identity=None):
             if config[key]!=expected[key]:
                 issues.append(f"{key} configuration differs from the fixed protocol")
         settings = config["train"]
+        if expected["loss"].get("rdrop", 0):
+            for key in ("rdrop_start_epoch", "rdrop_ramp_epochs"):
+                if settings.get(key) != expected["train"][key]:
+                    issues.append(f"train.{key} differs from the fixed protocol")
         if settings.get("reconstruction_decay") is not None:
             issues.append("train.reconstruction_decay differs from the fixed protocol")
         if settings.get("reconstruction_gradient", "sum") != "sum":

@@ -45,18 +45,21 @@ loss:
   modality_dropout: 0.1
   evidence: 0.0
   annotation_set: 0.0
+  rdrop: 0.1
 train:
   device: cpu
   seed: 42
   epochs: 100
-  batch_size: 32
-  accumulation_steps: 2
+  batch_size: 16
+  accumulation_steps: 4
   precision: fp32
   learning_rate: 0.0002
   weight_decay: 0.01
   patience: 15
   warmup_epochs: 5
   aux_warmup_epochs: 5
+  rdrop_start_epoch: 6
+  rdrop_ramp_epochs: 5
   gradient_clip: 5
   num_workers: 0
   ema_decay: 0.999

@@ -1,5 +1,17 @@
-"""EMA targets for unlabeled cells; observed positives retain their original loss."""
+"""Bernoulli consistency for EMA targets and paired dropout predictions."""
 from torch.nn import functional as F
+
+
+def bernoulli_rdrop(first_logits, second_logits):
+    """Mean symmetric KL over independent labels; both views receive gradients.
+
+    For Bernoulli logits a,b, (KL(p||q)+KL(q||p))/2 equals
+    (sigmoid(a)-sigmoid(b))*(a-b)/2. FP32 avoids log(0) and
+    cancellation between log-probabilities for confident predictions.
+    No targets are imputed and no softmax couples different labels.
+    """
+    first, second = first_logits.float(), second_logits.float()
+    return (.5 * (first.sigmoid() - second.sigmoid()) * (first - second)).mean()
 
 
 def consistency_weight(settings, epoch):

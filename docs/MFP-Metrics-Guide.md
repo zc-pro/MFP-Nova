@@ -568,7 +568,7 @@ $$
 | TriRelay | classification + 加权 direct + branch + reconstruction |
 | GeoFactor | classification + 加权 direct + reconstruction + factor |
 | ProtoRoute | classification + 加权 direct + branch + prototype + diversity + balance + reconstruction |
-| HelixSet | classification + 0.2 × direct（潜变量）+ 0.1 × branch（中间解码）+ 0.1 × evidence（深浅两路ASL均值）+ 0.05 × annotation_set（弱未标注惩罚的逐样本soft-Jaccard） |
+| HelixSet | 两次dropout前向的监督损失均值：classification + 0.2 × direct（潜变量）+ 0.1 × branch（中间解码），另加 λ × rdrop（逐标签Bernoulli对称KL）；λ第6–10轮从0.02升至0.1。第1–5轮单次前向。evidence/annotation_set当前为0，旧checkpoint按保存配置使用。 |
 
 HelixSet的`annotation_set`为`1-sum(p*y)/(sum(y)+sum(w*p*(1-y)))`，未标注权重`w=0.3`，fine39未知亚类的具体同功能标签再降权；无观测标签的样本不提供集合监督。此项针对已标注标签集合，不是真实功能数量或独立功能数量监督，不改变传统五指标定义。
 

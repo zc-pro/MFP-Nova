@@ -51,6 +51,7 @@ def main(argv=None):
             sub.add_argument("--ema-decay", type=float, help="Optional parameter EMA; evaluate online and averaged weights in the same run")
             sub.add_argument("--ema-start-epoch", type=int, help="First EMA update epoch (default: after LR warmup)")
             sub.add_argument("--consistency-weight", type=float, help="TriRelay: optional clean-EMA / masked-student consistency (candidate: 0.1)")
+            sub.add_argument("--rdrop-weight", type=float, help="HelixSet: symmetric Bernoulli dropout consistency; 0 disables it")
             sub.add_argument("--consistency-start-epoch", type=int, help="First consistency epoch (default: EMA start + 1)")
             sub.add_argument("--consistency-ramp-epochs", type=int, help="Consistency weight ramp length (default: 5)")
             sub.add_argument("--function-aux-weight", type=float, help="TriRelay: real paired major15/fine39 auxiliary supervision (candidate: 0.1)")
@@ -214,6 +215,10 @@ def main(argv=None):
                 value = getattr(args, key)
                 if value is not None:
                     config["train"][key] = value
+            if args.rdrop_weight is not None:
+                if model_name != "helixset":
+                    raise ValueError("--rdrop-weight requires HelixSet")
+                config["loss"]["rdrop"] = args.rdrop_weight
             if args.loss is not None:
                 if model_name != "sequence":
                     raise ValueError("Research losses are configured in their YAML; --loss is a sequence-model option")

@@ -218,6 +218,10 @@ def run(models, tasks, feature_root, device, output, esm="650m", batches=(2, 4, 
                            "label_order": source.data.labels, "groups": {k: int(v.sum()) for k, v in groups.items()},
                            "empirical_factors": len(source.statistics["labels"]["hyperedges"]),
                            "prototype_counts": source.statistics["labels"]["prototype_counts"]}
+            if config["loss"].get("rdrop", 0):
+                integration["rdrop_profile_weight"] = config["loss"]["rdrop"]
+                integration["rdrop_profile_scope"] = "Both dropout graphs retained; configured maximum weight, no warmup"
+                print(f"RDrop profile | weight={config['loss']['rdrop']:.4f} views=2 (maximum, no warmup)", flush=True)
             print(f"Checking {name}/{task}: {len(data)} real rows", flush=True)
             records = profile(config, source, data, device, batches, precisions)
             write_json(root/f"{name}_{task}_profile.json", {"integration": integration, "profile": records})

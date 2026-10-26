@@ -518,17 +518,34 @@ class HelixSet(nn.Module):
         output = self(view)
         def classification(logits):
             return observed_label_loss(logits, batch["y"], self.statistics, settings.get("unlabeled_weight", .3))
-        terms = {"classification": classification(output["logits"]),
-                 "direct": classification(output["direct"])}
-        terms["branch"] = (torch.stack([classification(x) for x in output["decoder_logits"]]).mean()
-                           if output["decoder_logits"] else output["logits"].sum() * 0)
-        total = terms["classification"] + settings.get("direct", .2) * terms["direct"] + settings.get("branch", .1) * terms["branch"]
-        if "shallow_logits" in output:
-            # Independent supervision keeps either route trainable when fusion favors the other.
-            terms["evidence"] = .5 * (classification(output["shallow_logits"]) + classification(output["deep_logits"]))
-            total = total + settings.get("evidence", .1) * terms["evidence"]
-        if settings.get("annotation_set", 0):
-            terms["annotation_set"] = annotation_set_loss(
-                output["logits"], batch["y"], self.statistics, settings.get("unlabeled_weight", .3))
-            total = total + settings["annotation_set"] * terms["annotation_set"]
+        def supervised_terms(prediction):
+            terms = {"classification": classification(prediction["logits"]),
+                     "direct": classification(prediction["direct"])}
+            terms["branch"] = (torch.stack([classification(x) for x in prediction["decoder_logits"]]).mean()
+                               if prediction["decoder_logits"] else prediction["logits"].sum() * 0)
+            if "shallow_logits" in prediction:
+                terms["evidence"] = .5 * (classification(prediction["shallow_logits"]) + classification(prediction["deep_logits"]))
+            if settings.get("annotation_set", 0):
+                terms["annotation_set"] = annotation_set_loss(
+                    prediction["logits"], batch["y"], self.statistics, settings.get("unlabeled_weight", .3))
+            return terms
+
+        terms = supervised_terms(output)
+        rdrop_weight = settings.get("rdrop", 0)
+        agreement = output["logits"].sum() * 0
+        if self.training and rdrop_weight > 0:
+            from ..consistency import bernoulli_rdrop
+            # Identical measured inputs and one shared modality-dropout draw;
+            # only the network's ordinary dropout masks differ between forwards.
+            second = self(view)
+            second_terms = supervised_terms(second)
+            terms = {key: .5 * (value + second_terms[key]) for key, value in terms.items()}
+            agreement = bernoulli_rdrop(output["logits"], second["logits"])
+        weights = {"classification": 1., "direct": settings.get("direct", .2),
+                   "branch": settings.get("branch", .1), "evidence": settings.get("evidence", .1),
+                   "annotation_set": settings.get("annotation_set", 0)}
+        total = sum(weights[key] * value for key, value in terms.items())
+        if "rdrop" in settings:
+            terms["rdrop"] = agreement
+            total = total + rdrop_weight * agreement
         return (total, terms, output) if return_output else (total, terms)

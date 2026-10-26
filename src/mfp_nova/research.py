@@ -162,6 +162,10 @@ def epoch_loss_settings(config, epoch):
                 'evidence', 'annotation_set'):
         if key in loss:
             loss[key] *= ramp
+    if "rdrop" in loss:
+        start = settings.get("rdrop_start_epoch", 6)
+        duration = settings.get("rdrop_ramp_epochs", 5)
+        loss["rdrop"] *= min(1., max(0., (epoch-start+1)/duration))
     decay = settings.get('reconstruction_decay')
     if decay is not None:
         start, end = decay
@@ -265,6 +269,14 @@ def train(config, name, resume=None):
             if key not in ("device", "output", "epochs", "num_workers", "max_steps"):
                 settings[key] = value
     suite = settings.get("metric_suite", "task_specific")
+    rdrop = config["loss"].get("rdrop", 0)
+    if not math.isfinite(rdrop) or rdrop < 0:
+        raise ValueError("R-Drop weight must be finite and nonnegative")
+    if rdrop:
+        if config["model_name"] != "helixset":
+            raise ValueError("R-Drop currently supports HelixSet")
+        if settings.get("rdrop_start_epoch", 6) < 1 or settings.get("rdrop_ramp_epochs", 5) < 1:
+            raise ValueError("R-Drop start epoch and ramp length must be positive")
     protocol = protocol_description(suite, settings.get("threshold_strategy", "global"))
     branch_supervision = settings.get("branch_supervision", "mixed_private")
     if branch_supervision not in ("mixed_private", "shared_private"):
@@ -437,6 +449,13 @@ def train(config, name, resume=None):
     elif evidence_fusion == "normalized_residual":
         metadata["evidence_fusion_scope"] = "Both reads: same parameter-free RMS, gate inputs and branch supervision as normalized_competitive; only mixing changes to shared+g*private; no extra parameters"
     metadata["metric_protocol"] = protocol
+    if rdrop:
+        metadata["rdrop_scope"] = {
+            "coefficient": rdrop, "start_epoch": settings.get("rdrop_start_epoch", 6),
+            "ramp_epochs": settings.get("rdrop_ramp_epochs", 5),
+            "objective": "mean supervised loss of two dropout forwards + symmetric Bernoulli KL over all labels",
+            "inputs": "same modality-dropout view; independent ordinary network dropout masks",
+            "train_metrics": "first stochastic forward only", "validation": "single clean forward; main ASL only"}
     metadata["phys_missing_values"] = "zero_after_scaling" if source.statistics["phys"].get("zero_missing", False) else "legacy_median_after_scaling"
     if save_candidates:
         metadata["selection_candidates"] = {"primary": suite, "alternate": alternate_suite,
@@ -647,6 +666,11 @@ def train(config, name, resume=None):
                   f"KL={history['losses']['consistency']:.6f} "
                   f"high={history['losses']['consistency_high']:.6f} "
                   f"low={history['losses']['consistency_low']:.6f}", flush=True)
+        if rdrop:
+            print(f"RDrop | weight={loss_settings['rdrop']:.4f} "
+                  f"KL={history['losses']['rdrop']:.6f} "
+                  f"weighted={loss_settings['rdrop']*history['losses']['rdrop']:.6f} "
+                  f"views={2 if loss_settings['rdrop'] > 0 else 1}", flush=True)
         if function_aux:
             print(f"FunctionAux | task={source.statistics['function_auxiliary']['track']} "
                   f"weight={loss_settings['function_aux']:.4f} "
