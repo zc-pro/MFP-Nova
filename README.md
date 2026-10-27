@@ -2,9 +2,9 @@
 
 独立的治疗肽多标签预测科研项目。当前专注 **`data/therapeutic_2025/`**，任务为 `major15` 和 `fine39`；同类论文的数据集仅作后续补充基准准备。
 
-项目统一维护四个研究模型：**TriRelay、GeoFactor、ProtoRoute、HelixSet**。前三模型已完成两任务各五 Seed 的首轮训练及独立 Test；HelixSet 原版、decay30、精简版、ESM尾部LoRA及早期取证方案均已完成major15/seed42 Train/Val。双表征R-Drop版已完成major15/seed42真实训练，传统最佳Val Acc64.96%/AT54.73%，AP候选Macro-AP58.43%。2026-10-26暂选此架构为汇报候选，准备fine39独立训练及两任务Test；实际Test尚未执行，命令见本文末节。
+项目统一维护五个研究模型：**TriRelay、GeoFactor、ProtoRoute、HelixSet、TheraSet**。前三模型已完成两任务各五 Seed 的首轮训练及独立 Test；HelixSet 原版、decay30、精简版、ESM尾部LoRA及早期取证方案均已完成major15/seed42 Train/Val。双表征R-Drop版已完成major15/seed42真实训练，传统最佳Val Acc64.96%/AT54.73%，AP候选Macro-AP58.43%。2026-10-26暂选此架构为汇报候选，准备fine39独立训练及两任务Test；实际Test尚未执行，命令见本文末节。2026-10-28新增 TheraSet，已完成实现与小批量检查，尚无正式训练性能结果。
 
-## 四模型入口
+## 五模型入口
 
 | 模型 | 源码 | 配置 | 主要机制 |
 |---|---|---|---|
@@ -12,26 +12,27 @@
 | GeoFactor | [models/geofactor.py](src/mfp_nova/models/geofactor.py) | [geofactor.yaml](configs/geofactor.yaml) | 异构图与高阶因子推断 |
 | ProtoRoute | [models/protoroute.py](src/mfp_nova/models/protoroute.py) | [protoroute.yaml](configs/protoroute.yaml) | 标签条件专家路由与多原型 |
 | HelixSet | [models/helixset.py](src/mfp_nova/models/helixset.py) | [helixset.yaml](configs/helixset.yaml) | 双冻结序列表征、理化/结构证据与完整残基对/潜变量/集合解码 |
+| TheraSet | [models/theraset.py](src/mfp_nova/models/theraset.py) | [theraset.yaml](configs/theraset.yaml) | TheraPep式两级CNN直接预测、共享多原型尺度/模态/pair读取与标签条件残差修正 |
 
-四个模型共用 `research.py` 的训练、恢复、评价和推理流程，使用同一套数据加载与基础神经网络层。`sequence` 仍是独立的轻量对照基线。
+五个模型共用 `research.py` 的训练、恢复、评价和推理流程，使用同一套数据加载与基础神经网络层。`sequence` 仍是独立的轻量对照基线。
 
-- 单次训练：`mfp_nova.cli train --model` 支持上述四个名称，`--task` 选择 `major15/fine39`。
+- 单次训练：`mfp_nova.cli train --model` 支持上述五个名称，`--task` 选择 `major15/fine39`。
 - 评价与推理：统一使用 `evaluate`、`predict`、`summarize`。
-- 多 Seed：`mfp_nova.experiments` 与 `scripts/run_multiseed.ps1` 已纳入四模型；`all` 为四模型 × 两任务 × 五 Seed，共 40 组候选任务。运行脚本才会执行，文件整理不会启动训练。
-- GPU 诊断：`gpu-check --models` 支持四模型，HelixSet 的关键模块检查点已列入源码；本轮没有执行诊断。
+- 多 Seed：`mfp_nova.experiments` 与 `scripts/run_multiseed.ps1` 已纳入五模型；`all` 为五模型 × 两任务 × 五 Seed，共 50 组候选任务。运行脚本才会执行，文件整理不会启动训练。
+- GPU 诊断：`gpu-check --models` 支持五模型，HelixSet/TheraSet 的关键模块检查点已列入源码；本轮仅做本地 CPU 检查。
 
-四模型都支持 `--metric-suite traditional5|task_specific`。HelixSet 当前默认传统五指标，前三模型保留原 AP 选模协议；批量计划会记录模式。跨模型正式比较时须明确统一的选模和阈值协议，不能将不同模式混成同一组结果。
+五模型都支持 `--metric-suite traditional5|task_specific`。HelixSet/TheraSet 当前默认传统五指标，前三模型保留原 AP 选模协议；批量计划会记录模式。跨模型正式比较时须明确统一的选模和阈值协议，不能将不同模式混成同一组结果。
 
 原三模型的历史五 Seed 批量设置仍为 FP32、batch64、无累积；HelixSet 当前为 FP32、batch16 × 累积4、EMA0.999，启用R-Drop后仍为64条不同样本/更新。双表征单路训练实测7.76GiB/263秒每轮，R-Drop双路16×4实测7.78GiB/763秒每轮；fine39仍需检查显存。
 
 ## 项目结构
 
 ```text
-configs/                      # 四模型、序列基线及设备环境配置
+configs/                      # 五模型、序列基线及设备环境配置
 src/mfp_nova/
-  models/                     # 四个研究模型，各自独立实现
+  models/                     # 五个研究模型，各自独立实现
   research_layers.py          # 共享网络层与研究模型基础损失
-  research.py                 # 四模型共享训练/恢复/评价/预测
+  research.py                 # 五模型共享训练/恢复/评价/预测
   data.py, multimodal.py      # 只读数据、模态输入与 Train 统计
   encoder.py                  # 冻结 ESM 与残基特征缓存
   esm_tail.py                 # 冻结前缀缓存之后的 ESM LoRA 适配
@@ -71,15 +72,23 @@ runs/                         # 训练输出、权重和分析，不提交 Git
 
 ## 文档导航
 
+- [第五模型 TheraSet 架构设计分析](docs/TheraSet-Architecture.md)：基线定义、四模型取舍、创新假设、公式与维度、消融、验证及 RTX 5070/V100 训练命令。
+- [同类论文模型重训练可行性分析](docs/literature-model-comparison-feasibility.md)：保留各论文处理与训练方法，在当前数据上比较；包括仓库缺口、候选优先级和实施建议。
 - [模型架构、四模型差异及项目结果](docs/MFP-Next-Generation-Architecture.md)：HelixSet 详见第 9 节。
 - [指标与 Loss 说明](docs/MFP-Metrics-Guide.md)：包括四模型监督目标及两种评价模式。
 - [实验与开发记录](docs/experiment-history.md)：保留原 README 的安装、两平台命令、历次改进和结果；历史数字按当时实验范围解释。
 - [真实 GPU 验证记录](docs/MFP-Real-Data-GPU-Validation.md)：已取得的检查与性能记录。
 - [主数据统计](docs/data_summary.json)、[原始论文数据说明](data/literature_benchmarks/README.md)、[按数据集归并说明](data/literature_consolidated/README.md)。
 
-`bb3aca4`原版在第17轮达到Val Acc63.87%、AT53.89%；`021734d` decay30为63.26%、52.60%。`0bf2435`精简版第76轮为63.45%、52.85%，最佳Macro-AP56.52%（第13轮）也低于原版57.33%（第12轮）；它没有解决过拟合，不作为性能主线。它的代码和权重仍在Git历史及原运行目录保留，评价需使用`0bf2435`版本。
+## 第五模型 TheraSet
+
+TheraSet 保留 TheraPep-AI 的 34 维残基编码、两级 3/5/7/9 CNN 与直接分类头，新增共享多原型查询、独立多源证据读取、因子化残基对及标签条件残差。major15/fine39 下游可训练参数分别为 10,376,854 / 10,404,206，另有约 800M 冻结编码器。默认双 ESM、batch16×累积4、FP32、R-Drop 和 EMA，与当前 HelixSet 的主要训练协议对齐。
+
+`train --model theraset` 使用新配置；`--ablate evidence_decoder chemical_evidence` 是适配后的纯 CNN 对照，不能称为原论文完整复现。已通过正确性与训练/恢复/推理检查，两任务真实输入均完成两步 CPU 小批量优化，尚未做正式性能比较或 GPU 性能测试。完整设计与两平台命令见 [TheraSet 文档](docs/TheraSet-Architecture.md)。
 
 ## HelixSet：双冻结表征与Bernoulli R-Drop
+
+`bb3aca4`原版在第17轮达到Val Acc63.87%、AT53.89%；`021734d` decay30为63.26%、52.60%。`0bf2435`精简版第76轮为63.45%、52.85%，最佳Macro-AP56.52%（第13轮）也低于原版57.33%（第12轮）；它没有解决过拟合，不作为性能主线。它的代码和权重仍在Git历史及原运行目录保留，评价需使用`0bf2435`版本。
 
 `756b707` ESM尾部LoRA真实实验完成29轮，传统最佳epoch14：Acc63.43%、AT53.39%、Macro-AP56.75%、Micro-AP72.64%；原版`bb3aca4`为63.87%、53.89%、56.90%、71.59%。最佳Macro-AP57.16%也未超过原版57.33%。LoRA每轮慢约61%，本次不继续扩大适配容量。2–16aa验证样本合计损失75条完全匹配，17–32aa增加33条，推动以下针对证据传递的整体改动；这些分组为探索证据，不能替代独立Test确认。
 

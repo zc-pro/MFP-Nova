@@ -21,10 +21,10 @@ ALIASES = {"accuracy": "sample_jaccard", "precision": "sample_precision", "cover
 
 
 def training_settings(model, config=None):
-    """Preserve the original three-model plan and HelixSet's own YAML defaults."""
+    """Preserve the original three-model plan; newer models use YAML defaults."""
     config = config or yaml.safe_load((PROJECT/f"configs/{model}.yaml").read_text(encoding="utf-8"))
     settings = config["train"]
-    return {"batch_size": settings["batch_size"] if model == "helixset" else 64,
+    return {"batch_size": settings["batch_size"] if model in ("helixset", "theraset") else 64,
             "precision": settings.get("precision", "fp32"),
             "accumulation_steps": settings.get("accumulation_steps", 1),
             "metric_suite": settings.get("metric_suite", "task_specific"),
@@ -36,7 +36,7 @@ def training_settings(model, config=None):
 def run_family(model, task, seed):
     settings = training_settings(model)
     tag = f"{settings['precision']}_b{settings['batch_size']}"
-    if model == "helixset":
+    if model in ("helixset", "theraset"):
         tag += f"_a{settings['accumulation_steps']}_ema_{settings['metric_suite']}"
     return f"{model}_{task}_esm650m_seed{seed}_rtx5070_{tag}"
 
@@ -140,9 +140,9 @@ def compatibility_issues(metadata, result, directory, identity=None):
             issues.append("diagnostic/augmented training is not the original-row formal protocol")
         if metadata.get("cohort") not in (None, "original_resolved_backbone"):
             issues.append("training cohort differs")
-    elif identity["model"] == "helixset":
+    elif identity["model"] in ("helixset", "theraset"):
         if not directory.name.startswith(run_family(identity["model"], identity["task"], identity["seed"])):
-            issues.append("results-only directory does not identify the HelixSet training settings")
+            issues.append("results-only directory does not identify the model's training settings")
     elif "esm650m" not in directory.name or "fp32_b64" not in directory.name:
         issues.append("results-only directory does not identify ESM-650M / FP32 / batch 64")
     return issues
@@ -158,7 +158,7 @@ def discover_runs(root):
         result = json.loads(result_path.read_text(encoding="utf-8")) if result_path.exists() else None
         identity = result or metadata
         if identity is None:
-            match = re.match(r"^(trirelay|geofactor|protoroute|helixset)_(major15|fine39)_esm650m_seed(\d+)_", directory.name)
+            match = re.match(r"^(trirelay|geofactor|protoroute|helixset|theraset)_(major15|fine39)_esm650m_seed(\d+)_", directory.name)
             if not match:
                 continue
             identity = {"model": match[1], "task": match[2], "seed": int(match[3])}

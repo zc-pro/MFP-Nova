@@ -1,10 +1,10 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('all', 'trirelay', 'geofactor', 'protoroute', 'helixset')][string]$Model = 'all',
+    [ValidateSet('all', 'trirelay', 'geofactor', 'protoroute', 'helixset', 'theraset')][string]$Model = 'all',
     [ValidateSet('all', 'major15', 'fine39')][string]$Task = 'all',
     [string]$Seeds = '42,101,202,303,404',
     [string]$Device = 'cuda:0',
-    [ValidateRange(1, 40)][int]$MaxRuns = 1,
+    [ValidateRange(1, 50)][int]$MaxRuns = 1,
     [switch]$All,
     [switch]$DryRun,
     [string]$Python = 'python'

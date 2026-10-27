@@ -23,6 +23,9 @@ from .metric_protocol import protocol_description, primary_metrics, selection, f
 
 
 def make_model(name, arguments):
+    if name == "theraset":
+        from .models.theraset import TheraSet
+        return TheraSet(**arguments)
     if name == "helixset":
         from .models.helixset import HelixSet
         return HelixSet(**arguments)
@@ -132,8 +135,8 @@ def validate_cache(dataset, config, reference=None):
     if (peptide is None) != (settings is None):
         raise ValueError("Peptide encoder configuration and cache must be supplied together")
     if peptide is not None:
-        if config["model_name"] != "helixset":
-            raise ValueError("Dual frozen encoders are supported by HelixSet")
+        if config["model_name"] not in ("helixset", "theraset"):
+            raise ValueError("Dual frozen encoders are supported by HelixSet and TheraSet")
         if peptide["name"] != settings["name"] or peptide["max_length"] != settings["max_length"]:
             raise ValueError("Configured peptide encoder differs from cache")
         if settings["revision"] not in (peptide["requested_revision"], peptide["resolved_revision"]):
@@ -273,8 +276,8 @@ def train(config, name, resume=None):
     if not math.isfinite(rdrop) or rdrop < 0:
         raise ValueError("R-Drop weight must be finite and nonnegative")
     if rdrop:
-        if config["model_name"] != "helixset":
-            raise ValueError("R-Drop currently supports HelixSet")
+        if config["model_name"] not in ("helixset", "theraset"):
+            raise ValueError("R-Drop currently supports HelixSet and TheraSet")
         if settings.get("rdrop_start_epoch", 6) < 1 or settings.get("rdrop_ramp_epochs", 5) < 1:
             raise ValueError("R-Drop start epoch and ramp length must be positive")
     protocol = protocol_description(suite, settings.get("threshold_strategy", "global"))

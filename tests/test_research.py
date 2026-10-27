@@ -42,7 +42,7 @@ def sample_statistics(n):
     return label_statistics(y, np.arange(450), [f"label{i}" for i in range(n)], min_support=1)
 
 
-@pytest.mark.parametrize("name", ["trirelay", "geofactor", "protoroute", "helixset"])
+@pytest.mark.parametrize("name", ["trirelay", "geofactor", "protoroute", "helixset", "theraset"])
 @pytest.mark.parametrize("labels", [15, 39])
 def test_complete_model_masks_gradients(name, labels):
     stats = sample_statistics(labels)
@@ -178,7 +178,7 @@ def peptide_cache_fixture(features):
     return peptide
 
 
-@pytest.mark.parametrize("name", ["trirelay", "geofactor", "protoroute", "helixset"])
+@pytest.mark.parametrize("name", ["trirelay", "geofactor", "protoroute", "helixset", "theraset"])
 def test_research_training_resume_inference(tmp_path, name, monkeypatch):
     import json
     from mfp_nova import research
@@ -191,11 +191,16 @@ def test_research_training_resume_inference(tmp_path, name, monkeypatch):
               "loss": {"mask_ratio": .5, "modality_dropout": .2},
               "train": {"device": "cpu", "seed": 42, "epochs": 1, "batch_size": 2, "learning_rate": .001,
                         "weight_decay": 0, "patience": 0, "warmup_epochs": 0, "num_workers": 0, "output": str(tmp_path)}}
-    if name == "helixset":
+    if name in ("helixset", "theraset"):
         config["data"]["peptide_features"] = str(peptide_cache_fixture(features))
         config["peptide_encoder"] = {"name": "peptide_fixture", "revision": "main", "max_length": 80}
+    if name == "helixset":
         config["model"].update(sequence_depth=1, property_depth=1, geometry_depth=1,
                                pair_depth=1, pair_dim=8, latent_depth=1, decoder_depth=1)
+    if name == "theraset":
+        config["model"].update(cnn_channels=8, pair_dim=8, decoder_depth=1)
+        config["loss"].update(rdrop=.1)
+        config["train"].update(ema_decay=.9, ema_start_epoch=1, rdrop_start_epoch=1, rdrop_ramp_epochs=1)
     result = research.train(config, "first")
     assert result["epochs_completed"] == 1
     checkpoint = tmp_path/"first/best.pt"
@@ -204,7 +209,7 @@ def test_research_training_resume_inference(tmp_path, name, monkeypatch):
     source = MultimodalData(root, "major15", torch.load(checkpoint, weights_only=True)["statistics"])
     data = MultimodalPeptides(source, features, "val", peptide_feature_root=config["data"].get("peptide_features"))
     batch = collate_multimodal([data[0], data[1]])
-    if name == "helixset":
+    if name in ("helixset", "theraset"):
         torch.testing.assert_close(batch["esm_peptide"], batch["esm"][..., :6])
         saved = torch.load(checkpoint, weights_only=True)
         assert saved["model_args"]["peptide_input_dim"] == 6
@@ -222,7 +227,7 @@ def test_research_training_resume_inference(tmp_path, name, monkeypatch):
            "angles_degrees": np.stack([source.struct[k][indices] for k in ("phi_degrees", "psi_degrees", "omega_degrees")], -1),
            "chemical_tokens": np.array([source.chemical[i] for i in indices]), "residue_chem_tokens": np.array([source.residue_chemical[i] for i in indices])}
     from mfp_nova.multimodal import prepare_inputs
-    if name == "helixset":
+    if name in ("helixset", "theraset"):
         raw["esm_peptide"] = batch["esm_peptide"].numpy()
     prepared = prepare_inputs(raw, source.statistics)
     # Fixture edges intentionally only contain backbone edges; compare numeric preprocessing.

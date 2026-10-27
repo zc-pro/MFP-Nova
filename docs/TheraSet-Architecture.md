@@ -1,0 +1,413 @@
+# 第五个模型 TheraSet：以 TheraPep-AI 为基线的标签条件多原型证据修正网络
+
+日期：2026-10-28。实现：[theraset.py](../src/mfp_nova/models/theraset.py)，配置：[theraset.yaml](../configs/theraset.yaml)。
+
+**设计结论：保留 TheraPep-AI 的两级多尺度 CNN 和直接分类路径；把 HelixSet 的细粒度证据读取改造成围绕 CNN 的轻量残差解码器。每个功能标签通过若干共享原型查询选择不同尺度、不同来源及不同残基对证据，最后对 CNN 的预测作可学习修正。**
+
+TheraSet 是第五个独立研究模型，不替换 HelixSet。当前已实现架构、训练、恢复、评价、推理和消融入口，完成必要的正确性检查及真实输入小批量训练检查；尚无完整训练后的性能结论。本文的“提升”“缓解”等均指设计目标，不能解释为已超过基线。
+
+## 1. 基线定义与设计依据
+
+### 1.1 从 TheraPep-AI 继承什么
+
+作者的核心分类器是固定残基编码、两级并行多尺度卷积、全局最大池化和 MLP。它提供了适合短肽的局部模式归纳偏置，也提示我们：增加更多深层交互并不自动提高性能。这里保留以下基础：
+
+- 20 维 one-hot 与 14 维固定残基属性，总计 34 维，投影到 64 维。
+- 两级并行卷积，每级使用 3/5/7/9 四个核，默认每分支 128 通道。
+- 第二级特征全局最大池化后拼接为 512 维，直接分类 MLP 为 512→1024→512→C。
+- C 为本项目 major15 的 15 或 fine39 的 39；两个任务分别训练。
+
+14 项属性为电荷、疏水性、极性、芳香性、氢键供体/受体、体积、G/P/C 标志、大小类别及螺旋/折叠/转角倾向。数值表与归一化口径参照作者公开数据定义，按本项目 `ACDEFGHIKLMNPQRSTVWY` 顺序排列；padding 行为全零。它们是残基查表信息，不是该肽的实测结构。
+
+### 1.2 必须区分的三个比较对象
+
+| 对象 | 内容 | 能回答的问题 |
+|---|---|---|
+| 原论文 TheraPep-AI | 作者 49 维目标、固定长度处理、合成背景、五成员集成及其训练策略 | 作者设定下的文献结果；不能与本项目数字直接排序 |
+| 本地适配 CNN 对照 | 本实现关闭 `evidence_decoder` 和 `chemical_evidence`；保留 34 维编码与两级 CNN，使用本项目划分、目标和损失 | 在相同数据协议下，新增证据模块是否有效 |
+| TheraSet | CNN 直接预测＋标签条件多原型证据修正 | 新架构整体效果以及各新增机制的贡献 |
+
+本地 CNN 对照**不是原论文严格复现**。适配差异包括：逐位置 LayerNorm 替代 BatchNorm、GELU 替代 ReLU、按真实长度 mask、零填充卷积、不截为 50 位、不随机循环放置、采用项目弱负项 ASL 和可选 R-Drop/EMA。保留全部有效残基，避免把普通线性肽的两端人为视为相邻。原论文严格复现应另用作者代码，在统一队列上明确映射标签和训练条件；本次不把它冒充成已经完成的结果。
+
+本地 CNN 对照与完整模型均可使用相同训练正则以比较架构。若还要比较原论文加权 BCE、五模型集成或合成负样本，必须分别作为独立实验因素。
+
+### 1.3 从四个现有模型中有选择地学习
+
+| 来源 | 保留的优点 | 在 TheraSet 中的具体落实 | 不照搬的部分及原因 |
+|---|---|---|---|
+| TriRelay | 各模态保留自己的证据路径，标签决定读取内容 | CNN、PLM、理化、结构、pair 分别读取，再按标签和原型分配权重 | 不复制双向多轮反馈和重建目标，减少混合前证据被覆盖及辅助任务竞争 |
+| GeoFactor | 单标签证据与标签集合关系分开建模 | 先读证据，再经 8 个样本条件的共享因子传递标签上下文 | 不直接注入固定训练共现图，不复制高阶标签组合枚举；降低频繁组合支配稀有组合的风险 |
+| ProtoRoute | 同一功能可能有多种模式，尾类需要共享统计力量 | 每标签 1–4 个有效查询，从共享原型库组合得到；容量仅由 Train 正例簇数决定 | 不复制四套完整专家网络，也不为每个尾类拟合大量独立原型向量 |
+| HelixSet | 双冻结表征、标签回读细粒度证据、显式 pair、质量与缺失处理 | 保留双 ESM 上下文、标签条件残基对读取、结构质量在归一化后缩放及 R-Drop | 不保留 6 层潜变量融合及 4 层三角传播，缩短 CNN→标签的证据路径 |
+
+GeoFactor 的启发在于“单标签与集合关系的分工”，这里不是对它原有概率因子推断的复现。TriRelay 的启发是保留独立路径，也不宣称这里获得了统计意义上的模态解耦。
+
+## 2. 总体架构
+
+```mermaid
+flowchart TD
+    AA[34维固定残基编码] --> CNN[两级3/5/7/9 CNN]
+    CHEM[D构型与化学注记] --> CNN
+    CNN --> MAX[各尺度masked max pooling]
+    MAX --> BASE[CNN直接logits]
+    CNN --> MAPS[四个尺度的位置特征]
+    ESM[冻结ESM650M与短肽ESM150M缓存] --> CTX[256维上下文编码]
+    PHY[515维理化及可用性mask] --> PROP[25个属性Token]
+    STR[结构节点与距离及质量] --> GEO[独立结构记忆]
+    MAPS --> PAIR[端点乘积与序列间隔pair]
+    CTX --> PAIR
+    STR --> GPAIR[独立几何pair]
+    BANK[共享32原型库与标签查询] --> QUERY[每标签1至4个有效查询]
+    MAX --> QUERY
+    QUERY --> READ[两层证据解码]
+    MAPS --> READ
+    CTX --> READ
+    PROP --> READ
+    GEO --> READ
+    PAIR --> READ
+    GPAIR --> READ
+    READ --> FACTOR[按标签聚合后经8个因子交换信息]
+    FACTOR --> DELTA[原型分数归一化聚合]
+    DELTA --> RES[标签条件残差修正]
+    BASE --> RES
+    RES --> OUT[15或39个独立Sigmoid概率]
+```
+
+图中为两层相同解码结构的概括，每一层均包含证据读取和因子交换。CNN 的直接头始终存在；结构与理化可缺失。没有额外全局“治疗/非治疗”分类头，因为当前真实队列不提供可支撑该目标的可信阴性标签。
+
+## 3. 输入、尺度与直接路径
+
+设 batch 为 B，批内最大长度为 L，标签数为 C，解码宽度 d=256，pair 宽度 r=32，原型上限 K=4。
+
+| 模块 | 张量或配置 | 作用 |
+|---|---|---|
+| 固定编码 | B×L×34 → B×L×64 | 将已知残基属性显式送入 CNN |
+| 化学注记 | D 嵌入、残基注记、全局化学注记均为 64 维 | 与 CNN 输入相加，保留骨架字母外的信息 |
+| CNN 一级 | 4 个 B×L×128，拼接 B×L×512 | 检测不同长度局部模式 |
+| CNN 二级 | 4 个 B×L×128 | 在一级混合特征上组合局部模式 |
+| 直接头 | B×512 → B×C | 保留短路径预测，提供独立辅助监督 |
+| 尺度记忆 | 二级四路各投影为 B×L×256 | 保留位置，不把全部证据提前压缩为一个向量 |
+| 上下文记忆 | 双 ESM 1280＋640 → 256，1 层 Transformer | 补充进化与短肽上下文信息；另含全局化学 Token |
+| 理化记忆 | 515 维分为既有 25 组，1 层 Transformer | 对属性数值及缺失 mask 分组编码 |
+| 结构记忆 | 16 维节点特征＋DSSP；另含 25 项全局结构值及 mask | 保存独立结构证据，不直接改写干净的 CNN 路径 |
+| 原型库 | 32×256，标签系数 C×4×32 | 共享查询基底，尾类也能使用共享模式 |
+| pair 状态 | 学习 pair 与几何 pair 各 B×L×L×32 | 保留关系内容供标签读取 |
+| 解码 | 2 层，8 头注意力，8 个关系因子 | 按功能读取证据，并建模样本条件的标签上下文 |
+
+第二级核为 k 的分支已经接收一级所有核，其最大理论感受野为 `9+k−1`，即 11/13/15/17；不能将它们误称为只看到 3/5/7/9 个原始残基。L 更短时只使用有效残基。卷积之间清除 padding 位置，最大池化排除 padding，LayerNorm 仅沿通道归一化，因此预测不依赖同批其他肽的补齐长度。
+
+上下文支路复用项目 `SequenceEncoder(depth=0)` 的输入投影、位置和化学编码，再加入一层 Transformer；没有在它内部再堆三层多尺度卷积。双 ESM 冻结，正式训练读取现有缓存。
+
+## 4. 三项核心研究设计
+
+### 4.1 原型条件的多尺度证据读取
+
+每标签的有效查询数由训练集中独立正例簇数决定，沿用现有统计：
+
+\[
+K_c=\min(4,\max(1,\lfloor n_c^{cluster}/100\rfloor)).
+\]
+
+阈值 100 是当前项目的容量启发式，不代表经过证明的生物学分组；可以在 Validation 上检验固定单原型与自适应容量的差别。
+
+共享库为 \(P\in\mathbb{R}^{32\times d}\)，标签原型系数为 \(a_{ck}\)：
+
+\[
+q_{ck}^{0}=e_c+\operatorname{softmax}(a_{ck})P+W_g h_{CNN}.
+\]
+
+查询先分别读取四个尺度的 CNN 位置记忆，再从查询与各尺度证据计算 softmax 权重：
+
+\[
+m_{cks}=\operatorname{Attn}(q_{ck},H_s),\quad
+\alpha_{cks}=\operatorname{softmax}_s f_s([q_{ck},m_{cks}]),\quad
+m_{ck}=\sum_s\alpha_{cks}m_{cks}.
+\]
+
+这使同一个标签的不同模式可以选择不同的局部尺度；每个尺度先单独读取，避免把尺度差异仅交给一次全局最大池化。32 个库向量是可学习的共享查询基底，**不是从真实阳性样本聚类得到的肽原型**，不能将某个向量直接解释为已确认的功能基序。
+
+### 4.2 由端点、学习关系和可靠几何共同支持的 pair 读取
+
+先从四尺度平均与 PLM 上下文生成残基表示 \(R_i\)。学习关系采用端点乘积与有符号间隔：
+
+\[
+Z_{ij}=\operatorname{LN}[(W_lR_i)\odot(W_rR_j)+W_\delta(\delta_{ij},|\delta_{ij}|)].
+\]
+
+几何关系 \(G_{ij}\) 单独编码 16 个距离 RBF、3 类边类型、可用性、置信度已知标记和置信度乘积，共 22 维输入。距离中心覆盖 0–30 Å，超过该范围的分辨率会下降；这比 HelixSet 的多范围距离编码更简洁，也可能损失长肽远距离信息，需看长度分组结果后决定是否扩展。
+
+对有效非自身残基对，复用 HelixSet 的标签条件读取形式：
+
+\[
+s_{ckij}=\frac{(W_q^lq_{ck})^TW_k^lR_i+(W_q^rq_{ck})^TW_k^rR_j
+ +(W_q^pq_{ck})^T\widetilde Z_{ij}}{\sqrt{3r}},
+\]
+
+\[
+\widetilde Z_{ij}=\operatorname{LN}(Z_{ij})+
+ \rho_i\rho_j\tanh(\operatorname{LN}(G_{ij})).
+\]
+
+权重在有效 \(i\ne j\) 对上归一化。通过边际权重读取左右端点，并读取窄 pair 状态，再投影回 d 维；不展开 B×C×K×L×L×d 的宽值张量。
+
+这里的因子化指端点低维乘积构造，不表示整个 pair 张量在 LayerNorm 后严格满足某个矩阵秩约束。它保留显式 pair 的可读性，省去三角传播的立方长度成本；也放弃了 HelixSet 经第三残基更新关系的能力。是否足够，必须与 HelixSet 和关闭 pair 的消融比较。
+
+### 4.3 保留 CNN 决策的证据残差与标签因子上下文
+
+每个查询独立读取五路：CNN 尺度证据、PLM 上下文、理化、结构、pair。各路无仿射 LayerNorm 后按查询与证据评分，在可用来源间归一化；缺失来源权重严格为零。结构质量在归一化后再次绝对缩放。
+
+已知质量使用预处理后的置信度 \(\rho_i\in[0,1]\)，未知置信度在结构存在时取中性值 1，缺失结构为 0。未知不是“证实可靠”，只是当前不额外降权。已知质量全零时，结构读取和几何 pair 均不贡献预测；与 HelixSet 的 0.3 质量下限不同，这是明确可检验的取舍。
+
+每层读完证据后，先按标签平均有效原型状态，形成 C 个状态，再让 8 个共享因子读取这些状态并写回查询。这样标签原型更多不会仅因 token 数量更多而占据更多关系注意力。因子从当前样本证据生成，没有固定共现图，也没有真实标签作为推理输入。它能表达集合依赖，但仍可能学到训练集频率偏差，不能声称已解决标签共现捷径。
+
+各原型输出分数 \(u_{ck}\)，通过归一化 log-mean-exp 聚合：
+
+\[
+\Delta_c=\log\sum_{k\in A_c}\exp(u_{ck})-\log K_c.
+\]
+
+减去 \(\log K_c\) 防止仅增加相同原型就抬高 logit；尾类的少原型不是人为减分。原型 softmax 权重还用于聚合标签状态 \(\bar q_c\)，生成修正门：
+
+\[
+g_c=\sigma(W_{gate}[\bar q_c,W_gh_{CNN}]+b),\qquad
+z_c=z_c^{CNN}+g_c\Delta_c.
+\]
+
+门控权重初始化为零、偏置为 −2，初值约 0.119，使初始训练更接近 CNN 路径；门是神经网络的一部分。这里不是性能保障：修正量仍可有益或有害，门也可在训练后变大。CNN 辅助头持续受监督，避免直接路径只剩形式上的连接。
+
+## 5. 创新定位与不能过度宣称的部分
+
+建议研究主线表述：**针对短肽多标签注释，在多尺度 CNN 直接预测之上，通过共享多原型查询联合选择尺度、证据来源和残基对关系，并用样本条件因子与标签残差形成证据驱动的集合预测。**
+
+创新假设主要落在连接方式与任务适配，而非发明 CNN、注意力、原型、因子或残差：
+
+1. 从“全局池化后丢失位置”转为“直接预测与可回读尺度记忆并存”，检验短路径是否更适合短肽。
+2. 同一组标签原型共同决定尺度选择、模态读取和 pair 读取，检验同标签的异质模式是否被更好表达。
+3. 将质量感知证据和按标签平衡的关系因子用于修正直接预测，检验是否能以更少下游参数保留 HelixSet 的关键收益。
+
+已核对的相关先例包括 Query2Label 的标签查询读取、C-Tran 的标签依赖建模、TPpred-LE 的治疗肽标签嵌入和多标签多原型查询工作。因此不能把“标签查询”“多原型注意力”单独作为首次创新，也不能仅凭对 TheraPep-AI 的差异宣称世界首次。完整领域新颖性仍需更系统的检索和实验支撑。
+
+## 6. 训练目标与科研协议
+
+使用项目现有 `observed_label_loss`：已标注正例接受正类监督，0 仍为未标注，以默认 0.3 权重进入弱负项；fine39 的 `__unknown` 对相关亚类继续使用既有弱监督处理。这不等同于严格的无偏 PU 风险估计，也不消除漏标偏差。
+
+\[
+\mathcal L=\mathcal L_{ASL}(z,y)
++\lambda_d\mathcal L_{ASL}(z^{CNN},y)
++\lambda_e\mathcal L_{ASL}(b^{prior}+\Delta,y)
++\lambda_r\mathcal L_{RDrop}.
+\]
+
+- `direct=0.2`：直接路径监督；`evidence=0.1`：证据头监督，防止修正分支完全依赖直接头。
+- 二者沿用 5 epoch 辅助损失预热。先验偏置来自 Train 的观测注释频率，不当作真实功能比例。
+- `rdrop=0.1`：第 6 epoch 开始，5 epoch 升至全权重。两次前向共享同一次模态 dropout 视图，普通网络 dropout 独立；全部监督项取两路平均，再加最终多标签 Bernoulli 对称 KL。
+- `modality_dropout=0.1`，随机移除理化或结构输入；原始数据增强关闭。
+- AdamW，学习率 2e−4，weight decay 0.01，最大 100 epoch，warmup 5，patience 15，梯度裁剪 5；沿用项目调度实现。
+- batch16×累积4，即每更新 64 条不同样本。R-Drop 是同一批样本的两次随机前向，不算 128 条独立样本。
+- EMA0.999 从第 6 epoch 更新；推理单次前向，EMA 不是五独立模型集成。
+- 默认 `traditional5`：Validation 的拟合阈值 Jaccard 选模、完全匹配用于同分比较；同一 Validation 选择最终阈值。另存 AP 候选，但不能在看 Test 后更换主报告候选。
+
+沿用修复簇划分、原样本、row_id/ID 对齐和监督范围，不改 `data/`。Test 不参与开发、损失调参、先验拟合或阈值选择。不加入全零合成阴性：当前任务首先是功能注释，统计生成的序列不能自动当作已证实无活性，背景拒识应另立实验。
+
+## 7. 参数、成本与预期风险
+
+当前真实 Train 化学词表下的可训练参数：
+
+| 任务 | 词表大小（含保留项） | TheraSet 下游参数 |
+|---|---:|---:|
+| major15 | 664 | 10,376,854 |
+| fine39 | 663 | 10,404,206 |
+
+与项目现有 major15 HelixSet 约 71.72M 下游参数相比，TheraSet 约减少 85.5%。两者另有约 800M 冻结 ESM 参数；新序列编码、缓存空间及完整系统成本均不能省略。少参数不自动等于同等比例的速度或显存改善。
+
+学习 pair 的存储为 O(BL²r)，原型条件读取的分数/注意力开销为 O(BCKL²)，计算包含 O(BCKL²r)。上下文自注意力仍有 O(BL²d) 开销。去掉了三角更新的 O(BL³r) 主项，但四原型查询增加了解码读取成本；fine39、L 接近 80 时仍需在实际 GPU 上测量。
+
+| 可能的不足 | 需要观察的证据 | 已有可执行比较 |
+|---|---|---|
+| 少了三角传播，复杂关系表达不足 | 结构可用组、长肽组表现 | HelixSet vs TheraSet；pair 开关 |
+| 原型学成相同模式 | 有效原型权重与各标签改善是否稳定 | `prototype_readout=false`，不先加新的正则损失 |
+| 修正路径损害有效 CNN 预测 | CNN 对照、门值和修正方向 | 关闭 `evidence_decoder` |
+| 结构质量不准确或缺失模式偏移 | 结构缺失/已知质量分组 | 关闭 `structure_evidence` |
+| 标签关系依赖训练共现 | 稀有组合与多功能组表现 | 关闭 `label_context` |
+| 双 ESM 收益主要来自输入规模 | 参数、缓存与新序列推理成本 | 关闭 `contextual_evidence`；单 ESM 比较时同时移除配置中的 peptide 缓存及编码器 |
+| 原型门和注意力被过度解释 | 归因是否随真实扰动稳定 | 注意力仅作关注线索，不作为生物因果结论 |
+
+## 8. 消融与正式比较
+
+先在 major15/seed42 做开发阶段比较，依据 Validation 选择候选；确定方法后在 major15、fine39 使用 42/101/202/303/404 五个固定 seed。保持相同修复划分、标签集合、原样本、选模指标、阈值策略和训练预算。比较均报告单模型；集成另列，不能让五成员对单模型成为不注明的混杂因素。
+
+| 比较 | 当前入口 | 隔离的问题 |
+|---|---|---|
+| 适配 CNN 基础对照 | `--ablate evidence_decoder chemical_evidence` | 34 维编码＋两级 CNN 的基础性能 |
+| 带化学的 CNN | `--ablate evidence_decoder` | 化学注记的净增量 |
+| 完整 TheraSet | 默认配置 | 整体方案 |
+| 无 PLM 上下文 | `--ablate contextual_evidence` | 额外预训练表征贡献 |
+| 无理化 | `--ablate property_evidence` | 独立属性读取贡献 |
+| 无结构 | `--ablate structure_evidence` | 同时移除节点、全局结构、几何 pair 的贡献 |
+| 无 pair 读取 | `--ablate pair_readout` | 在其余输入不变时，直接关系读取贡献 |
+| 单原型查询 | `--ablate prototype_readout` | 将每标签有效查询数降至 1；共享库仍保留 |
+| 无标签因子 | `--ablate label_context` | 条件集合关系贡献 |
+| 无 R-Drop | `--rdrop-weight 0` | 训练一致性贡献 |
+
+这些是模型内的输入/路径消融，不等于完整正交实验矩阵。尤其完整模型比 CNN 多了预训练表征和多模态输入，整体差值不能全部归因于解码算法；至少补充无 PLM 与无理化/结构比较，再讨论算法贡献。采用同输入 CNN 池化分类头等进一步严格对照时，应明确它与当前 34 维 CNN 对照的不同。
+
+统一报告 Micro/Macro AP、Micro/Macro F1、传统五指标、尾类、长度、D 注记、结构可用性、多功能检测与独立功能预测，并给出训练耗时、峰值显存、参数量及新序列编码成本。各 seed 的均值/标准差与配对差值比单个最佳 seed 更有说服力。只有完成这些实验，才能判断是否“保持性能优秀”。
+
+## 9. 代码接口与运行
+
+新增模型由 `make_model("theraset", args)` 构建，沿用 `forward(batch)` 和 `compute_loss(batch, settings)`；checkpoint 保存相同训练框架所需的模型参数、配置与 Train 统计。默认前向返回最终 logits、CNN logits、证据 logits；`return_evidence=True` 额外返回修正门、修正量、原型权重、尺度权重、来源权重及按原型汇总后的标签 pair 注意力。
+
+`source_weights` 最后一维顺序为 **CNN 基序、PLM 上下文、理化、结构、pair**。无效原型的分数不进入预测；解释查询级权重时仍应使用 `model.active` 过滤无效原型。所有权重都不是经过校准的生物学证据强度。
+
+两平台首先激活各自已有的 `MFP-Nova` 环境，并进入项目根目录。正式命令需要 `features/esm2_650m/{train,val}` 与 `features/esm2_peptide_150m/{train,val}` 缓存。当前本机第二路缓存仍在已有 ZIP 内，本次检查只按 row_id 读取了所需小片段；正式训练前需将该缓存放到上述路径或传入正确的 `--peptide-feature-root`，不需要重新生成已有缓存。
+
+### RTX 5070 / Windows PowerShell
+
+以下命令在 RTX 5070 上的 PowerShell 窗口依次执行，默认 major15/fine39 各训练 seed42。项目路径和 Python 路径沿用该机器现有约定；若实际安装位置不同，只改这两处。先结束该目录中正在运行的训练，再同步源码。后续缓存提取、显存测试和正式训练均在前台运行。
+
+**代码同步与环境、缓存准备：**
+
+```powershell
+$ErrorActionPreference = 'Stop'
+Set-Location 'D:\Data\ChatGPT\mfp\MFP-Nova'
+git switch main
+if ($LASTEXITCODE -ne 0) { throw '分支切换失败。' }
+git pull --ff-only origin main
+if ($LASTEXITCODE -ne 0) { throw '代码同步失败，请查看 Git 输出。' }
+git log -1 --oneline
+$mfpPython = 'D:\App\Code\Anaconda\envs\MFP-Nova\python.exe'
+$env:PYTHONPATH = Join-Path $PWD.Path 'src'
+$env:CUDA_VISIBLE_DEVICES = '0'
+$env:OMP_NUM_THREADS = '4'
+$env:MKL_NUM_THREADS = '4'
+& $mfpPython -c "import torch; print('torch:', torch.__version__); print('CUDA:', torch.version.cuda); print('GPU:', torch.cuda.get_device_name(0))"
+if ($LASTEXITCODE -ne 0) { throw 'GPU 环境检查失败。' }
+
+# 已有 ZIP 且尚无解压目录时，直接复用；其他缺失缓存才进行提取。
+if ((Test-Path -LiteralPath 'esm2_peptide_150m.zip') -and
+    -not (Test-Path -LiteralPath 'features/esm2_peptide_150m')) {
+  Expand-Archive -LiteralPath 'esm2_peptide_150m.zip' -DestinationPath 'features'
+}
+foreach ($View in @('primary', 'peptide')) {
+  $FeatureRoot = if ($View -eq 'primary') { 'features/esm2_650m' } else { 'features/esm2_peptide_150m' }
+  foreach ($Split in @('train', 'val')) {
+    if (Test-Path -LiteralPath "$FeatureRoot/$Split/metadata.json") { continue }
+    & $mfpPython -u -m mfp_nova.cli features --config configs/theraset.yaml `
+      --encoder-view $View --splits $Split --device cuda:0 --batch-size 8
+    if ($LASTEXITCODE -ne 0) { throw "缓存提取失败：$View/$Split。中断缓存按日志用 --resume-from 续提。" }
+  }
+}
+New-Item -ItemType Directory -Path 'runs' -Force | Out-Null
+$SessionTag = Get-Date -Format 'yyyyMMdd_HHmmss'
+```
+
+**显存及完整训练链路测试：** 固定使用正式训练的 FP32/batch16，profile 中直接启用最大 R-Drop 权重 0.1；同时包含真实数据短训练、checkpoint 恢复和 Validation 前向。诊断会覆盖两任务；其小样本指标不能作为模型性能。
+
+```powershell
+$GpuCheckDir = Join-Path 'runs' "gpucheck_theraset_rtx5070_fp32_b16_$SessionTag"
+& $mfpPython -u -m mfp_nova.cli gpu-check --models theraset --tasks major15 fine39 `
+  --esm 650m --feature-root features/esm2_650m `
+  --peptide-feature-root features/esm2_peptide_150m --device cuda:0 `
+  --batch-sizes 16 --precisions fp32 --samples 128 --steps 16 --output $GpuCheckDir `
+  2>&1 | Tee-Object -FilePath "${GpuCheckDir}.log"
+if ($LASTEXITCODE -ne 0) { throw "GPU 检查异常，请查看 ${GpuCheckDir}.log 及 *_profile.json。" }
+foreach ($Task in @('major15', 'fine39')) {
+  $Profile = Get-Content -LiteralPath "$GpuCheckDir/theraset_${Task}_profile.json" -Raw | ConvertFrom-Json
+  Write-Host "任务：$Task"
+  $Profile.profile | Select-Object precision, batch_size, status, peak_allocated_mib, peak_reserved_mib, mean_step_seconds | Format-Table
+}
+```
+
+`peak_allocated_mib` 是 PyTorch 张量峰值，`peak_reserved_mib` 是分配器保留峰值；桌面、驱动和其他进程占用还需参考 `nvidia-smi`。诊断包含长序列样本，但仍不能保证所有正式批次具有完全相同峰值。如果 batch16 出现 OOM，重新使用新的输出目录，以 batch8 运行检查；随后正式训练也相应使用 batch8×累积8，保持有效 batch64。
+
+**正式训练：** 使用完整原样本 Train/Val，依次训练两个任务，不传 `--limit-samples` 或 `--max-steps`。两任务各自使用独立运行目录、Validation 选模和阈值；本次开发阶段不调用 Test。
+
+```powershell
+$Revision = git rev-parse --short HEAD
+$TrainRuns = @()
+foreach ($Task in @('major15', 'fine39')) {
+  $RunName = "theraset_${Task}_seed42_rtx5070_${Revision}_fp32_b16_a4_$SessionTag"
+  $RunDir = Join-Path 'runs' $RunName
+  Write-Host "本次正式实验：$RunDir"
+  & $mfpPython -u -m mfp_nova.cli train --model theraset --config configs/theraset.yaml `
+    --task $Task --seed 42 --device cuda:0 --precision fp32 `
+    --feature-root features/esm2_650m --peptide-feature-root features/esm2_peptide_150m `
+    --batch-size 16 --accumulation-steps 4 --num-workers 0 `
+    --rdrop-weight 0.1 --ema-decay 0.999 --ema-start-epoch 6 `
+    --metric-suite traditional5 --threshold-strategy global --epochs 100 --name $RunName `
+    2>&1 | Tee-Object -FilePath "${RunDir}.log"
+  if ($LASTEXITCODE -ne 0) { throw "$Task 训练异常退出，请查看 ${RunDir}.log。" }
+  $TrainRuns += $RunDir
+  $Result = Get-Content -LiteralPath "$RunDir/results.json" -Raw | ConvertFrom-Json
+  $Result | Select-Object model, task, seed, best_epoch, epochs_completed, trainable_parameters, weight_source, peak_cuda_memory_bytes | Format-List
+}
+```
+
+正式多 seed 比较在方法确定后，将相同两任务分别使用 42/101/202/303/404；不要把两个 seed42 运行当作完整多 seed 结果。训练中断后使用原目录 `last.pt` 和新的 `--name` 恢复，避免重建或覆盖已有运行。
+
+**打包交回分析：** 在同一窗口执行，保留 GPU 诊断、两个正式运行和外部日志的目录层级，只收集 JSON/JSONL/NPZ/LOG，并附本模型配置与架构文档。checkpoint 和 ESM 缓存留在训练机器。若已重开窗口，先把 `$GpuCheckDir` 和 `$TrainRuns` 恢复成实际目录名。
+
+```powershell
+$ZipPath = Join-Path ([Environment]::GetFolderPath('Desktop')) "theraset_seed42_rtx5070_results_$SessionTag.zip"
+@'
+import sys
+from pathlib import Path
+from zipfile import ZipFile, ZIP_DEFLATED
+
+archive, *directories = sys.argv[1:]
+project = Path.cwd()
+with ZipFile(archive, 'x', ZIP_DEFLATED) as package:
+    for directory in directories:
+        root = Path(directory)
+        for path in sorted(root.rglob('*')):
+            if path.is_file() and path.suffix.lower() in {'.json', '.jsonl', '.npz', '.log'}:
+                package.write(path, path.relative_to(project) if path.is_absolute() else path)
+        log = Path(str(root) + '.log')
+        if log.is_file():
+            package.write(log, log.relative_to(project) if log.is_absolute() else log)
+    for path in (Path('configs/theraset.yaml'), Path('docs/TheraSet-Architecture.md')):
+        package.write(path, path)
+print(Path(archive).resolve())
+'@ | & $mfpPython - $ZipPath $GpuCheckDir @TrainRuns
+if ($LASTEXITCODE -ne 0) { throw '结果打包失败。' }
+Write-Host "请传回此结果包：$ZipPath"
+```
+
+### V100 / Ubuntu Bash
+
+```bash
+conda activate MFP-Nova
+GPU=0                 # 选择已获授权使用的 GPU
+CPU_THREADS=8
+TASK=major15          # fine39 使用相同模型、seed 和评价协议
+RUN="theraset_${TASK}_seed42_$(date +%Y%m%d_%H%M%S)"
+mkdir -p runs
+nohup env CUDA_VISIBLE_DEVICES="$GPU" OMP_NUM_THREADS="$CPU_THREADS" MKL_NUM_THREADS="$CPU_THREADS" \
+  python -u -m mfp_nova.cli train --model theraset --task "$TASK" --seed 42 \
+  --device cuda:0 --precision fp32 --batch-size 16 --accumulation-steps 4 \
+  --name "$RUN" > "runs/${RUN}.log" 2>&1 < /dev/null &
+```
+
+两个默认命令使用相同 FP32 和有效 batch，先确保算法比较一致。V100 通过 `CUDA_VISIBLE_DEVICES` 指定物理 GPU 后，进程内部为 `cuda:0`，`nohup` 支持断开 SSH 后继续运行。如果显存不足，可同时把物理 batch 改成 8、累积改成 8，保持每更新 64 条样本，并记录执行设置。GPU 混合精度效率和数值表现仍待设备实测，当前不预先把任一 GPU 的结果写成已验证。
+
+适配 CNN 对照在上述两平台命令上都追加 `--ablate evidence_decoder chemical_evidence`，并使用新的运行名；其他比较同表格追加参数。保留相同 R-Drop/EMA 可隔离架构变化。共享数据加载器仍会加载配置中的 ESM 缓存，即使 CNN 对照不使用它们，因此这条路径的端到端 I/O 耗时不能冒充精简版原始 CNN 的成本。
+
+多 Seed 入口及 PowerShell 批量脚本已接入 TheraSet，`all` 现在为五模型×两任务×五 seed，共 50 组；这只是可执行计划，本次没有启动完整批量实验。
+
+## 10. 本次验证与结论边界
+
+本地环境为 CPU / PyTorch 2.8.0+cpu。新模型与受影响的相关测试累计 71 项通过，覆盖 15/39 输出、双缓存对齐与两路投影梯度、主要模块梯度、padding 与补齐长度不变性、缺失属性/结构屏蔽、刚体变换不变性、质量全零、单残基无 pair、重复原型无数量奖励、CNN 对照、短优化、checkpoint 保存恢复、EMA/R-Drop 训练与两类推理入口；CPU BF16 检查不能代替 CUDA FP16/BF16 验证。
+
+真实输入检查读取当前原始 Train/Val 数据和两路真实 ESM 缓存，未改写输入包、未读 Test。major15 与 fine39 各取 Train row_id 0/1 做两步 CPU 优化，Val row_id 6/27 检查前向：输出分别为 2×15、2×39，loss、梯度及输出均有限。这里只确认真实输入可运行，不估计模型性能；样本极少、重复训练同一批，也不能据 loss 下降报告泛化收益。
+
+正式五 seed 性能、与作者模型同协议重训比较、RTX 5070/V100 的显存与速度尚待实验。当前交付的是完整可训练的第五模型及可检验的创新假设，不承诺在没有实验时已经优于 TheraPep-AI 或 HelixSet。
+
+## 参考与溯源
+
+- TheraPep-AI：[作者仓库](https://github.com/terra-quantum-public/tq-therapep-ai)、[模型定义](https://github.com/terra-quantum-public/tq-therapep-ai/blob/main/src/therapep_ai/model.py)、[残基数值属性定义](https://github.com/terra-quantum-public/tq-therapep-ai/blob/main/src/therapep_ai/data.py)；2026-10-28 核对。本文代码独立实现，未导入作者训练框架或权重。
+- [本项目论文全文解读](therapep-ai-paper-report.md)及[与 HelixSet 的详细比较](therapep-ai-helixset-architecture-comparison.md)：用于理解同源数据、负样本及协议差异。
+- [Query2Label](https://arxiv.org/abs/2107.10834)：标签查询从特征图读取类别相关信息的先例。
+- [C-Tran](https://openaccess.thecvf.com/content/CVPR2021/html/Lanchantin_General_Multi-Label_Image_Classification_With_Transformers_CVPR_2021_paper.html)：特征与标签依赖的 Transformer 建模先例。
+- [TPpred-LE](https://doi.org/10.1186/s12915-023-01740-w)：治疗肽功能预测与标签嵌入研究。
+- [MuP-VSS，CVPR 2025](https://openaccess.thecvf.com/content/CVPR2025/papers/Duan_Multi-Label_Prototype_Visual_Spatial_Search_for_Weakly_Supervised_Semantic_Segmentation_CVPR_2025_paper.pdf)：其他领域的多标签多原型查询先例，不作为治疗肽性能证据。
+- 项目内部实现：[TriRelay](../src/mfp_nova/models/trirelay.py)、[GeoFactor](../src/mfp_nova/models/geofactor.py)、[ProtoRoute](../src/mfp_nova/models/protoroute.py)、[HelixSet](../src/mfp_nova/models/helixset.py)。

@@ -53,7 +53,10 @@ PROBES = {
     "helixset": ["sequence.plm.weight", "geometry_blocks.0.read.attention.in_proj_weight",
                  "pair_geometry.weight", "pair_blocks.0.left.weight", "pair_blocks.0.triangle_left.weight",
                  "pair_blocks.0.geometry_left.weight",
-                 "latent_blocks.0.combine.0.weight", "decoder.0.pair_read.queries.weight", "label_weights"]}
+                 "latent_blocks.0.combine.0.weight", "decoder.0.pair_read.queries.weight", "label_weights"],
+    "theraset": ["cnn.convs1.0.weight", "sequence.plm.weight", "pairs.left.weight",
+                 "pairs.geometry.weight", "prototype_bank", "decoder.0.pair.queries.weight",
+                 "decoder.0.factor_read.attention.in_proj_weight", "label_weights"]}
 
 
 @torch.inference_mode()
@@ -206,7 +209,7 @@ def run(models, tasks, feature_root, device, output, esm="650m", batches=(2, 4, 
         for task in tasks:
             config = yaml.safe_load(Path(f"configs/{name}.yaml").read_text(encoding="utf-8"))
             config["data"].update(root=str(data_root), track=task, features=str(feature_root))
-            if peptide_feature_root is not None and name == "helixset":
+            if peptide_feature_root is not None and name in ("helixset", "theraset"):
                 config["data"]["peptide_features"] = str(peptide_feature_root)
             config["encoder"]["name"] = "facebook/esm2_t33_650M_UR50D" if esm=="650m" else "facebook/esm2_t12_35M_UR50D"
             source = MultimodalData(config["data"]["root"], task)

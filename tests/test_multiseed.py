@@ -138,12 +138,12 @@ def finished_run(root, model='trirelay', task='major15', seed=42, macro_ap=.4, m
     return path
 
 
-def test_fixed_plan_reuses_four_model_results_and_identifies_live_resume(tmp_path):
+def test_fixed_plan_reuses_five_model_results_and_identifies_live_resume(tmp_path):
     for model in experiments.MODELS:
         for task in experiments.TASKS:
             finished_run(tmp_path, model, task)
     plan = experiments.make_plan(tmp_path, running={})
-    assert plan['total'] == 40 and plan['counts']['completed'] == 8 and plan['counts']['not_started'] == 32
+    assert plan['total'] == 50 and plan['counts']['completed'] == 10 and plan['counts']['not_started'] == 40
     job = next(j for j in plan['jobs'] if j['seed']==101)
     interrupted = tmp_path/job['run_name']; interrupted.mkdir()
     (interrupted/'last.pt').write_bytes(b'not loaded by planner')
@@ -258,7 +258,7 @@ exit CODE
 
 @pytest.mark.parametrize('shell', ['powershell', 'pwsh'])
 @pytest.mark.parametrize('arguments,expected', [(['-DryRun'], 0), ([], 1), (['-MaxRuns', '3'], 3),
-                                               (['-All'], 32), (['-All', '-MaxRuns', '1'], -1)])
+                                               (['-All'], 40), (['-All', '-MaxRuns', '1'], -1)])
 def test_powershell_limits_with_fake_python(tmp_path, shell, arguments, expected):
     executable = shutil.which(shell)
     if executable is None:
@@ -272,7 +272,7 @@ def test_powershell_limits_with_fake_python(tmp_path, shell, arguments, expected
                              'run_name': f'{model}_{task}_seed{seed}', 'resume': None, 'issues': [],
                              'train_settings': experiments.training_settings(model)})
     plan = tmp_path/'plan.json'
-    plan.write_text(json.dumps({'total': 40, 'counts': {'completed': 8}, 'jobs': jobs}))
+    plan.write_text(json.dumps({'total': 50, 'counts': {'completed': 10}, 'jobs': jobs}))
     fake = tmp_path/'fake_python.ps1'
     fake.write_text("""param([Parameter(ValueFromRemainingArguments=$true)][string[]]$CallArgs)
 if ($CallArgs -contains 'mfp_nova.experiments') {

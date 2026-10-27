@@ -1,3 +1,3 @@
-"""Four research architectures; shared training lives in mfp_nova.research."""
+"""Five research architectures; shared training lives in mfp_nova.research."""
 
-RESEARCH_MODELS = ("trirelay", "geofactor", "protoroute", "helixset")
+RESEARCH_MODELS = ("trirelay", "geofactor", "protoroute", "helixset", "theraset")
