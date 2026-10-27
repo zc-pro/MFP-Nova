@@ -58,3 +58,34 @@ def test_busy_gpu_returns_before_cuda_context(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="other compute jobs"):
         runtime_check.run(["trirelay"], ["major15"], "features", "cuda:3", tmp_path/"gpu")
     assert selected==[] and not (tmp_path/"gpu").exists()
+
+
+def test_micro_f1_selection_keeps_fixed_threshold_through_evaluation(tmp_path):
+    from mfp_nova.research import evaluate
+    from mfp_nova.metric_protocol import selection
+
+    # AP and Macro F1 must not break a Micro F1 tie.
+    assert selection(None, None, {"micro_f1": .7, "macro_ap": .9}, "micro_f1", "global")[0] == (.7,)
+    torch.set_num_threads(1)
+    root, features = multimodal_fixture(tmp_path)
+    config = {"model_name": "helixset",
+              "model": {"dim": 32, "heads": 4, "dropout": .1, "latent_count": 4,
+                        "sequence_depth": 1, "property_depth": 1, "geometry_depth": 1,
+                        "pair_depth": 1, "latent_depth": 1, "decoder_depth": 1},
+              "data": {"root": str(root), "track": "major15", "features": str(features)},
+              "encoder": {"name": "fixture", "revision": "main", "max_length": 80},
+              "loss": {"modality_dropout": 0},
+              "train": {"device": "cpu", "seed": 42, "epochs": 2, "batch_size": 2,
+                        "learning_rate": .001, "weight_decay": 0, "patience": 0,
+                        "warmup_epochs": 0, "num_workers": 0, "output": str(tmp_path),
+                        "metric_suite": "micro_f1", "ema_decay": .9, "ema_start_epoch": 1,
+                        "save_selection_candidates": True}}
+    result = train(config, "micro")
+    history = [json.loads(line) for line in (tmp_path/"micro/history.jsonl").read_text().splitlines()]
+    expected = max(history, key=lambda row: row["validation"]["micro_f1"])
+    assert result["best_epoch"] == expected["epoch"]
+    assert result["threshold"] == result["online_reference"]["threshold"] == .5
+    assert result["threshold_fit_split"] is None
+    assert "alternate_selection" not in result
+    measured = evaluate(tmp_path/"micro/best.pt", root, features, "val", "cpu", tmp_path/"eval.json")
+    assert measured["metrics"] == result["validation"]

@@ -19,7 +19,7 @@ from .multimodal import MultimodalData, MultimodalPeptides, collate_multimodal
 from .research_layers import observed_label_loss
 from .consistency import bernoulli_consistency, consistency_weight
 from .trainer import seed_everything, write_json
-from .metric_protocol import protocol_description, primary_metrics, selection, format_primary
+from .metric_protocol import protocol_description, primary_metrics, selection, format_primary, final_threshold
 
 
 def make_model(name, arguments):
@@ -359,7 +359,7 @@ def train(config, name, resume=None):
     decay_epochs = settings.get("lr_decay_epochs", planned_epochs)
     if "lr_decay_epochs" in settings and decay_epochs <= warmup:
         raise ValueError("lr_decay_epochs must exceed warmup_epochs")
-    save_candidates = settings.get("save_selection_candidates", False)
+    save_candidates = settings.get("save_selection_candidates", False) and suite != "micro_f1"
     alternate_suite = "task_specific" if suite == "traditional5" else "traditional5"
     alternate_stem = "best_ap" if suite == "traditional5" else "best_accuracy"
     alternate_best = checkpoint.get("alternate_best") if checkpoint and save_candidates else None
@@ -695,7 +695,7 @@ def train(config, name, resume=None):
             break
     restore_model_state(model, best_state)
     y, probabilities, validation_loss = predict_loader(model, loaders[1], device, precision, config["loss"])
-    threshold = fit_label_thresholds(y, probabilities) if settings.get("threshold_strategy", "global")=="per_label" else fit_global_threshold(y, probabilities)
+    threshold = final_threshold(y, probabilities, suite, settings.get("threshold_strategy", "global"))
     torch.save({**static, "model_state": best_state, "best_epoch": best_epoch, "threshold": threshold,
                 "weight_source": best_weights}, run/"best.pt")
     if device.type=="cuda":
@@ -703,7 +703,7 @@ def train(config, name, resume=None):
     if terminal_resume:
         torch.save({**checkpoint, **static, "elapsed_seconds": elapsed_before+time.perf_counter()-started}, run/"last.pt")
     result = {"model": config["model_name"], "task": source.data.track, "seed": settings["seed"],
-              "best_epoch": best_epoch, "epochs_completed": epoch, "threshold": threshold, "threshold_fit_split": "val",
+              "best_epoch": best_epoch, "epochs_completed": epoch, "threshold": threshold, "threshold_fit_split": protocol["threshold_fit_split"],
               "global_step": global_step, "precision": precision, "accumulation_steps": accumulation,
               "threshold_strategy": settings.get("threshold_strategy", "global"), "trainable_parameters": params,
               "elapsed_seconds": elapsed_before+time.perf_counter()-started,
@@ -713,7 +713,8 @@ def train(config, name, resume=None):
               "validation_groups": evaluate_groups(y, probabilities, validation_groups, threshold,
                   source.statistics["labels"]["support"], source.statistics["function_projection"]),
               "labels": source.data.labels, "monitor_threshold": .5,
-              "final_metrics_scope": "best_checkpoint_with_validation_fitted_threshold",
+              "final_metrics_scope": ("best_checkpoint_at_fixed_0_5" if suite == "micro_f1"
+                                      else "best_checkpoint_with_validation_fitted_threshold"),
               "annotation_based_metrics": True,
               "checkpoint": str(run/"best.pt")}
     result.update(metric_protocol=protocol, primary_metrics=primary_metrics(result["validation"], suite),
@@ -746,12 +747,12 @@ def train(config, name, resume=None):
     if ema is not None:
         restore_model_state(model, online_best_state)
         raw_y, raw_p, raw_loss = predict_loader(model, loaders[1], device, precision, config["loss"])
-        raw_threshold = fit_label_thresholds(raw_y, raw_p) if settings.get("threshold_strategy", "global")=="per_label" else fit_global_threshold(raw_y, raw_p)
+        raw_threshold = final_threshold(raw_y, raw_p, suite, settings.get("threshold_strategy", "global"))
         torch.save({**static, "model_state": online_best_state, "best_epoch": online_best_epoch,
                     "threshold": raw_threshold, "weight_source": "online"}, run/"online_best.pt")
         result.update(weight_source=best_weights, ema_updates=int(ema.n_averaged),
                       online_reference={"best_epoch": online_best_epoch, "threshold": raw_threshold,
-                          "threshold_fit_split": "val", "validation_loss": raw_loss,
+                          "threshold_fit_split": protocol["threshold_fit_split"], "validation_loss": raw_loss,
                           "validation": metrics(raw_y, raw_p, source.statistics, raw_threshold),
                           "validation_groups": evaluate_groups(raw_y, raw_p, validation_groups, raw_threshold,
                               source.statistics['labels']['support'], source.statistics['function_projection']),

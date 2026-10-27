@@ -31,7 +31,7 @@ def main(argv=None):
                              help="Completed rows in the first split, from the interrupted extraction log")
         else:
             sub.add_argument("--model", choices=("sequence", *RESEARCH_MODELS), default="sequence")
-            sub.add_argument("--metric-suite", choices=("traditional5", "task_specific"),
+            sub.add_argument("--metric-suite", choices=("traditional5", "task_specific", "micro_f1"),
                              help="Research models: primary report and checkpoint selection protocol")
             sub.add_argument("--task", choices=("major15", "fine39"), help="Alias for --track")
             sub.add_argument("--resume", help="last.pt with optimizer and RNG state; creates a new run")

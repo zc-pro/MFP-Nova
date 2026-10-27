@@ -4,7 +4,7 @@ import numpy as np
 from .metrics import fit_global_threshold, fit_label_thresholds
 
 
-SUITES = ("traditional5", "task_specific")
+SUITES = ("traditional5", "task_specific", "micro_f1")
 TRADITIONAL = ("accuracy", "precision", "coverage", "absolute_true", "absolute_false")
 TASK_SPECIFIC = ("macro_ap", "micro_ap", "macro_f1", "micro_f1", "sample_jaccard",
                  "head_macro_ap", "medium_macro_ap", "tail_macro_ap", "mfp_detection",
@@ -19,6 +19,12 @@ def primary_metrics(report, suite):
 def protocol_description(suite, strategy):
     if suite not in SUITES:
         raise ValueError(f"metric_suite must be one of {SUITES}")
+    if suite == "micro_f1":
+        return {"metric_suite": suite,
+                "selection": ["val_micro_f1_at_0_5", "earlier_epoch"],
+                "threshold_strategy": "fixed_0_5", "threshold_objective": None,
+                "threshold_fit_split": None, "selection_threshold": 0.5,
+                "monitor_threshold": 0.5, "absolute_false_direction": "minimize"}
     return {
         "metric_suite": suite,
         "selection": (["val_fitted_accuracy", "val_fitted_absolute_true", "earlier_epoch"]
@@ -34,6 +40,8 @@ def protocol_description(suite, strategy):
 
 def selection(y, probabilities, report, suite, strategy):
     """Reuse the epoch's predictions; never run another neural forward pass."""
+    if suite == "micro_f1":
+        return (report["micro_f1"],), 0.5, primary_metrics(report, suite)
     if suite == "task_specific":
         return (report["macro_ap"], report["micro_ap"]), None, primary_metrics(report, suite)
     threshold = (fit_label_thresholds(y, probabilities) if strategy == "per_label"
@@ -50,6 +58,13 @@ def selection(y, probabilities, report, suite, strategy):
         "absolute_false": float((actual != predicted).mean()),
     }
     return (fitted["accuracy"], fitted["absolute_true"]), threshold, fitted
+
+
+def final_threshold(y, probabilities, suite, strategy):
+    if suite == "micro_f1":
+        return 0.5
+    return (fit_label_thresholds(y, probabilities) if strategy == "per_label"
+            else fit_global_threshold(y, probabilities))
 
 
 def format_primary(suite, report):
