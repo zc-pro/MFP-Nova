@@ -92,24 +92,28 @@ def export_validation(run, stem, source, dataset, y, probabilities, threshold, e
     actual, predicted = y.astype(bool), probabilities >= threshold
     from .multimodal import independent_functions
     projection = source.statistics["function_projection"]
-    actual_functions = independent_functions(actual, projection)
-    predicted_functions = independent_functions(predicted, projection)
-    multifunction = actual_functions.sum(1) >= 2
     summary = {
         "split": "val", "epoch": epoch, "weight_source": weight_source, "selection_objective": objective,
         "threshold": threshold, "rows": len(y), "empty_predictions": int((~predicted.any(1)).sum()),
         "mean_predicted_labels": float(predicted.sum(1).mean()),
         "mean_observed_labels": float(actual.sum(1).mean()),
-        "multifunction_support": int(multifunction.sum()),
-        "multifunction_missed_detection": int((multifunction & (predicted_functions.sum(1) < 2)).sum()),
-        "multifunction_with_two_observed_functions_recovered": int(
-            (multifunction & ((actual_functions & predicted_functions).sum(1) >= 2)).sum()),
         "per_label": [{"label": label, "tp": int((actual[:, j] & predicted[:, j]).sum()),
                        "observed_fp": int((~actual[:, j] & predicted[:, j]).sum()),
                        "fn": int((actual[:, j] & ~predicted[:, j]).sum())}
                       for j, label in enumerate(source.data.labels)],
         "scope": "Validation-selected checkpoint and threshold; FP means unannotated, not confirmed inactive",
     }
+    if projection is not None:
+        actual_functions = independent_functions(actual, projection)
+        predicted_functions = independent_functions(predicted, projection)
+        multifunction = actual_functions.sum(1) >= 2
+        summary.update(
+            multifunction_support=int(multifunction.sum()),
+            multifunction_missed_detection=int((multifunction & (predicted_functions.sum(1) < 2)).sum()),
+            multifunction_with_two_observed_functions_recovered=int(
+                (multifunction & ((actual_functions & predicted_functions).sum(1) >= 2)).sum()))
+    else:
+        summary["scope"] = "Published 49-bit targets; decoy zeros are assigned negatives, not verified inactivity"
     write_json(run/f"{stem}_diagnostics.json", summary)
     return path.name
 
@@ -432,6 +436,10 @@ def train(config, name, resume=None):
                 "resume": str(resume) if resume else None, "diagnostic_subset": diagnostic,
                 "monitor_threshold": .5, "train_metrics_scope": "online_augmented_changing_weights",
                 "validation_loss_scope": "main_classification_clean_eval; no stochastic auxiliary reconstruction"}
+    if source.data.track == "therapep49":
+        metadata["label_semantics"] = "Author-published 49-bit targets; synthetic backgrounds are assigned zeros; therapeutic flag is supervised"
+        metadata["split_protocol"] = "Published CSV members, including duplicates; no cluster isolation imposed"
+        metadata["modality_scope"] = "Sequence only for every source; no positive-only structure/descriptor availability shortcut"
     if getattr(model, "esm_tail", None) is not None:
         metadata["esm_adaptation"] = {
             "mode": "frozen_prefix_cached_trainable_tail_lora",
@@ -659,9 +667,11 @@ def train(config, name, resume=None):
                   f"shared={history['losses']['branch_shared']:.6f} private={history['losses']['branch_private']:.6f} "
                   f"weight_each={loss_settings.get('branch', .1)/2:.3f} fusion={evidence_fusion}", flush=True)
         if ema is not None:
+            mfp_text = (f"{online_report['mfp_detection']['f1']:.4f}"
+                        if 'mfp_detection' in online_report else 'NA')
             print(f"Weights | Val={validation_weights} EMA-updates={int(ema.n_averaged)} | OnlineVal "
                   f"MacroAP={online_report['macro_ap']:.4f} MicroAP={online_report['micro_ap']:.4f} "
-                  f"MFP-F1={online_report['mfp_detection']['f1']:.4f} "
+                  f"MFP-F1={mfp_text} "
                   f"Acc={online_report['accuracy']:.4f} Prec={online_report['precision']:.4f} "
                   f"Cov={online_report['coverage']:.4f} AT={online_report['absolute_true']:.4f} AF={online_report['absolute_false']:.4f}", flush=True)
         if consistency:
@@ -763,6 +773,9 @@ def train(config, name, resume=None):
                           "scope": "same optimizer trajectory; stopping follows primary Validation, not an independent baseline training"})
         if device.type == "cuda":
             result['peak_cuda_memory_bytes'] = max(peak_memory, torch.cuda.max_memory_allocated(device))
+    if source.data.track == "therapep49":
+        from .therapep import published_metrics
+        result["therapep_validation"] = published_metrics(y, probabilities, threshold)
     result["elapsed_seconds"] = elapsed_before+time.perf_counter()-started
     write_json(run/"results.json", result)
     return result
@@ -818,6 +831,9 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
             'threshold_refit': False}
     if decision is not None:
         result['decision'] = decision
+    if checkpoint["track"] == "therapep49":
+        from .therapep import published_metrics
+        result["therapep"] = published_metrics(y, probabilities, threshold)
     settings = checkpoint["config"]["train"]
     suite = checkpoint.get("selection_suite", settings.get("metric_suite", "task_specific"))
     result["metric_protocol"] = protocol_description(suite, settings.get("threshold_strategy", "global"))
@@ -899,6 +915,8 @@ def predict_sequences(checkpoint_path, sequences, device="cpu", decision_path=No
         raw = {"esm": esm, "aa": aa, "d": stereo, "mask": valid,
                "phys_raw": np.full((len(selected), 515), np.nan),
                "residue_chem_tokens": np.array([[c if j<len(s) else "" for j, c in enumerate(s.ljust(length))] for s in selected])}
+        if checkpoint["track"] == "therapep49":
+            raw.pop("residue_chem_tokens")
         if peptide_encoder is not None:
             peptide_states, peptide_mask = peptide_encoder.encode(selected)
             peptide_residues = [peptide_states[i, peptide_mask[i]].half().float().cpu() for i in range(len(selected))]

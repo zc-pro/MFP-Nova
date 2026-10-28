@@ -6,11 +6,17 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+TRACKS = ("major15", "fine39", "therapep49")
+
 
 class PeptideData:
     def __init__(self, root, track="fine39"):
         self.root = Path(root)
         self.track = track
+        if track == "therapep49":
+            from .therapep import read_data
+            self.__dict__.update(read_data(self.root))
+            return
         with np.load(self.root / "arrays/sequences.npz", allow_pickle=False) as source:
             self.rows = source["row_id"]
             self.ids = source["ID"]
@@ -37,6 +43,8 @@ class PeptideData:
             raise ValueError(f"Unknown split: {split}")
         if augment and split != "train":
             raise ValueError("Augmentation is train-only")
+        if augment and self.track == "therapep49":
+            raise ValueError("therapep49 preserves published rows; no augmentation is defined")
         key = "train_aug_mask" if augment else f"{split}_original_mask"
         mask = self.masks[key].copy()
         if sequence_only:

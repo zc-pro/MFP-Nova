@@ -1392,3 +1392,38 @@ printf 'PID=%s  Log=runs/relationview_%s.log\n' "$!" "$tag"
 ```
 
 两个脚本默认串行训练完整 major15/fine39、seed42、650M、FP32、batch64、EMA0.999，其他候选 Loss 关闭；自动导出完整 Val 11 头并打包 metadata/results/history/概率，不含权重。只跑一项时 PowerShell 加 `-Tasks fine39`，Bash 在脚本路径后加 `fine39`。不自动启动服务器任务、不使用 Test，不覆盖历史运行目录。
+
+## 2026-10-28：TheraSet 两任务 seed42 正式 Train/Val 结果
+
+来源：`theraset_seed42_rtx5070_results_20261028_035242.zip`。代码 `6bef2d2a70859d83f7010b61b43dbc2df9c01cb3`，训练记录为干净工作区、数据2026-10-14、原样本、双冻结ESM缓存；RTX5070 / PyTorch2.8.0+cu128 / FP32 / batch64×累积1 / seed42。沿用ASL弱负项0.3、R-Drop0.1、EMA0.999、traditional5及Validation全局阈值。
+
+| 项目 | major15 | fine39 |
+|---|---:|---:|
+| Train / Validation 样本数 | 39,478 / 8,534 | 39,455 / 8,529 |
+| 训练结束 / 主候选epoch | 39 / 24 | 33 / 18 |
+| 主候选权重 / 阈值 | EMA / 0.74 | EMA / 0.68 |
+| Accuracy（样本Jaccard） | 65.0756% | 59.5821% |
+| 样本Precision / Coverage | 69.6270% / 71.1531% | 63.5863% / 66.6297% |
+| 完全匹配率AT / Hamming loss | 54.5114% / 5.4972% | 47.7664% / 2.8846% |
+| Macro-AP / Micro-AP | 58.4839% / 74.4229% | 56.5149% / 69.0188% |
+| Macro-F1 / Micro-F1 | 56.7611% / 68.5834% | 55.7485% / 64.1536% |
+| 独立多功能检测F1 | 56.2757% | 54.0054% |
+| 原始运行总耗时 | 76.92分钟 | 89.02分钟 |
+| 第10轮起平均epoch耗时 | 124.06秒 | 171.40秒 |
+| 正式运行显存峰值 | 4.20GiB | 7.50GiB |
+
+检查了两任务主候选与AP候选的完整Validation概率：row_id、ID、cluster_id、标签顺序、目标和样本范围均与本地数据匹配，无重复或非有限概率；Train/Val簇交叉为0。使用现有指标代码复算，最大数值差为2.22e−16，重新拟合的全局阈值与保存结果一致。epoch连续、每轮617次更新、EMA更新总数、R-Drop预热和patience15均与配置一致，分项loss有限、AMP跳步为0。GPU profile在长度74、batch32/64、完整R-Drop下均成功，列出的关键模块梯度有限、非零且实际更新。
+
+按预定Jaccard主目标应保留两个`best.pt`。AP候选为major15 epoch17（阈值0.73、Macro-AP59.2683%、Micro-AP74.8331%）和fine39 epoch16（阈值0.66、Macro-AP57.0042%、Micro-AP69.4111%），仅作为Validation备选，不能混用各候选最优数字。包内没有checkpoint，能核对的是概率、记录及诊断；没有重新运行权重前向，也没有Test结果。
+
+与本地已有HelixSet双表征R-Drop/seed42的major15结果逐样本对齐：TheraSet主候选的Jaccard +0.1130个百分点、AT −0.2226个百分点、Macro-AP +0.9158个百分点、Micro-AP +2.3264个百分点、Micro-F1 +0.9032个百分点。5,013个Validation簇的2,000次配对簇bootstrap给出Jaccard差异95%区间[−0.8268,+1.0526]个百分点，AT差异区间[−1.5267,+1.0335]个百分点；均跨零，不能宣称整体严格优胜。该区间是在已选checkpoint/阈值上的探索性估计，不包含选模与跨seed不确定性。
+
+TheraSet major15可训练参数较HelixSet减少85.53%，实测每轮约快6.16倍，正式运行峰值显存减少45.98%。这是两种实际执行配置（TheraSet64×1、HelixSet16×4）的联合效率结果，不是固定物理batch下的纯架构速度对照，且不含新序列ESM编码成本。
+
+分组取舍：major15的D注记组173条Jaccard +12.09个百分点，缺结构组1,040条 +1.98，2–8aa组 +1.07、9–16aa组 +1.11；17–32aa组 −1.86、AT −2.98。小分组为探索结果。major15唯一Train尾类thrombolytic的AP从HelixSet29.94%降至21.84%；不能从整体Macro-AP改善推断尾类都改善。
+
+两任务Validation ASL均在epoch8最低，此后训练loss继续下降、Validation loss持续上升；最终训练Macro-AP约99.30%/99.11%，Validation Macro-AP58%左右/55%左右，存在明显过拟合。loss最低epoch与Jaccard/AP最优epoch不同不构成选模错误；当前记录支持保留早期候选，不支持继续单纯延长训练。
+
+弱项包括fine39 antiinflammatory：Val40个正例只召回1个，AP2.14%、F1 3.03%；growth_regulatory召回7/36，thrombolytic__unknown召回7/37。独立多功能检测仍漏掉major15的885/2,118和fine39的908/2,108；真正同时恢复至少两个已标注独立功能的比例仅47.69%/46.54%。0为未标注，统计中的FP不是经实验确认的无活性。
+
+结论：这两次是有效的完整seed42 Train/Val结果，支持TheraSet作为较低成本候选继续比较；尚不能证明对TheraPep适配CNN的净增益，也不能确认各创新模块有效或跨seed稳定。下一步先补CNN对照及有针对性的消融，再做统一多Seed和一次独立Test评价。分析数据与图保存在`runs/analysis/theraset_seed42_20261028/`，不提交运行输出。

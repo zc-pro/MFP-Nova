@@ -389,6 +389,12 @@ def reconstruction_loss(output, original, hidden):
 def unlabeled_weights(targets, statistics, unknown_weight=.3):
     """Shared missing-label semantics for pointwise and annotation-set losses."""
     weak_weight = torch.full_like(targets, unknown_weight)
+    if "therapep_background_index" in statistics:
+        flag = statistics["therapep_background_index"]
+        # Published decoys have assigned zero targets, not missing annotations.
+        # Their validity as biological negatives remains an explicit assumption.
+        weak_weight = torch.where(targets[:, flag:flag+1] == 0, 1., weak_weight)
+        weak_weight[:, flag] = 1.
     labels = statistics["labels"]
     if any(label.endswith("__unknown") for label in labels):
         from .multimodal import function_projection

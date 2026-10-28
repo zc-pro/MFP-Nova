@@ -1,5 +1,6 @@
 """Fixed five-seed plan and read-only summaries; training stays in research.py."""
 import argparse
+import copy
 import json
 import os
 import re
@@ -11,18 +12,23 @@ from pathlib import Path
 import yaml
 
 from .models import RESEARCH_MODELS
+from .data import TRACKS
+from .therapep import configure_task
 
 MODELS = RESEARCH_MODELS
-TASKS = ("major15", "fine39")
+TASKS = ("major15", "fine39")  # Keep the existing default/all comparison cohort.
 SEEDS = (42, 101, 202, 303, 404)
 PROJECT = Path(__file__).resolve().parents[2]
 ALIASES = {"accuracy": "sample_jaccard", "precision": "sample_precision", "coverage": "sample_recall",
            "absolute_true": "exact_match", "absolute_false": "hamming_loss"}
 
 
-def training_settings(model, config=None):
+def training_settings(model, config=None, task=None):
     """Preserve the original three-model plan; newer models use YAML defaults."""
     config = config or yaml.safe_load((PROJECT/f"configs/{model}.yaml").read_text(encoding="utf-8"))
+    if task is not None:
+        config = copy.deepcopy(config)
+        configure_task(config, task)
     settings = config["train"]
     return {"batch_size": settings["batch_size"] if model in ("helixset", "theraset") else 64,
             "precision": settings.get("precision", "fp32"),
@@ -34,7 +40,7 @@ def training_settings(model, config=None):
 
 
 def run_family(model, task, seed):
-    settings = training_settings(model)
+    settings = training_settings(model, task=task)
     tag = f"{settings['precision']}_b{settings['batch_size']}"
     if model in ("helixset", "theraset"):
         tag += f"_a{settings['accumulation_steps']}_ema_{settings['metric_suite']}"
@@ -105,6 +111,7 @@ def compatibility_issues(metadata, result, directory, identity=None):
     issues = []
     identity = metadata or result or identity
     expected = yaml.safe_load((PROJECT/f"configs/{identity['model']}.yaml").read_text(encoding="utf-8"))
+    configure_task(expected, identity['task'])
     fixed = training_settings(identity["model"], expected)
     defaults = {"precision": "fp32", "accumulation_steps": 1, "threshold_strategy": "global",
                 "metric_suite": "task_specific", "ema_decay": None}
@@ -138,7 +145,8 @@ def compatibility_issues(metadata, result, directory, identity=None):
                 issues.append(f"train.{key} differs from {value}")
         if settings.get("limit_samples") or settings.get("max_steps") or config["data"].get("augment", False):
             issues.append("diagnostic/augmented training is not the original-row formal protocol")
-        if metadata.get("cohort") not in (None, "original_resolved_backbone"):
+        cohort = "therapep_author_published_all49" if identity['task'] == 'therapep49' else "original_resolved_backbone"
+        if metadata.get("cohort") not in (None, cohort):
             issues.append("training cohort differs")
     elif identity["model"] in ("helixset", "theraset"):
         if not directory.name.startswith(run_family(identity["model"], identity["task"], identity["seed"])):
@@ -158,11 +166,11 @@ def discover_runs(root):
         result = json.loads(result_path.read_text(encoding="utf-8")) if result_path.exists() else None
         identity = result or metadata
         if identity is None:
-            match = re.match(r"^(trirelay|geofactor|protoroute|helixset|theraset)_(major15|fine39)_esm650m_seed(\d+)_", directory.name)
+            match = re.match(r"^(trirelay|geofactor|protoroute|helixset|theraset)_(major15|fine39|therapep49)_esm650m_seed(\d+)_", directory.name)
             if not match:
                 continue
             identity = {"model": match[1], "task": match[2], "seed": int(match[3])}
-        if identity.get("model") not in MODELS or identity.get("task") not in TASKS:
+        if identity.get("model") not in MODELS or identity.get("task") not in TRACKS:
             continue
         if identity.get("diagnostic_subset"):
             continue
@@ -196,7 +204,7 @@ def make_plan(root="runs", models=MODELS, tasks=TASKS, seeds=SEEDS, running=None
                           any(name==r["directory"].name for r in matches)}
                 job = {"model": model, "task": task, "seed": seed, "run_name": base, "resume": None,
                        "result_path": None, "running": active, "issues": [],
-                       "train_settings": training_settings(model)}
+                               "train_settings": training_settings(model, task=task)}
                 if complete:
                     # Count one result per seed. Prefer the furthest completed
                     # continuation, never choose a repeat by its Validation score.
@@ -231,7 +239,7 @@ def make_plan(root="runs", models=MODELS, tasks=TASKS, seeds=SEEDS, running=None
 def summarize(plan, label=None, group=None):
     comparisons = []
     for model in MODELS:
-        for task in TASKS:
+        for task in TRACKS:
             jobs = [j for j in plan["jobs"] if j["model"]==model and j["task"]==task]
             if not jobs:
                 continue
@@ -319,7 +327,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("plan", "summary"))
     parser.add_argument("--model", choices=("all", *MODELS), default="all")
-    parser.add_argument("--task", choices=("all", *TASKS), default="all")
+    parser.add_argument("--task", choices=("all", *TRACKS), default="all")
     parser.add_argument("--seeds", default=",".join(map(str, SEEDS)))
     parser.add_argument("--runs-root", default="runs")
     parser.add_argument("--json", action="store_true")

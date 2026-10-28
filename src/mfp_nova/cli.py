@@ -5,6 +5,7 @@ from pathlib import Path
 import yaml
 
 from .models import RESEARCH_MODELS
+from .data import TRACKS
 
 
 def main(argv=None):
@@ -13,13 +14,15 @@ def main(argv=None):
     analyze = commands.add_parser("analyze")
     analyze.add_argument("--data-root", default="data/therapeutic_2025")
     analyze.add_argument("--output", default="docs/data_summary.json")
+    download = commands.add_parser("download-therapep", help="Download author-published Train/Val/Test CSVs")
+    download.add_argument("--output", default="data/therapep_ai")
     for command in ("features", "train"):
         sub = commands.add_parser(command)
         sub.add_argument("--config")
         sub.add_argument("--data-root")
         sub.add_argument("--feature-root")
         sub.add_argument("--peptide-feature-root", help="Short-peptide cache directory for HelixSet/TheraSet")
-        sub.add_argument("--track", choices=("major15", "fine39"))
+        sub.add_argument("--track", choices=TRACKS)
         sub.add_argument("--device")
         sub.add_argument("--batch-size", type=int, help="Encoder batch for features; head batch for train")
         sub.add_argument("--esm", choices=("35m", "650m"), help="Select ESM size and matching feature directory")
@@ -33,7 +36,7 @@ def main(argv=None):
             sub.add_argument("--model", choices=("sequence", *RESEARCH_MODELS), default="sequence")
             sub.add_argument("--metric-suite", choices=("traditional5", "task_specific", "micro_f1"),
                              help="Research models: primary report and checkpoint selection protocol")
-            sub.add_argument("--task", choices=("major15", "fine39"), help="Alias for --track")
+            sub.add_argument("--task", choices=TRACKS, help="Alias for --track")
             sub.add_argument("--resume", help="last.pt with optimizer and RNG state; creates a new run")
             sub.add_argument("--ablate", nargs="*", help="Model switches to disable, e.g. feedback high_order")
             sub.add_argument("--threshold-strategy", choices=("global", "per_label"))
@@ -73,7 +76,7 @@ def main(argv=None):
             sub.add_argument("--global-only", action="store_true", help="Disable the local CNN branch")
     evaluate = commands.add_parser("evaluate")
     evaluate.add_argument("--checkpoint", required=True)
-    evaluate.add_argument("--data-root", default="data/therapeutic_2025")
+    evaluate.add_argument("--data-root", help="Defaults to the checkpoint's data root")
     evaluate.add_argument("--feature-root")
     evaluate.add_argument("--peptide-feature-root")
     evaluate.add_argument("--split", choices=("val", "test"), default="test")
@@ -98,7 +101,7 @@ def main(argv=None):
     summarize.add_argument("--output", help="Optional JSON; otherwise print")
     gpu_check = commands.add_parser("gpu-check", help="Real-cache full-model server probes and bounded short training")
     gpu_check.add_argument("--models", nargs="+", choices=RESEARCH_MODELS, default=list(RESEARCH_MODELS))
-    gpu_check.add_argument("--tasks", nargs="+", choices=("major15", "fine39"), default=["major15", "fine39"])
+    gpu_check.add_argument("--tasks", nargs="+", choices=TRACKS, default=["major15", "fine39"])
     gpu_check.add_argument("--esm", choices=("35m", "650m"), default="650m")
     gpu_check.add_argument("--feature-root")
     gpu_check.add_argument("--peptide-feature-root")
@@ -111,7 +114,10 @@ def main(argv=None):
     gpu_check.add_argument("--output")
     gpu_check.add_argument("--inspect-only", action="store_true", help="Read GPU occupancy/cache metadata without training")
     args = parser.parse_args(argv)
-    if args.command == "analyze":
+    if args.command == "download-therapep":
+        from .therapep import download_data
+        print(json.dumps(download_data(args.output), ensure_ascii=False, indent=2))
+    elif args.command == "analyze":
         from .analysis import analyze_data
         result = analyze_data(args.data_root)
         from .trainer import write_json
@@ -122,6 +128,9 @@ def main(argv=None):
         model_name = args.model if args.command == "train" else "sequence"
         config_path = args.config or f"configs/{model_name}.yaml"
         config = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
+        from .therapep import configure_task
+        configure_task(config, (args.task if args.command == "train" else None)
+                       or args.track or config["data"]["track"])
         peptide_view = args.command == "features" and args.encoder_view == "peptide"
         if peptide_view and args.esm:
             raise ValueError("--encoder-view peptide uses peptide_encoder; omit --esm")
@@ -129,7 +138,8 @@ def main(argv=None):
             if config.get("model", {}).get("esm_tail") and args.esm != "650m":
                 raise ValueError("This HelixSet ESM-tail configuration uses ESM650M")
             config["encoder"]["name"] = "facebook/esm2_t12_35M_UR50D" if args.esm=="35m" else "facebook/esm2_t33_650M_UR50D"
-            config["data"]["features"] = f"features/esm2_{args.esm}"
+            config["data"]["features"] = (f"features/therapep_ai/esm2_{args.esm}"
+                                           if config["data"]["track"] == "therapep49" else f"features/esm2_{args.esm}")
             layer = config["encoder"].get("representation_layer")
             if layer is not None:
                 config["data"]["features"] += f"_layer{layer}"
@@ -254,7 +264,8 @@ def main(argv=None):
             if "model_name" not in checkpoint:
                 raise ValueError("Function decisions are supported for research models")
             extra['decision_path'] = args.decision
-        evaluate(args.checkpoint, args.data_root, feature_root, args.split, args.device, args.output,
+        data_root = args.data_root or checkpoint["config"]["data"]["root"]
+        evaluate(args.checkpoint, data_root, feature_root, args.split, args.device, args.output,
                  predictions=args.predictions, batch_size=batch_size, **extra)
     elif args.command == "gpu-check":
         from .runtime_check import inspect, run

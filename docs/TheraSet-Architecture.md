@@ -4,7 +4,7 @@
 
 **设计结论：保留 TheraPep-AI 的两级多尺度 CNN 和直接分类路径；把 HelixSet 的细粒度证据读取改造成围绕 CNN 的轻量残差解码器。每个功能标签通过若干共享原型查询选择不同尺度、不同来源及不同残基对证据，最后对 CNN 的预测作可学习修正。**
 
-TheraSet 是第五个独立研究模型，不替换 HelixSet。当前已实现架构、训练、恢复、评价、推理和消融入口，完成必要的正确性检查及真实输入小批量训练检查；尚无完整训练后的性能结论。本文的“提升”“缓解”等均指设计目标，不能解释为已超过基线。
+TheraSet 是第五个独立研究模型，不替换 HelixSet。当前已实现架构、训练、恢复、评价、推理和消融入口，完成必要的正确性检查及真实输入小批量训练检查。2026-10-28已完成两任务seed42完整Train/Val，复算结果与训练记录一致，详见[实验记录](experiment-history.md#2026-10-28theraset-两任务-seed42-正式-trainval-结果)；独立Test、多Seed、TheraPep适配CNN对照及消融仍待开展。本文的“提升”“缓解”等均指设计目标，不能解释为已全面超过基线。
 
 ## 1. 基线定义与设计依据
 
@@ -186,6 +186,7 @@ z_c=z_c^{CNN}+g_c\Delta_c.
 3. 将质量感知证据和按标签平衡的关系因子用于修正直接预测，检验是否能以更少下游参数保留 HelixSet 的关键收益。
 
 已核对的相关先例包括 Query2Label 的标签查询读取、C-Tran 的标签依赖建模、TPpred-LE 的治疗肽标签嵌入和多标签多原型查询工作。因此不能把“标签查询”“多原型注意力”单独作为首次创新，也不能仅凭对 TheraPep-AI 的差异宣称世界首次。完整领域新颖性仍需更系统的检索和实验支撑。
+
 
 ## 6. 训练目标与科研协议
 
@@ -393,6 +394,96 @@ nohup env CUDA_VISIBLE_DEVICES="$GPU" OMP_NUM_THREADS="$CPU_THREADS" MKL_NUM_THR
 适配 CNN 对照在上述两平台命令上都追加 `--ablate evidence_decoder chemical_evidence`，并使用新的运行名；其他比较同表格追加参数。保留相同 R-Drop/EMA 可隔离架构变化。共享数据加载器仍会加载配置中的 ESM 缓存，即使 CNN 对照不使用它们，因此这条路径的端到端 I/O 耗时不能冒充精简版原始 CNN 的成本。
 
 多 Seed 入口及 PowerShell 批量脚本已接入 TheraSet，`all` 现在为五模型×两任务×五 seed，共 50 组；这只是可执行计划，本次没有启动完整批量实验。
+
+### TheraPep-AI 作者发布基准：therapep49
+
+新增 `--task therapep49`，供使用作者同一队列、标签和划分比较；major15/fine39继续使用原输入和簇划分。直接读取[作者发布资源](https://github.com/terra-quantum-public/tq-therapep-ai/releases/tag/assets)中的三个CSV，不用“80/10/10随机切分”重新近似作者成员。CSV原始字节保存在独立的 `data/therapep_ai/`，不写入普通Git。
+
+| 作者划分 | 全部记录 | 真实/恢复正样本 | 合成背景 |
+|---|---:|---:|---:|
+| Train | 131,947 | 44,524 | 87,423 |
+| Validation | 16,457 | 5,565 | 10,892 |
+| Test | 16,537 | 5,566 | 10,971 |
+
+总计164,941条，序列长2–74。输出严格保留作者48个功能列＋最后的`is_therapeutic`，包括大小写不同的`Growth_Regeneration`和`Growth_regeneration`两列；不做标签别名合并、父类传播或重编码。来源与CSV行序用于建立稳定ID，如`therapep:train:0`；重复序列保留，cluster_id仅标识完全相同序列，不意味着重新做过同源簇隔离。该基准的评价口径与原主基准不同。
+
+输入统一为作者提供的标准骨架序列，不从本项目正样本中额外搬入结构、D注记或515维属性，否则模态可用性可能直接暴露背景标签。CNN固定34维残基编码、PLM上下文、序列pair、共享原型与标签因子仍工作；TheraSet的显式结构、独立属性及化学注记开关自动关闭。所有来源的缺失模态mask一致；Train拟合标签先验、原型容量等统计，Val/Test不参与拟合。两套ESM仍冻结并分别提取新缓存：
+
+- `features/therapep_ai/esm2_650m/{train,val,test}`
+- `features/therapep_ai/esm2_peptide_150m/{train,val,test}`
+
+作者成员不同，不能把原两任务按split保存的缓存直接拿来替换新缓存。训练准备默认仅提取Train/Val，独立Test评价时再单独提取Test。
+
+模型仍使用TheraSet自己的ASL和R-Drop/EMA：正样本中的功能0继续是降权未标注项；合成背景的49位零标签，以及全局治疗标志的0/1，都作为显式监督。合成背景的零标签是作者指定的代理阴性，不是湿实验确认的无活性。该变更没有把损失替换成作者加权BCE，也未加入作者的五模型集成、长度50截断或随机循环放置，因此是同数据比较，不是TheraPep-AI完整复现。
+
+默认选模为 `micro_f1`、阈值`>=0.5`，patience与其他TheraSet设置保持不变。作者当前代码采用`>0.5`，若严格复现作者报告还需注明这一边界差异。关闭major15独立功能投影，不把49个输出当作49项互相独立的生物学功能，不输出无法定义的major15 MFP分数。
+
+`results.json` 中 `validation` 是全部验证记录的49维指标，`therapep_validation` 另外提供：`positive_all49`（真实/恢复正样本）、`all_functions48`、`positive_functions48`、`therapeutic_flag`（二分类指标）、`synthetic_background.any_function_fpr`及`therapeutic_flag_fpr`。评价命令同样在输出的`therapep`字段提供这些视图。项目的`accuracy`仍指样本Jaccard，空真值且空预测按0计分；包含大量全零背景时不能将它与作者逐标签准确率相混，另提供`all49_labelwise_accuracy`用于区分。合成背景FPR不能报告成真实生物学FPR。
+
+RTX5070 / PowerShell，在新代码已同步且项目目录无现有训练时执行。此处先使用保守的batch16×累积4；49维解码成本不同，应先测本任务再决定是否扩大batch。
+
+```powershell
+Set-Location 'D:\Data\ChatGPT\mfp\MFP-Nova'
+$mfpPython = 'D:\App\Code\Anaconda\envs\MFP-Nova\python.exe'
+$env:PYTHONPATH = Join-Path $PWD.Path 'src'
+$env:CUDA_VISIBLE_DEVICES = '0'
+$env:OMP_NUM_THREADS = '4'
+$env:MKL_NUM_THREADS = '4'
+& $mfpPython -m mfp_nova.cli download-therapep
+if ($LASTEXITCODE -ne 0) { throw '作者数据下载或读取失败。' }
+foreach ($View in @('primary', 'peptide')) {
+  $Cache = if ($View -eq 'primary') { 'features/therapep_ai/esm2_650m' } else { 'features/therapep_ai/esm2_peptide_150m' }
+  foreach ($Split in @('train', 'val')) {
+    if (Test-Path -LiteralPath "$Cache/$Split/metadata.json") { continue }
+    & $mfpPython -u -m mfp_nova.cli features --config configs/theraset.yaml `
+      --track therapep49 --encoder-view $View --splits $Split --device cuda:0 --batch-size 8
+    if ($LASTEXITCODE -ne 0) { throw "新基准缓存提取失败：$View/$Split" }
+  }
+}
+$Tag = Get-Date -Format 'yyyyMMdd_HHmmss'
+$GpuCheckDir = "runs/gpucheck_theraset_therapep49_$Tag"
+& $mfpPython -u -m mfp_nova.cli gpu-check --models theraset --tasks therapep49 `
+  --device cuda:0 --batch-sizes 16 --precisions fp32 --samples 128 --steps 16 --output $GpuCheckDir
+if ($LASTEXITCODE -ne 0) { throw '新基准GPU诊断异常。' }
+$RunName = "theraset_therapep49_microf1_seed42_rtx5070_$Tag"
+& $mfpPython -u -m mfp_nova.cli train --model theraset --task therapep49 `
+  --metric-suite micro_f1 --seed 42 --device cuda:0 --precision fp32 `
+  --batch-size 16 --accumulation-steps 4 --num-workers 0 --name $RunName
+```
+
+V100 / Ubuntu Bash，在同一新代码与缓存准备口径下，选择GPU和CPU线程；提取及训练在后台运行，失败直接退出，断开SSH可继续。
+
+```bash
+cd ~/wuzhencheng/projects/MFP-Nova
+conda activate MFP-Nova
+GPU=0
+CPU_THREADS=16
+tag=$(date +%Y%m%d_%H%M%S)
+mkdir -p runs
+nohup env CUDA_VISIBLE_DEVICES="$GPU" OMP_NUM_THREADS="$CPU_THREADS" MKL_NUM_THREADS="$CPU_THREADS" \
+  PYTHONPATH="$PWD/src" MFP_PYTHON="$(command -v python)" RUN_TAG="$tag" bash -c '
+set -e
+"$MFP_PYTHON" -m mfp_nova.cli download-therapep
+for view in primary peptide; do
+  if [ "$view" = primary ]; then cache=features/therapep_ai/esm2_650m; else cache=features/therapep_ai/esm2_peptide_150m; fi
+  for split in train val; do
+    if [ -f "$cache/$split/metadata.json" ]; then continue; fi
+    "$MFP_PYTHON" -u -m mfp_nova.cli features --config configs/theraset.yaml \
+      --track therapep49 --encoder-view "$view" --splits "$split" --device cuda:0 --batch-size 8
+  done
+done
+"$MFP_PYTHON" -u -m mfp_nova.cli gpu-check --models theraset --tasks therapep49 \
+  --device cuda:0 --batch-sizes 16 --precisions fp32 --samples 128 --steps 16 \
+  --output "runs/gpucheck_theraset_therapep49_${RUN_TAG}"
+exec "$MFP_PYTHON" -u -m mfp_nova.cli train --model theraset --task therapep49 \
+  --metric-suite micro_f1 --seed 42 --device cuda:0 --precision fp32 \
+  --batch-size 16 --accumulation-steps 4 --num-workers 0 \
+  --name "theraset_therapep49_microf1_seed42_v100_${RUN_TAG}"
+' > "runs/theraset_therapep49_${tag}.log" 2>&1 < /dev/null &
+echo "PID=$! Log=runs/theraset_therapep49_${tag}.log"
+```
+
+共享`evaluate`会默认读取checkpoint保存的数据根目录，避免误用`data/therapeutic_2025`。多Seed入口支持显式`--task therapep49`；`all`仍保留原major15/fine39的50组计划，不自动启动新基准的大批量实验。新增任务与受影响流程累计77项相关测试通过，覆盖CSV成员与标签、监督权重、独立缓存、短训练/恢复/评价/预测，以及其他共享模型的49维前后向；三份真实CSV已读通。此任务新增的是数据/标签口径，尚未完成真实GPU训练，不报告模型性能。
 
 ## 10. 本次验证与结论边界
 

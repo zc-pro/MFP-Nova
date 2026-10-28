@@ -1,8 +1,8 @@
 # MFP-Nova
 
-独立的治疗肽多标签预测科研项目。当前专注 **`data/therapeutic_2025/`**，任务为 `major15` 和 `fine39`；同类论文的数据集仅作后续补充基准准备。
+独立的治疗肽多标签预测科研项目。主数据 **`data/therapeutic_2025/`** 提供 `major15` 和 `fine39`；新增 `therapep49` 使用独立目录 **`data/therapep_ai/`** 中 TheraPep-AI 作者发布的 Train/Val/Test 与49维标签，作为同论文数据口径的补充比较。
 
-项目统一维护五个研究模型：**TriRelay、GeoFactor、ProtoRoute、HelixSet、TheraSet**。前三模型已完成两任务各五 Seed 的首轮训练及独立 Test；HelixSet 原版、decay30、精简版、ESM尾部LoRA及早期取证方案均已完成major15/seed42 Train/Val。双表征R-Drop版已完成major15/seed42真实训练，传统最佳Val Acc64.96%/AT54.73%，AP候选Macro-AP58.43%。2026-10-26暂选此架构为汇报候选，准备fine39独立训练及两任务Test；实际Test尚未执行，命令见本文末节。2026-10-28新增 TheraSet，已完成实现与小批量检查，尚无正式训练性能结果。
+项目统一维护五个研究模型：**TriRelay、GeoFactor、ProtoRoute、HelixSet、TheraSet**。前三模型已完成两任务各五 Seed 的首轮训练及独立 Test；HelixSet 原版、decay30、精简版、ESM尾部LoRA及早期取证方案均已完成major15/seed42 Train/Val。双表征R-Drop版已完成major15/seed42真实训练，传统最佳Val Acc64.96%/AT54.73%，AP候选Macro-AP58.43%。2026-10-26暂选此架构为汇报候选，准备fine39独立训练及两任务Test；实际Test尚未执行，命令见本文末节。TheraSet 于2026-10-28完成两任务seed42完整Train/Val：major15 Acc65.08%/AT54.51%，fine39 Acc59.58%/AT47.77%；复算与训练记录一致，尚无独立Test或多Seed结论，详见[实验记录](docs/experiment-history.md#2026-10-28theraset-两任务-seed42-正式-trainval-结果)。
 
 ## 五模型入口
 
@@ -16,9 +16,9 @@
 
 五个模型共用 `research.py` 的训练、恢复、评价和推理流程，使用同一套数据加载与基础神经网络层。`sequence` 仍是独立的轻量对照基线。
 
-- 单次训练：`mfp_nova.cli train --model` 支持上述五个名称，`--task` 选择 `major15/fine39`。
+- 单次训练：`mfp_nova.cli train --model` 支持上述五个名称，`--task` 选择 `major15/fine39/therapep49`。
 - 评价与推理：统一使用 `evaluate`、`predict`、`summarize`。
-- 多 Seed：`mfp_nova.experiments` 与 `scripts/run_multiseed.ps1` 已纳入五模型；`all` 为五模型 × 两任务 × 五 Seed，共 50 组候选任务。运行脚本才会执行，文件整理不会启动训练。
+- 多 Seed：`mfp_nova.experiments` 与 `scripts/run_multiseed.ps1` 已纳入五模型；`all` 仍为五模型 × 原两任务 × 五 Seed，共 50 组候选任务。新基准通过 `--task therapep49` 显式选择。运行脚本才会执行。
 - GPU 诊断：`gpu-check --models` 支持五模型，HelixSet/TheraSet 的关键模块检查点已列入源码；本轮仅做本地 CPU 检查。
 
 五模型都支持 `--metric-suite traditional5|task_specific`。HelixSet/TheraSet 当前默认传统五指标，前三模型保留原 AP 选模协议；批量计划会记录模式。跨模型正式比较时须明确统一的选模和阈值协议，不能将不同模式混成同一组结果。
@@ -65,10 +65,13 @@ runs/                         # 训练输出、权重和分析，不提交 Git
 |---|---:|---:|---:|---:|
 | major15 | 15 | 39,478 | 8,534 | 8,187 |
 | fine39 | 39 | 39,455 | 8,529 | 8,180 |
+| therapep49（独立作者发布基准） | 48功能＋1全局标志 | 131,947 | 16,457 | 16,537 |
 
 0 表示未标注，fine39 的 `__unknown` 表示具体亚类未知。Train 学参数，Validation 选模型与阈值，Test 作独立最终评价。主数据、既有 ESM 缓存与历史运行目录不因源码归类而重建。
 
 环境按设备适配：V100 保留 Conda 克隆环境中的 PyTorch 2.4.1+cu121；RTX 5070 使用 [environment-rtx5070.yaml](configs/environment-rtx5070.yaml) 对应的 Blackwell 构建。主要依赖和实验协议保持一致。
+
+`therapep49` 保留作者 CSV 成员、49位标签顺序及合成背景，包含55,655条真实/恢复正样本与109,286条合成背景；采用作者发布划分，不具备主基准的簇隔离口径。运行 `python -m mfp_nova.cli download-therapep` 下载原CSV；`features --config configs/theraset.yaml --track therapep49` 创建独立缓存，`train --model theraset --task therapep49` 默认 Micro-F1/固定0.5选模。新基准对所有来源统一使用序列与ESM，避免仅正样本有结构/属性造成背景标签泄漏；原两任务保留完整模态。数据、缓存路径、两平台准备与训练命令见 [TheraSet文档](docs/TheraSet-Architecture.md#therapep-ai-作者发布基准therapep49)。
 
 ## 文档导航
 
@@ -84,7 +87,7 @@ runs/                         # 训练输出、权重和分析，不提交 Git
 
 TheraSet 保留 TheraPep-AI 的 34 维残基编码、两级 3/5/7/9 CNN 与直接分类头，新增共享多原型查询、独立多源证据读取、因子化残基对及标签条件残差。major15/fine39 下游可训练参数分别为 10,376,854 / 10,404,206，另有约 800M 冻结编码器。默认双 ESM、batch16×累积4、FP32、R-Drop 和 EMA，与当前 HelixSet 的主要训练协议对齐。
 
-`train --model theraset` 使用新配置；`--ablate evidence_decoder chemical_evidence` 是适配后的纯 CNN 对照，不能称为原论文完整复现。已通过正确性与训练/恢复/推理检查，两任务真实输入均完成两步 CPU 小批量优化，尚未做正式性能比较或 GPU 性能测试。完整设计与两平台命令见 [TheraSet 文档](docs/TheraSet-Architecture.md)。
+`train --model theraset` 使用新配置；`--ablate evidence_decoder chemical_evidence` 是适配后的纯 CNN 对照，不能称为原论文完整复现。两任务已完成RTX5070/FP32/batch64×累积1/seed42完整Train/Val，均为EMA候选，39/33轮正常早停；主候选epoch24/18，阈值0.74/0.68，显存峰值4.20/7.50GiB。major15相对HelixSet的Jaccard差异仅+0.11个百分点，按簇配对bootstrap区间跨零；主要已证实收益是更低成本，尚未完成TheraPep适配CNN对照与模块消融。完整设计与两平台命令见 [TheraSet 文档](docs/TheraSet-Architecture.md)。
 
 ## HelixSet：双冻结表征与Bernoulli R-Drop
 

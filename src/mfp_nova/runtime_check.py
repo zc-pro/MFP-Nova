@@ -103,6 +103,9 @@ def profile(config, source, dataset, device, batches, precisions, measured_steps
         input_check = check_inputs(model, samples, device, precision)
         parameters = dict(model.named_parameters())
         probe_keys = list(PROBES[config["model_name"]])
+        if config["data"]["track"] == "therapep49":
+            probe_keys = [key for key in probe_keys if not any(
+                absent in key for absent in ("geometry", "interactions.", "collaboration."))]
         if getattr(model, "esm_tail", None) is not None:
             probe_keys.append("esm_tail.layers.0.attention.self.query.lora_B.weight")
         if hasattr(model, "early_evidence"):
@@ -189,6 +192,11 @@ def profile(config, source, dataset, device, batches, precisions, measured_steps
 
 def run(models, tasks, feature_root, device, output, esm="650m", batches=(2, 4, 8, 16),
         precisions=("fp32", "fp16"), steps=32, samples=128, data_root="data/therapeutic_2025", peptide_feature_root=None):
+    if set(tasks) == {"therapep49"}:
+        if str(data_root) == "data/therapeutic_2025":
+            data_root = "data/therapep_ai"
+        if str(feature_root) == f"features/esm2_{esm}":
+            feature_root = f"features/therapep_ai/esm2_{esm}"
     environment = inspect(feature_root, device)
     print(json.dumps(environment, ensure_ascii=False, indent=2), flush=True)
     active = environment["gpu"]["other_compute_processes"]
@@ -208,12 +216,18 @@ def run(models, tasks, feature_root, device, output, esm="650m", batches=(2, 4, 
     for name in models:
         for task in tasks:
             config = yaml.safe_load(Path(f"configs/{name}.yaml").read_text(encoding="utf-8"))
-            config["data"].update(root=str(data_root), track=task, features=str(feature_root))
+            from .therapep import configure_task
+            configure_task(config, task)
+            if task != "therapep49" or str(data_root) != "data/therapeutic_2025":
+                config["data"]["root"] = str(data_root)
+            if task != "therapep49" or str(feature_root) != f"features/esm2_{esm}":
+                config["data"]["features"] = str(feature_root)
             if peptide_feature_root is not None and name in ("helixset", "theraset"):
                 config["data"]["peptide_features"] = str(peptide_feature_root)
             config["encoder"]["name"] = "facebook/esm2_t33_650M_UR50D" if esm=="650m" else "facebook/esm2_t12_35M_UR50D"
             source = MultimodalData(config["data"]["root"], task)
-            data = MultimodalPeptides(source, feature_root, "train", samples, config["data"].get("peptide_features"))
+            task_features = config["data"]["features"]
+            data = MultimodalPeptides(source, task_features, "train", samples, config["data"].get("peptide_features"))
             validate_cache(data, config)
             groups = source.groups(data.indices, source.data.y[data.indices])
             integration = {"rows": len(data), "esm_dim": data.meta["input_dim"], "encoder": data.meta,
@@ -243,7 +257,7 @@ def run(models, tasks, feature_root, device, output, esm="650m", batches=(2, 4, 
             restored = train(continued, f"{name}_{task}_resume", resume=root/f"{name}_{task}"/"last.pt")
             model, checkpoint = load_model(root/f"{name}_{task}_resume"/"best.pt", device)
             source = MultimodalData(config["data"]["root"], task, checkpoint["statistics"])
-            val = MultimodalPeptides(source, feature_root, "val", min(samples, 64), config["data"].get("peptide_features"))
+            val = MultimodalPeptides(source, task_features, "val", min(samples, 64), config["data"].get("peptide_features"))
             loader = torch.utils.data.DataLoader(val, batch_size=chosen["batch_size"], collate_fn=collate_multimodal)
             y, p = predict_loader(model, loader, device, chosen["precision"])
             evaluation = metrics(y, p, source.statistics, checkpoint["threshold"])

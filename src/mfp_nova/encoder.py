@@ -105,5 +105,6 @@ def prepare_features(config, splits, device, resume_from=0, encoder_view="primar
         np.save(root / "ids.npy", data.ids[indices])
         np.save(root / "sequences.npy", data.sequences[indices])
         metadata = {**encoder.metadata, "split": split, "rows": len(indices),
-                    "dataset": json.loads((data.root / "manifest.json").read_text(encoding="utf-8"))["version_date"]}
+                    "dataset": (data.dataset_id if data.track == "therapep49" else
+                                json.loads((data.root / "manifest.json").read_text(encoding="utf-8"))["version_date"])}
         (root / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
