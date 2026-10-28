@@ -235,7 +235,9 @@ z_c=z_c^{CNN}+g_c\Delta_c.
 
 ## 8. 消融与正式比较
 
-先在 major15/seed42 做开发阶段比较，依据 Validation 选择候选；确定方法后在 major15、fine39 使用 42/101/202/303/404 五个固定 seed。保持相同修复划分、标签集合、原样本、选模指标、阈值策略和训练预算。比较均报告单模型；集成另列，不能让五成员对单模型成为不注明的混杂因素。
+当前执行范围按2026-10-28约定更新：固定 **seed42**，在 **major15、fine39、therapep49** 分别完成剩余消融，并分别运行 **traditional5、micro_f1** 两种独立选模/早停协议。major15使用物理batch128，fine39和therapep49使用物理batch64，全部累积1、FP32；RTX5070和V100保持相同设置。最大100epoch、patience15、学习率和R-Drop/EMA日程沿用配置。两套协议各自保存最佳模型；每套结果都包含传统五指标、AP与F1，不能混取两个候选的最佳数字。`traditional5`以Validation拟合阈值Jaccard选模；`micro_f1`以Validation Micro-F1@0.5选模、固定0.5，不使用Test。
+
+本轮是单seed消融，不是五seed正式结论。确定方法后再使用42/101/202/303/404做正式多seed比较。比较均报告单模型；集成另列。
 
 | 比较 | 当前入口 | 隔离的问题 |
 |---|---|---|
@@ -250,9 +252,165 @@ z_c=z_c^{CNN}+g_c\Delta_c.
 | 无标签因子 | `--ablate label_context` | 条件集合关系贡献 |
 | 无 R-Drop | `--rdrop-weight 0` | 训练一致性贡献 |
 
+对应队列名称依次为`cnn`、`cnn_chemical`、`full`、`no_plm`、`no_property`、`no_structure`、`no_pair`、`single_prototype`、`no_label_context`、`no_rdrop`。`therapep49`统一关闭理化、结构、化学输入，因此跳过重复的`cnn_chemical`、`no_property`、`no_structure`；保留7种有效配置。`no_plm`关闭两套PLM的上下文读取，不是只去掉其中一套。
+
+| 任务 | batch×累积 | 配置数×协议数 | 本轮处理 |
+|---|---:|---:|---|
+| major15 | 128×1 | 10×2=20 | 原完整模型batch64不能作同设置基线，需要补batch128完整模型 |
+| fine39 | 64×1 | 10×2=20 | 自动复用本机`runs/theraset_*`中配置一致的两组已完成完整模型；通常剩18组 |
+| therapep49 | 64×1 | 7×2=14 | 作者发布Train/Val成员及49维标签，包含合成背景 |
+
+总计54个有效槽位，fine39两组完整模型在训练机器上可用时剩52组。复用只比对模型、输入、损失及训练配置，不按分数选旧实验；两台机器各自检查本机运行目录。旧结果目录没有迁移到V100时，V100会补齐完整模型。`plan`显示实际已完成、待续训、新训练数量。
+
+`therapep49`传统五指标仍沿用项目公式：Accuracy为样本Jaccard，空真值/空预测计0，因此全零合成背景不会获得Jaccard加分；它不是作者逐标签Accuracy。结果另外输出`therapep_validation`中的49维逐标签Accuracy、正样本49维/纯48功能、治疗标志和合成背景FPR。不同任务或不同公式的数值不能直接横比。
+
 这些是模型内的输入/路径消融，不等于完整正交实验矩阵。尤其完整模型比 CNN 多了预训练表征和多模态输入，整体差值不能全部归因于解码算法；至少补充无 PLM 与无理化/结构比较，再讨论算法贡献。采用同输入 CNN 池化分类头等进一步严格对照时，应明确它与当前 34 维 CNN 对照的不同。
 
 统一报告 Micro/Macro AP、Micro/Macro F1、传统五指标、尾类、长度、D 注记、结构可用性、多功能检测与独立功能预测，并给出训练耗时、峰值显存、参数量及新序列编码成本。各 seed 的均值/标准差与配对差值比单个最佳 seed 更有说服力。只有完成这些实验，才能判断是否“保持性能优秀”。
+
+### 8.1 队列与断点续训
+
+入口为`python -m mfp_nova.theraset_ablation`，支持`plan`、`prepare`、`run`、`pause`、`pack`。可用`--tasks`、`--variants`、`--suites`选择子集；省略时为上述完整矩阵。队列目录固定，不能每次续训换时间戳或输出目录：
+
+```text
+runs/theraset_ablation_seed42_<platform>/
+  major15/no_pair/traditional5/{metadata.json,last.pt,history.jsonl,results.json,...}
+  major15/no_pair/traditional5.log
+  ...
+```
+
+`run`跳过完成结果，自动从未完成实验的`last.pt`原目录续训。恢复模型、optimizer、scheduler、scaler、EMA、最佳候选、patience及Python/NumPy/PyTorch/CUDA/DataLoader随机状态。`pause`在队列根目录创建`PAUSE`；每个正在训练的任务完成当前epoch、保存断点后退出，不生成假的完成结果。删除`PAUSE`并重复原启动命令即可继续。处于最后epoch或已经达到早停条件的实验正常完成，然后停止队列。
+
+`last.pt`先写临时文件，再替换旧断点，避免写入途中中断破坏上一完整epoch。强制中断时从上一完整epoch重算；尚未保存第一个epoch时重新训练第一轮。续训保留原始metadata及连续history，补回保存断点后尚未来得及追加的那条history。GPU浮点运算仍可能存在非确定性，不能承诺跨硬件逐位相同。
+
+先暂停并等当前任务退出后再重启，不能同时启动两个写入同一任务目录的队列。代码更新只在启动前完成，续训时保持同一版本。这里只准备训练入口，未在本地CPU机器上启动54组正式训练。
+
+### 8.2 RTX5070：PowerShell
+
+首次启动（仓库更新前确保旧训练已经退出）：
+
+```powershell
+$ErrorActionPreference = 'Stop'
+Set-Location 'D:\Data\ChatGPT\mfp\MFP-Nova'
+git pull --ff-only origin main
+if ($LASTEXITCODE -ne 0) { throw '代码同步失败。' }
+$mfpPython = 'D:\App\Code\Anaconda\envs\MFP-Nova\python.exe'
+$env:PYTHONPATH = Join-Path $PWD.Path 'src'
+$env:CUDA_VISIBLE_DEVICES = '0'
+$env:OMP_NUM_THREADS = '4'
+$env:MKL_NUM_THREADS = '4'
+$RunRoot = 'runs/theraset_ablation_seed42_rtx5070'
+
+& $mfpPython -u -m mfp_nova.theraset_ablation plan --output $RunRoot
+& $mfpPython -u -m mfp_nova.theraset_ablation prepare --device cuda:0
+if ($LASTEXITCODE -ne 0) { throw '缓存准备失败，请按提取日志处理后再训练。' }
+& $mfpPython -u -m mfp_nova.theraset_ablation run --output $RunRoot --device cuda:0 --cpu-threads 4
+if ($LASTEXITCODE -ne 0) { throw '队列已中断，修复日志中的错误后用相同run命令续训。' }
+```
+
+`prepare`只提取缺少的Train/Val缓存，major15/fine39复用同一套双ESM，therapep49单独提取，不自动提取Test。若特征提取中断，仍按提取日志给出的行数使用原`features --resume-from`续提；训练断点不适用于缓存提取。大型缓存可按三机约定传输。
+
+在另一PowerShell窗口暂停（使用相同项目目录和Python路径）：
+
+```powershell
+Set-Location 'D:\Data\ChatGPT\mfp\MFP-Nova'
+$mfpPython = 'D:\App\Code\Anaconda\envs\MFP-Nova\python.exe'
+$env:PYTHONPATH = Join-Path $PWD.Path 'src'
+& $mfpPython -m mfp_nova.theraset_ablation pause --output runs/theraset_ablation_seed42_rtx5070
+```
+
+原训练窗口退出后续训；关闭窗口或重启后同样执行下面的块，无需重新pull代码：
+
+```powershell
+Set-Location 'D:\Data\ChatGPT\mfp\MFP-Nova'
+$mfpPython = 'D:\App\Code\Anaconda\envs\MFP-Nova\python.exe'
+$env:PYTHONPATH = Join-Path $PWD.Path 'src'
+$env:CUDA_VISIBLE_DEVICES = '0'
+$RunRoot = 'runs/theraset_ablation_seed42_rtx5070'
+Remove-Item -LiteralPath "$RunRoot/PAUSE" -ErrorAction SilentlyContinue
+& $mfpPython -u -m mfp_nova.theraset_ablation run --output $RunRoot --device cuda:0 --cpu-threads 4
+```
+
+完成后打包（也支持暂停后的部分结果，文件名含完成数）：
+
+```powershell
+& $mfpPython -m mfp_nova.theraset_ablation pack `
+  --output runs/theraset_ablation_seed42_rtx5070 --platform rtx5070
+```
+
+### 8.3 V100：Ubuntu Bash，三卡后台
+
+保留MFP-Nova独立Conda环境的PyTorch2.4.1+cu121，不升级原环境。三张已获分配的GPU分别负责major15、fine39、therapep49；这是三个独立实验队列，不是DDP。`GPUS='0 1 2'`可替换为实际卡号，`CPU_THREADS=4`是每个队列的线程数。
+
+首次启动；脚本先在第一张卡上顺序补缓存，避免major15/fine39同时写共享缓存，然后启动三个任务：
+
+```bash
+cd ~/wuzhencheng/projects/MFP-Nova
+conda activate MFP-Nova
+git pull --ff-only origin main
+export PYTHONPATH="$PWD/src"
+RUN_ROOT=runs/theraset_ablation_seed42_v100
+mkdir -p "$RUN_ROOT"
+python -m mfp_nova.theraset_ablation plan --output "$RUN_ROOT"
+nohup env PYTHON_BIN="$(command -v python)" GPUS='0 1 2' CPU_THREADS=4 RUN_ROOT="$RUN_ROOT" \
+  bash scripts/run_theraset_ablations.sh >> "$RUN_ROOT/launcher.log" 2>&1 < /dev/null &
+echo "Launcher PID=$!"
+```
+
+关闭SSH后继续运行。查看进度：
+
+```bash
+tail -n 30 runs/theraset_ablation_seed42_v100/launcher.log
+tail -n 20 runs/theraset_ablation_seed42_v100/major15.log
+tail -n 20 runs/theraset_ablation_seed42_v100/fine39.log
+tail -n 20 runs/theraset_ablation_seed42_v100/therapep49.log
+```
+
+暂停全部三个任务，等待每个日志显示`Paused after epoch`或当前实验完成、队列退出：
+
+```bash
+python -m mfp_nova.theraset_ablation pause --output runs/theraset_ablation_seed42_v100
+```
+
+重新登录后续训（相同输出目录，既有完成实验跳过）：
+
+```bash
+cd ~/wuzhencheng/projects/MFP-Nova
+conda activate MFP-Nova
+export PYTHONPATH="$PWD/src"
+RUN_ROOT=runs/theraset_ablation_seed42_v100
+rm -f "$RUN_ROOT/PAUSE"
+nohup env PYTHON_BIN="$(command -v python)" GPUS='0 1 2' CPU_THREADS=4 RUN_ROOT="$RUN_ROOT" \
+  bash scripts/run_theraset_ablations.sh >> "$RUN_ROOT/launcher.log" 2>&1 < /dev/null &
+echo "Launcher PID=$!"
+```
+
+若仅补一个任务，可在缓存准备完成后单独启动（不要同时运行另一个负责同任务的队列）：
+
+```bash
+nohup env CUDA_VISIBLE_DEVICES=2 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 PYTHONPATH="$PWD/src" \
+  python -u -m mfp_nova.theraset_ablation run --tasks therapep49 --device cuda:0 --cpu-threads 4 \
+  --output runs/theraset_ablation_seed42_v100 \
+  >> runs/theraset_ablation_seed42_v100/therapep49.log 2>&1 < /dev/null &
+```
+
+完成后打包：
+
+```bash
+python -m mfp_nova.theraset_ablation pack \
+  --output runs/theraset_ablation_seed42_v100 --platform v100
+```
+
+两端默认将ZIP输出到`runs/`，例如：
+
+```text
+theraset_all-ablations_seed42_rtx5070_major15-b128_fine39-b64_therapep49-b64_traditional5-microf1_54of54_20261030_120000.zip
+theraset_all-ablations_seed42_v100_major15-b128_fine39-b64_therapep49-b64_traditional5-microf1_54of54_20261030_120000.zip
+```
+
+`54of54`为完成数/计划数，未完成时据实变化；选择任务或消融子集时文件名同步变化。包内保留`任务/消融/协议`目录、完整结果JSON、逐样本概率NPZ、history、诊断和日志；`summary.csv`包含54个槽位及其完成情况和关键指标。复用的旧完整模型放在`reused/原运行名/`。默认不打包权重、缓存或原始数据；`last.pt`和`best.pt`留在训练机器以供续训和最终评价。
+
+目前仅在CPU小型数据上验证了暂停续训及恢复一致性，尚未在两端实测本轮batch128/64的完整训练；显存不足会明确报错并停止该任务，不自动改变batch或精度。已有RTX5070完整模型batch64结果支持major15约4.2GiB、fine39约7.5GiB；major15 batch128和therapep49 batch64仍需以实际运行峰值为准。
 
 ## 9. 代码接口与运行
 

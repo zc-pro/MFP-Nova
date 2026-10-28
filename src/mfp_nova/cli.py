@@ -38,6 +38,8 @@ def main(argv=None):
                              help="Research models: primary report and checkpoint selection protocol")
             sub.add_argument("--task", choices=TRACKS, help="Alias for --track")
             sub.add_argument("--resume", help="last.pt with optimizer and RNG state; creates a new run")
+            sub.add_argument("--resume-in-place", action="store_true", help="Research models: append to the same interrupted run")
+            sub.add_argument("--stop-file", help="Research models: pause after a complete epoch when this file exists")
             sub.add_argument("--ablate", nargs="*", help="Model switches to disable, e.g. feedback high_order")
             sub.add_argument("--threshold-strategy", choices=("global", "per_label"))
             sub.add_argument("--limit-samples", type=int, help="Diagnostic subset, not a performance experiment")
@@ -239,9 +241,16 @@ def main(argv=None):
                 config["model"]["use_local"] = False
             name = args.name or f"{model_name}_{config['data']['track']}_seed{config['train']['seed']}"
             if model_name == "sequence":
+                if args.resume_in_place or args.stop_file:
+                    raise ValueError('Pause/in-place resume currently requires a research model')
                 train(config, name)
             else:
-                train(config, name, resume=args.resume)
+                continuation = {}
+                if args.resume_in_place:
+                    continuation['resume_in_place'] = True
+                if args.stop_file:
+                    continuation['stop_file'] = args.stop_file
+                train(config, name, resume=args.resume, **continuation)
     elif args.command == "evaluate":
         import torch
         checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)

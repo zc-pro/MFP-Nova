@@ -227,7 +227,33 @@ def make_optimizer(model, settings):
     return torch.optim.AdamW(groups, lr=settings["learning_rate"], weight_decay=settings["weight_decay"])
 
 
-def train(config, name, resume=None):
+def save_last_checkpoint(checkpoint, path):
+    """Keep the previous complete epoch if saving is interrupted."""
+    path = Path(path)
+    temporary = path.with_suffix('.pt.tmp')
+    torch.save(checkpoint, temporary)
+    temporary.replace(path)
+
+
+def restore_history(run, checkpoint):
+    """Discard uncommitted lines and recover the epoch saved just before interruption."""
+    path = run / 'history.jsonl'
+    records = []
+    if path.exists():
+        for line in path.read_text(encoding='utf-8').splitlines():
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                break  # A process can stop halfway through the final append.
+            if record['epoch'] <= checkpoint['epoch']:
+                records.append(record)
+    if 'history_record' in checkpoint:
+        records = [r for r in records if r['epoch'] < checkpoint['epoch']]
+        records.append(checkpoint['history_record'])
+    path.write_text(''.join(json.dumps(r, allow_nan=False)+'\n' for r in records), encoding='utf-8')
+
+
+def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     settings = config["train"]
     device = torch.device(settings["device"])
     if device.type=="cuda":
@@ -356,7 +382,21 @@ def train(config, name, resume=None):
         args["function_aux_statistics"] = source.statistics["function_auxiliary"]
     model = make_model(config["model_name"], args).to(device)
     run = Path(settings["output"])/name
-    run.mkdir(parents=True, exist_ok=False)
+    if resume_in_place:
+        if (run/'results.json').exists():
+            raise ValueError('This run is already complete; use a new name for another experiment')
+        if resume is not None:
+            if Path(resume).resolve() != (run/'last.pt').resolve():
+                raise ValueError('In-place resume requires this run directory\'s last.pt')
+            restore_history(run, checkpoint)
+        elif (run/'last.pt').exists() or (run/'history.jsonl').exists():
+            raise ValueError('Continue this run using --resume last.pt')
+        else:
+            # An interruption before epoch one committed has no state to resume.
+            run.mkdir(parents=True, exist_ok=True)
+            print('Restarting the uncommitted first epoch.', flush=True)
+    else:
+        run.mkdir(parents=True, exist_ok=False)
     optimizer = make_optimizer(model, settings)
     precision = settings.get("precision", "fp32")
     accumulation = settings.get("accumulation_steps", 1)
@@ -472,7 +512,8 @@ def train(config, name, resume=None):
         metadata["selection_candidates"] = {"primary": suite, "alternate": alternate_suite,
                                             "tracking_start_epoch": candidate_start,
                                             "stopping": "primary suite only; one shared optimizer trajectory"}
-    write_json(run/"metadata.json", metadata)
+    if not resume_in_place or checkpoint is None:
+        write_json(run/"metadata.json", metadata)
     static = {"model_name": config["model_name"], "model_args": args, "config": config, "statistics": source.statistics,
               "labels": source.data.labels, "track": source.data.track, "encoder": datasets[0].meta, "planned_epochs": planned_epochs}
     if device.type == "cuda":
@@ -645,7 +686,9 @@ def train(config, name, resume=None):
         numpy_rng = np.random.get_state()
         candidate_checkpoint = ({"alternate_best": alternate_best, "selection_tracking_start_epoch": candidate_start}
                                 if save_candidates else {})
-        torch.save({**static, **ema_checkpoint, **candidate_checkpoint, "best_weights": best_weights, "model_state": checkpoint_state(model), "optimizer_state": optimizer.state_dict(),
+        history.update(seconds=time.perf_counter()-epoch_start, elapsed_seconds=elapsed_before+time.perf_counter()-started)
+        save_last_checkpoint({**static, **ema_checkpoint, **candidate_checkpoint, "history_record": history,
+                    "best_weights": best_weights, "model_state": checkpoint_state(model), "optimizer_state": optimizer.state_dict(),
                     "scheduler_state": scheduler.state_dict(), "best_model_state": best_state,
                     "scaler_state": scaler.state_dict(), "global_step": global_step,
                     "best_key": best_key, "best_epoch": best_epoch, "epoch": epoch, "stale": stale,
@@ -655,7 +698,6 @@ def train(config, name, resume=None):
                     "cuda_rng": torch.cuda.get_rng_state(device) if device.type=="cuda" else None,
                     "elapsed_seconds": elapsed_before+time.perf_counter()-started,
                     "peak_cuda_memory_bytes": peak_memory if device.type=="cuda" else None}, run/"last.pt")
-        history.update(seconds=time.perf_counter()-epoch_start, elapsed_seconds=elapsed_before+time.perf_counter()-started)
         with (run/"history.jsonl").open("a", encoding="utf-8") as f:
             f.write(json.dumps(history, allow_nan=False)+"\n")
         print(format_epoch(config["model_name"], source.data.track, settings["seed"], settings["epochs"], history, settings["patience"]), flush=True)
@@ -706,6 +748,9 @@ def train(config, name, resume=None):
             break
         if settings.get("max_steps") and global_step>=settings["max_steps"]:
             break
+        if stop_file is not None and Path(stop_file).exists() and epoch < settings['epochs']:
+            print(f'Paused after epoch {epoch}; continue from {run / "last.pt"}', flush=True)
+            return {'paused': True, 'epoch': epoch, 'checkpoint': str(run/'last.pt')}
     restore_model_state(model, best_state)
     y, probabilities, validation_loss = predict_loader(model, loaders[1], device, precision, config["loss"])
     threshold = final_threshold(y, probabilities, suite, settings.get("threshold_strategy", "global"))
@@ -714,7 +759,7 @@ def train(config, name, resume=None):
     if device.type=="cuda":
         peak_memory = max(peak_memory, torch.cuda.max_memory_allocated(device))
     if terminal_resume:
-        torch.save({**checkpoint, **static, "elapsed_seconds": elapsed_before+time.perf_counter()-started}, run/"last.pt")
+        save_last_checkpoint({**checkpoint, **static, "elapsed_seconds": elapsed_before+time.perf_counter()-started}, run/"last.pt")
     result = {"model": config["model_name"], "task": source.data.track, "seed": settings["seed"],
               "best_epoch": best_epoch, "epochs_completed": epoch, "threshold": threshold, "threshold_fit_split": protocol["threshold_fit_split"],
               "global_step": global_step, "precision": precision, "accumulation_steps": accumulation,
@@ -777,7 +822,8 @@ def train(config, name, resume=None):
         from .therapep import published_metrics
         result["therapep_validation"] = published_metrics(y, probabilities, threshold)
     result["elapsed_seconds"] = elapsed_before+time.perf_counter()-started
-    write_json(run/"results.json", result)
+    write_json(run/"results.json.tmp", result)
+    (run/"results.json.tmp").replace(run/"results.json")
     return result
 
 
