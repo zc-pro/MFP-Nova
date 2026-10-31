@@ -95,7 +95,7 @@ $RunRoot = Join-Path $PWD.Path 'runs/helixset_therapep3_seed42'
 
 RTX前台执行，请保持终端打开。训练时按Ctrl+C退出后，重复同一条 `train` 命令即可：跳过完成任务，从未完成任务的last.pt原位续训，日志追加；不新建resume目录。恢复模型、优化器、学习率日程、EMA、随机数状态和早停计数，history按checkpoint恢复。保存以完整epoch为单位，未完成的epoch会重跑，不是从中断的microbatch续跑；第1轮尚未保存时在原目录重跑第1轮。last.pt先写临时文件再替换，写入中断保留上一份完整checkpoint。
 
-脚本默认固定Output为 `runs/helixset_therapep3_seed42`，可直接重复 `& .\scripts\run_helixset_therapep.ps1 -Action train`。如果此前已使用带时间戳的Output，必须继续显式传入原路径，不改用默认目录，也不重新生成时间戳。仅跑一个协议时，给每条脚本命令加 `-Suites traditional5` 或 `-Suites micro_f1`；仅跑一个任务用 `-Tasks therapep48`。`prepare`提取缺少的Train/Val缓存，`evaluate`才提取缺少的Test缓存；缓存中断须按完成行数使用features的 `--resume-from`，不覆盖缓存目录。
+脚本默认固定Output为项目目录下的 `runs/helixset_therapep3_seed42`，可直接重复 `& .\scripts\run_helixset_therapep.ps1 -Action train`。相对Output按脚本所在项目的PowerShell路径解析，不使用可能仍指向C盘用户目录的.NET进程当前目录；启动时打印绝对Output。如果此前已使用带时间戳的Output，必须继续显式传入原路径，不改用默认目录，也不重新生成时间戳。仅跑一个协议时，给每条脚本命令加 `-Suites traditional5` 或 `-Suites micro_f1`；仅跑一个任务用 `-Tasks therapep48`。`prepare`提取缺少的Train/Val缓存，`evaluate`才提取缺少的Test缓存；缓存中断须按完成行数使用features的 `--resume-from`，不覆盖缓存目录。
 
 打包文件在桌面，包含配置元数据、训练记录、Val/Test预测、日志和 `summary.csv`；不包含checkpoint或ESM缓存。汇总同时列出整体输出与正肽48功能指标。完整therapep49的空背景Jaccard计0，Val整体Accuracy上限约33.82%；正样本49维版含恒正治疗标志，整体指标包含其贡献，48维版无该列。三种不同队列的整体数字不能直接作净增益比较，应在共同正肽48功能视图下分析，且注明各自选模协议。当前变更只做静态和数据对齐检查，尚未执行这6次真实GPU训练。
 

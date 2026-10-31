@@ -14,7 +14,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-Location (Split-Path $PSScriptRoot -Parent)
-$Output = [IO.Path]::GetFullPath($Output)
+$Output = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Output)
+Write-Host "Output: $Output"
 $env:PYTHONPATH = Join-Path $PWD.Path 'src'
 $env:CUDA_VISIBLE_DEVICES = $Gpu
 $env:OMP_NUM_THREADS = "$Threads"
