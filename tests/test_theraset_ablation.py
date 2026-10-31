@@ -128,6 +128,76 @@ def test_interrupted_save_preserves_last_complete_checkpoint(tmp_path, monkeypat
     assert torch.load(target, weights_only=True)['epoch'] == 1
 
 
+@pytest.mark.parametrize('suite', ['traditional5', 'micro_f1'])
+@pytest.mark.parametrize('completed_epochs', [0, 1])
+def test_helixset_ctrl_c_replays_uncommitted_epoch_in_place(tmp_path, monkeypatch, suite, completed_epochs):
+    torch.set_num_threads(1)
+    root, features = multimodal_fixture(tmp_path)
+    config = {'model_name': 'helixset',
+        'model': {'dim': 32, 'heads': 4, 'dropout': .1, 'sequence_depth': 1, 'property_depth': 1,
+                  'geometry_depth': 1, 'pair_depth': 1, 'pair_dim': 8, 'latent_depth': 1, 'decoder_depth': 1},
+        'data': {'root': str(root), 'track': 'major15', 'features': str(features)},
+        'encoder': {'name': 'fixture', 'revision': 'main', 'max_length': 80},
+        'loss': {'modality_dropout': .1, 'rdrop': .1},
+        'train': {'device': 'cpu', 'seed': 42, 'epochs': 3, 'batch_size': 2, 'accumulation_steps': 2,
+                  'learning_rate': .001, 'weight_decay': 0, 'patience': 0, 'num_workers': 0,
+                  'warmup_epochs': 0, 'aux_warmup_epochs': 0, 'ema_decay': .9, 'ema_start_epoch': 1,
+                  'rdrop_start_epoch': 1, 'rdrop_ramp_epochs': 1, 'metric_suite': suite,
+                  'save_selection_candidates': True, 'output': str(tmp_path)}}
+    expected = research.train(copy.deepcopy(config), 'full')
+    make_model = research.make_model
+    def interrupted_model(*args):
+        model = make_model(*args)
+        compute_loss = model.compute_loss
+        calls = 0
+        def interrupt(*values, **options):
+            nonlocal calls
+            calls += 1
+            # Two microbatches per epoch; interrupt the second microbatch before an update.
+            if calls == completed_epochs*2 + 2:
+                raise KeyboardInterrupt
+            return compute_loss(*values, **options)
+        model.compute_loss = interrupt
+        return model
+    with monkeypatch.context() as patch:
+        patch.setattr(research, 'make_model', interrupted_model)
+        with pytest.raises(KeyboardInterrupt):
+            research.train(copy.deepcopy(config), 'partial')
+    last = tmp_path/'partial/last.pt'
+    assert last.exists() == bool(completed_epochs)
+    resumed = research.train(copy.deepcopy(config), 'partial',
+                             resume=last if last.exists() else None, resume_in_place=True)
+    full = torch.load(tmp_path/'full/last.pt', weights_only=True)
+    saved = torch.load(last, weights_only=True)
+    for key in ('model_state', 'ema_state', 'best_model_state', 'online_best_state'):
+        for name, value in full[key].items():
+            torch.testing.assert_close(value, saved[key][name], rtol=0, atol=0)
+    assert full['global_step'] == saved['global_step']
+    assert full['scheduler_state'] == saved['scheduler_state']
+    assert full['stale'] == saved['stale']
+    assert expected['validation'] == resumed['validation']
+    history = (tmp_path/'partial/history.jsonl').read_text().splitlines()
+    assert [json.loads(line)['epoch'] for line in history] == [1, 2, 3]
+
+
+@pytest.mark.parametrize('has_checkpoint', [False, True])
+def test_cli_ctrl_c_reports_epoch_boundary_resume(tmp_path, monkeypatch, capsys, has_checkpoint):
+    from mfp_nova.cli import main
+    run = tmp_path/'existing_run'
+    run.mkdir()
+    if has_checkpoint:
+        (run/'last.pt').touch()
+    def interrupt(*args, **kwargs):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(research, 'train', interrupt)
+    with pytest.raises(SystemExit) as error:
+        main(['train', '--model', 'helixset', '--name', str(run)])
+    assert error.value.code == 130
+    message = capsys.readouterr().out
+    assert str(run) in message
+    assert ('last complete epoch' if has_checkpoint else 'Restart epoch 1') in message
+
+
 def test_pack_named_results_without_weights_including_reused_baseline(tmp_path):
     output, reuse = tmp_path/'queue', tmp_path/'old'
     control = reuse/'theraset_fine39_completed'

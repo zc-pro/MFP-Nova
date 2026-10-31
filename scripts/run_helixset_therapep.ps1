@@ -2,8 +2,7 @@ param(
     [Parameter(Mandatory = $true)]
     [ValidateSet('prepare', 'train', 'evaluate', 'pack')]
     [string]$Action,
-    [Parameter(Mandatory = $true)]
-    [string]$Output,
+    [string]$Output = 'runs/helixset_therapep3_seed42',
     [ValidateSet('therapep49', 'therapep49_positive', 'therapep48')]
     [string[]]$Tasks = @('therapep49', 'therapep49_positive', 'therapep48'),
     [ValidateSet('traditional5', 'micro_f1')]
@@ -86,6 +85,9 @@ switch ($Action) {
                     '--epochs', '100', '--name', $RunDir)
                 if (Test-Path -LiteralPath "$RunDir/last.pt") {
                     $Arguments += @('--resume', "$RunDir/last.pt", '--resume-in-place')
+                } elseif (Test-Path -LiteralPath $RunDir) {
+                    # Ctrl+C during epoch one leaves a directory but no committed checkpoint.
+                    $Arguments += @('--resume-in-place')
                 }
                 Write-Host "Training: $Task/$Suite -> $RunDir"
                 Invoke-Mfp -Arguments $Arguments -LogPath $Log

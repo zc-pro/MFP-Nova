@@ -257,7 +257,17 @@ def main(argv=None):
                     continuation['resume_in_place'] = True
                 if args.stop_file:
                     continuation['stop_file'] = args.stop_file
-                train(config, name, resume=args.resume, **continuation)
+                try:
+                    train(config, name, resume=args.resume, **continuation)
+                except KeyboardInterrupt:
+                    run = Path(config['train']['output']) / name
+                    if (run/'last.pt').exists():
+                        print(f'\nTraining interrupted. Resume from the last complete epoch in {run}. '
+                              'The unfinished epoch will be replayed.', flush=True)
+                    else:
+                        print(f'\nTraining interrupted before the first complete epoch. '
+                              f'Restart epoch 1 in the same directory: {run}', flush=True)
+                    raise SystemExit(130) from None
     elif args.command == "evaluate":
         import torch
         checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
