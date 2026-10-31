@@ -10,6 +10,7 @@ import torch
 from torch.utils.data import Dataset
 
 from .data import PeptideData, CachedPeptides
+from .therapep import TRACKS as THERAPEP_TRACKS
 
 
 PROPERTY_GROUPS = [list(range(37 + 20*i, 57 + 20*i)) for i in range(20)] + [
@@ -73,7 +74,7 @@ def label_statistics(y, clusters, labels, min_support=20, max_factors=32):
 
 def function_projection(labels, track):
     """Independent-function groups. Antimicrobial is generic evidence, not another function."""
-    if track == "therapep49":
+    if track in THERAPEP_TRACKS:
         # Published aliases and the global therapeutic flag do not define 15
         # independent functions; do not fabricate the major15 MFP projection.
         return None
@@ -112,7 +113,7 @@ class MultimodalData:
     def __init__(self, root, track, statistics=None, min_support=20, max_factors=32):
         self.data = PeptideData(root, track)
         self.root = Path(root)
-        if track == "therapep49":
+        if track in THERAPEP_TRACKS:
             from .therapep import init_multimodal
             init_multimodal(self, statistics, min_support, max_factors)
             return
@@ -191,7 +192,7 @@ class MultimodalData:
             raise ValueError("Auxiliary checkpoint label order differs from data")
 
     def sample(self, i, esm):
-        if self.data.track == "therapep49":
+        if self.data.track in THERAPEP_TRACKS:
             from .therapep import sequence_sample
             return sequence_sample(self.data, i, esm)
         length = len(self.data.sequences[i])
@@ -241,7 +242,7 @@ class MultimodalData:
                 "y": torch.from_numpy(self.data.y[i].astype(np.float32)), "row_id": torch.tensor(int(self.data.rows[i]))}
 
     def groups(self, indices, targets):
-        if self.data.track == "therapep49":
+        if self.data.track in THERAPEP_TRACKS:
             from .therapep import groups
             return groups(self.data, indices)
         lengths = np.array([len(self.data.sequences[i]) for i in indices])

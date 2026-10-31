@@ -8,6 +8,7 @@ import socket
 import subprocess
 import time
 from pathlib import Path
+from .therapep import TRACKS as THERAPEP_TRACKS, ROOTS as THERAPEP_ROOTS
 
 import numpy as np
 import torch
@@ -103,7 +104,7 @@ def profile(config, source, dataset, device, batches, precisions, measured_steps
         input_check = check_inputs(model, samples, device, precision)
         parameters = dict(model.named_parameters())
         probe_keys = list(PROBES[config["model_name"]])
-        if config["data"]["track"] == "therapep49":
+        if config["data"]["track"] in THERAPEP_TRACKS:
             probe_keys = [key for key in probe_keys if not any(
                 absent in key for absent in ("geometry", "interactions.", "collaboration."))]
         if getattr(model, "esm_tail", None) is not None:
@@ -192,9 +193,9 @@ def profile(config, source, dataset, device, batches, precisions, measured_steps
 
 def run(models, tasks, feature_root, device, output, esm="650m", batches=(2, 4, 8, 16),
         precisions=("fp32", "fp16"), steps=32, samples=128, data_root="data/therapeutic_2025", peptide_feature_root=None):
-    if set(tasks) == {"therapep49"}:
+    if len(set(tasks)) == 1 and tasks[0] in THERAPEP_TRACKS:
         if str(data_root) == "data/therapeutic_2025":
-            data_root = "data/therapep_ai"
+            data_root = THERAPEP_ROOTS[tasks[0]]
         if str(feature_root) == f"features/esm2_{esm}":
             feature_root = f"features/therapep_ai/esm2_{esm}"
     environment = inspect(feature_root, device)
@@ -218,9 +219,9 @@ def run(models, tasks, feature_root, device, output, esm="650m", batches=(2, 4, 
             config = yaml.safe_load(Path(f"configs/{name}.yaml").read_text(encoding="utf-8"))
             from .therapep import configure_task
             configure_task(config, task)
-            if task != "therapep49" or str(data_root) != "data/therapeutic_2025":
+            if task not in THERAPEP_TRACKS or str(data_root) != "data/therapeutic_2025":
                 config["data"]["root"] = str(data_root)
-            if task != "therapep49" or str(feature_root) != f"features/esm2_{esm}":
+            if task not in THERAPEP_TRACKS or str(feature_root) != f"features/esm2_{esm}":
                 config["data"]["features"] = str(feature_root)
             if peptide_feature_root is not None and name in ("helixset", "theraset"):
                 config["data"]["peptide_features"] = str(peptide_feature_root)

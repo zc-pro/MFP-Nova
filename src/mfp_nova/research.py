@@ -8,6 +8,7 @@ import time
 from contextlib import nullcontext
 from importlib.metadata import version
 from pathlib import Path
+from .therapep import TRACKS as THERAPEP_TRACKS
 
 import numpy as np
 import torch
@@ -476,8 +477,10 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
                 "resume": str(resume) if resume else None, "diagnostic_subset": diagnostic,
                 "monitor_threshold": .5, "train_metrics_scope": "online_augmented_changing_weights",
                 "validation_loss_scope": "main_classification_clean_eval; no stochastic auxiliary reconstruction"}
-    if source.data.track == "therapep49":
-        metadata["label_semantics"] = "Author-published 49-bit targets; synthetic backgrounds are assigned zeros; therapeutic flag is supervised"
+    if source.data.track in THERAPEP_TRACKS:
+        metadata["label_semantics"] = ("Positive-only 48 functional targets; 0 is unannotated; no therapeutic flag"
+            if source.data.track == "therapep48" else
+            "Author-published 49-bit targets; synthetic backgrounds when present are assigned zeros; therapeutic flag is supervised")
         metadata["split_protocol"] = "Published CSV members, including duplicates; no cluster isolation imposed"
         metadata["modality_scope"] = "Sequence only for every source; no positive-only structure/descriptor availability shortcut"
     if getattr(model, "esm_tail", None) is not None:
@@ -818,7 +821,7 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
                           "scope": "same optimizer trajectory; stopping follows primary Validation, not an independent baseline training"})
         if device.type == "cuda":
             result['peak_cuda_memory_bytes'] = max(peak_memory, torch.cuda.max_memory_allocated(device))
-    if source.data.track == "therapep49":
+    if source.data.track in THERAPEP_TRACKS:
         from .therapep import published_metrics
         result["therapep_validation"] = published_metrics(y, probabilities, threshold)
     result["elapsed_seconds"] = elapsed_before+time.perf_counter()-started
@@ -877,7 +880,7 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
             'threshold_refit': False}
     if decision is not None:
         result['decision'] = decision
-    if checkpoint["track"] == "therapep49":
+    if checkpoint["track"] in THERAPEP_TRACKS:
         from .therapep import published_metrics
         result["therapep"] = published_metrics(y, probabilities, threshold)
     settings = checkpoint["config"]["train"]
@@ -961,7 +964,7 @@ def predict_sequences(checkpoint_path, sequences, device="cpu", decision_path=No
         raw = {"esm": esm, "aa": aa, "d": stereo, "mask": valid,
                "phys_raw": np.full((len(selected), 515), np.nan),
                "residue_chem_tokens": np.array([[c if j<len(s) else "" for j, c in enumerate(s.ljust(length))] for s in selected])}
-        if checkpoint["track"] == "therapep49":
+        if checkpoint["track"] in THERAPEP_TRACKS:
             raw.pop("residue_chem_tokens")
         if peptide_encoder is not None:
             peptide_states, peptide_mask = peptide_encoder.encode(selected)

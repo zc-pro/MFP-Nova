@@ -16,7 +16,7 @@
 
 五个模型共用 `research.py` 的训练、恢复、评价和推理流程，使用同一套数据加载与基础神经网络层。`sequence` 仍是独立的轻量对照基线。
 
-- 单次训练：`mfp_nova.cli train --model` 支持上述五个名称，`--task` 选择 `major15/fine39/therapep49`。
+- 单次训练：`mfp_nova.cli train --model` 支持上述五个名称，`--task` 选择 `major15/fine39/therapep49/therapep49_positive/therapep48`。
 - 评价与推理：统一使用 `evaluate`、`predict`、`summarize`。
 - 多 Seed：`mfp_nova.experiments` 与 `scripts/run_multiseed.ps1` 已纳入五模型；`all` 仍为五模型 × 原两任务 × 五 Seed，共 50 组候选任务。新基准通过 `--task therapep49` 显式选择。运行脚本才会执行。
 - GPU 诊断：`gpu-check --models` 支持五模型，HelixSet/TheraSet 的关键模块检查点已列入源码；本轮仅做本地 CPU 检查。
@@ -66,12 +66,36 @@ runs/                         # 训练输出、权重和分析，不提交 Git
 | major15 | 15 | 39,478 | 8,534 | 8,187 |
 | fine39 | 39 | 39,455 | 8,529 | 8,180 |
 | therapep49（独立作者发布基准） | 48功能＋1全局标志 | 131,947 | 16,457 | 16,537 |
+| therapep49_positive（所有split去除合成背景） | 48功能＋恒正治疗标志 | 44,524 | 5,565 | 5,566 |
+| therapep48（正样本纯功能） | 原前48功能列 | 44,524 | 5,565 | 5,566 |
 
 0 表示未标注，fine39 的 `__unknown` 表示具体亚类未知。Train 学参数，Validation 选模型与阈值，Test 作独立最终评价。主数据、既有 ESM 缓存与历史运行目录不因源码归类而重建。
 
 环境按设备适配：V100 保留 Conda 克隆环境中的 PyTorch 2.4.1+cu121；RTX 5070 使用 [environment-rtx5070.yaml](configs/environment-rtx5070.yaml) 对应的 Blackwell 构建。主要依赖和实验协议保持一致。
 
 `therapep49` 保留作者 CSV 成员、49位标签顺序及合成背景，包含55,655条真实/恢复正样本与109,286条合成背景；采用作者发布划分，不具备主基准的簇隔离口径。运行 `python -m mfp_nova.cli download-therapep` 下载原CSV；`features --config configs/theraset.yaml --track therapep49` 创建独立缓存，`train --model theraset --task therapep49` 默认 Micro-F1/固定0.5选模。新基准对所有来源统一使用序列与ESM，避免仅正样本有结构/属性造成背景标签泄漏；原两任务保留完整模态。数据、缓存路径、两平台准备与训练命令见 [TheraSet文档](docs/TheraSet-Architecture.md#therapep-ai-作者发布基准therapep49)。
+
+### HelixSet：三个TheraPep数据版本、两套选模协议
+
+`python -m mfp_nova.cli prepare-therapep-variants` 从原CSV生成 `data/therapep49_positive/` 和 `data/therapep48/`，保留各split内相对顺序、重复记录与原始row_id/ID；已有目录直接读取，不覆盖。48维版本同时去掉CSV的 `is_therapeutic` 和标签向量最后一位。它不将最后的 `Tumor_homing` 当治疗标志；功能0仍按未标注处理。三个任务都采用相同的序列输入范围、双ESM、HelixSet、R-Drop/EMA。正样本版本通过原row_id/ID/骨架对齐复用 `features/therapep_ai/` 完整缓存，不复制缓存或重新编码。
+
+RTX5070使用 [run_helixset_therapep.ps1](scripts/run_helixset_therapep.ps1)。默认三个任务×两种协议，共6次独立训练；FP32、seed42、batch16×累积4、EMA0.999、R-Drop0.1、100轮上限、patience15。`traditional5` 以Validation拟合全局阈值的样本Jaccard选模，AT打破平局；`micro_f1` 以Validation Micro-F1@0.5选模，阈值固定0.5。两种协议均输出完整传统五指标及AP/F1，不混取不同checkpoint的单项最佳值。
+
+```powershell
+Set-Location 'D:\Data\ChatGPT\mfp\MFP-Nova'
+git pull --ff-only origin main
+if ($LASTEXITCODE -ne 0) { throw '代码同步失败。' }
+$RunRoot = Join-Path $PWD.Path "runs/helixset_therapep3_seed42_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+& .\scripts\run_helixset_therapep.ps1 -Action prepare -Output $RunRoot
+& .\scripts\run_helixset_therapep.ps1 -Action train -Output $RunRoot
+# 所有训练完成后，评价各自best.pt的Val/Test，Test不重新调阈值
+& .\scripts\run_helixset_therapep.ps1 -Action evaluate -Output $RunRoot
+& .\scripts\run_helixset_therapep.ps1 -Action pack -Output $RunRoot
+```
+
+RTX前台执行，请保持终端打开；重复 `train` 并指定同一个Output，会跳过完成任务并从未完成任务的last.pt原位续训。重新打开窗口后，先把RunRoot设为已有批次的绝对路径。仅跑一个协议时，给每条脚本命令加 `-Suites traditional5` 或 `-Suites micro_f1`；仅跑一个任务用 `-Tasks therapep48`。`prepare`提取缺少的Train/Val缓存，`evaluate`才提取缺少的Test缓存；缓存中断须按完成行数使用features的 `--resume-from`，不覆盖缓存目录。
+
+打包文件在桌面，包含配置元数据、训练记录、Val/Test预测、日志和 `summary.csv`；不包含checkpoint或ESM缓存。汇总同时列出整体输出与正肽48功能指标。完整therapep49的空背景Jaccard计0，Val整体Accuracy上限约33.82%；正样本49维版含恒正治疗标志，整体指标包含其贡献，48维版无该列。三种不同队列的整体数字不能直接作净增益比较，应在共同正肽48功能视图下分析，且注明各自选模协议。当前变更只做静态和数据对齐检查，尚未执行这6次真实GPU训练。
 
 ## 文档导航
 

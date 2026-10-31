@@ -14,7 +14,7 @@ from mfp_nova.data import PeptideData
 from mfp_nova.multimodal import MultimodalData, MultimodalPeptides, collate_multimodal
 from mfp_nova.research_layers import unlabeled_weights
 from mfp_nova.therapep import (DATASET, LABELS, configure_task, download_data,
-                               published_metrics, read_data)
+                               published_metrics, read_data, prepare_positive_variants)
 
 
 @pytest.fixture
@@ -262,3 +262,72 @@ def test_gpu_check_defaults_select_the_published_cache_before_inspection(tmp_pat
     with pytest.raises(RuntimeError,match='other compute jobs'):
         runtime_check.run(['theraset'],['therapep49'],'features/esm2_650m','cuda:0',tmp_path/'probe')
     assert calls==[('features/therapep_ai/esm2_650m','cuda:0')]
+
+
+def test_positive_variants_keep_original_ids_and_reuse_full_cache(published_fixture, tmp_path):
+    from mfp_nova.data import CachedPeptides
+    features = tmp_path/'features'
+    cache_fixture(published_fixture, features, 12, 'fixture')
+    original = PeptideData(published_fixture, 'therapep49')
+    reports = prepare_positive_variants(published_fixture, tmp_path)
+    for task in ('therapep49_positive', 'therapep48'):
+        data = PeptideData(tmp_path/task, task)
+        selected = original.therapeutic
+        np.testing.assert_array_equal(data.rows, original.rows[selected])
+        np.testing.assert_array_equal(data.ids, original.ids[selected])
+        np.testing.assert_array_equal(data.sequences, original.sequences[selected])
+        np.testing.assert_array_equal(data.y[:, :48], original.y[selected, :48])
+        assert [len(data.indices(s)) for s in ('train', 'val', 'test')] == [2, 1, 1]
+        assert reports[task]['splits']['train']['therapeutic'] == 2
+        cached = CachedPeptides(data, features, 'train')
+        assert len(cached) == 2 and cached[0][1].shape == (len(data.labels),)
+        source = MultimodalData(tmp_path/task, task)
+        assert source.statistics['function_projection'] is None
+        assert source.statistics['train_rows'] == 2
+        assert ('therapep_background_index' in source.statistics['labels']) == (task != 'therapep48')
+        assert source.groups(data.indices('val'), data.y[data.indices('val')])['therapeutic_positive'].all()
+    # Re-running preparation reads existing datasets without overwriting them.
+    assert prepare_positive_variants(published_fixture, tmp_path) == reports
+
+
+@pytest.mark.parametrize('task', ['therapep49_positive', 'therapep48'])
+def test_positive_task_cli_and_defaults(task, monkeypatch):
+    from mfp_nova.cli import main
+    captured = []
+    monkeypatch.setattr(research, 'train', lambda config, name, resume=None: captured.append(config))
+    main(['train', '--model', 'helixset', '--task', task, '--metric-suite', 'traditional5'])
+    config = captured[0]
+    assert config['data']['root'] == f'data/{task}'
+    assert config['data']['features'] == 'features/therapep_ai/esm2_650m'
+    assert config['train']['metric_suite'] == 'traditional5'
+    assert not config['model']['structure_evidence']
+
+
+def test_48_function_metrics_and_loss_do_not_treat_last_function_as_flag():
+    y = np.zeros((2, 48)); y[0, 18] = y[1, 47] = 1
+    report = published_metrics(y, .1 + .8*y, .5)
+    assert report['positive_functions48']['micro_f1'] == 1
+    assert report['therapeutic_flag'] is None
+    assert report['synthetic_background']['rows'] == 0
+    assert report['synthetic_background']['therapeutic_flag_fpr'] is None
+    weights = unlabeled_weights(torch.tensor(y), {'labels': LABELS[:-1]}, .3)
+    torch.testing.assert_close(weights, torch.full_like(weights, .3))
+
+
+@pytest.mark.parametrize('task', ['therapep49_positive', 'therapep48'])
+def test_helixset_positive_task_forward_backward(published_fixture, tmp_path, task):
+    prepare_positive_variants(published_fixture, tmp_path)
+    source = MultimodalData(tmp_path/task, task)
+    batch = collate_multimodal([source.sample(i, torch.randn(len(source.data.sequences[i]), 12))
+                               for i in source.data.indices('train')])
+    config = {'model_name': 'helixset', 'data': {'root': 'data/therapeutic_2025'},
+              'model': {'structure_evidence': True}}
+    configure_task(config, task)
+    model = research.make_model('helixset', {'input_dim': 12, 'num_labels': len(source.data.labels),
+        'vocab_size': 2, 'statistics': source.statistics['labels'], 'dim': 32, 'heads': 4,
+        'dropout': .1, **config['model']})
+    loss, _ = model.compute_loss(batch, {'rdrop': .1, 'modality_dropout': 0})
+    loss.backward()
+    assert model(batch)['logits'].shape == (2, len(source.data.labels))
+    assert torch.isfinite(loss)
+    assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)

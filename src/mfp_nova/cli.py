@@ -6,6 +6,7 @@ import yaml
 
 from .models import RESEARCH_MODELS
 from .data import TRACKS
+from .therapep import TRACKS as THERAPEP_TRACKS
 
 
 def main(argv=None):
@@ -16,6 +17,9 @@ def main(argv=None):
     analyze.add_argument("--output", default="docs/data_summary.json")
     download = commands.add_parser("download-therapep", help="Download author-published Train/Val/Test CSVs")
     download.add_argument("--output", default="data/therapep_ai")
+    variants = commands.add_parser("prepare-therapep-variants", help="Create aligned positive-only 49/48-label CSVs")
+    variants.add_argument("--source", default="data/therapep_ai")
+    variants.add_argument("--output-root", default="data")
     for command in ("features", "train"):
         sub = commands.add_parser(command)
         sub.add_argument("--config")
@@ -116,7 +120,10 @@ def main(argv=None):
     gpu_check.add_argument("--output")
     gpu_check.add_argument("--inspect-only", action="store_true", help="Read GPU occupancy/cache metadata without training")
     args = parser.parse_args(argv)
-    if args.command == "download-therapep":
+    if args.command == "prepare-therapep-variants":
+        from .therapep import prepare_positive_variants
+        print(json.dumps(prepare_positive_variants(args.source, args.output_root), ensure_ascii=False, indent=2))
+    elif args.command == "download-therapep":
         from .therapep import download_data
         print(json.dumps(download_data(args.output), ensure_ascii=False, indent=2))
     elif args.command == "analyze":
@@ -141,7 +148,7 @@ def main(argv=None):
                 raise ValueError("This HelixSet ESM-tail configuration uses ESM650M")
             config["encoder"]["name"] = "facebook/esm2_t12_35M_UR50D" if args.esm=="35m" else "facebook/esm2_t33_650M_UR50D"
             config["data"]["features"] = (f"features/therapep_ai/esm2_{args.esm}"
-                                           if config["data"]["track"] == "therapep49" else f"features/esm2_{args.esm}")
+                                           if config["data"]["track"] in THERAPEP_TRACKS else f"features/esm2_{args.esm}")
             layer = config["encoder"].get("representation_layer")
             if layer is not None:
                 config["data"]["features"] += f"_layer{layer}"
