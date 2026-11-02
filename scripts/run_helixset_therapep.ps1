@@ -128,43 +128,7 @@ switch ($Action) {
     'pack' {
         $ZipPath = Join-Path ([Environment]::GetFolderPath('Desktop')) `
             "helixset_therapep3_seed42_$(Split-Path $Output -Leaf)_results_$(Get-Date -Format 'yyyyMMdd_HHmmss').zip"
-        @'
-from pathlib import Path
-from zipfile import ZipFile, ZIP_DEFLATED
-import csv, io, json, sys
-
-root, archive = Path(sys.argv[1]), Path(sys.argv[2])
-tasks, suites = sys.argv[3].split(','), sys.argv[4].split(',')
-metrics = ('accuracy', 'precision', 'coverage', 'absolute_true', 'absolute_false',
-           'micro_f1', 'macro_f1', 'micro_ap', 'macro_ap')
-rows, paths = [], []
-for task in tasks:
-    for suite in suites:
-        directory = root/task/suite
-        result = json.loads((directory/'results.json').read_text(encoding='utf-8'))
-        for split in ('val', 'test'):
-            report = json.loads((directory/f'{split}.json').read_text(encoding='utf-8'))
-            for scope, values in (('all_outputs', report['metrics']),
-                                  ('positive_functions48', report['therapep']['positive_functions48'])):
-                rows.append(dict(task=task, suite=suite, split=split, scope=scope,
-                    rows=report['rows'] if scope == 'all_outputs' else report['groups']['therapeutic_positive']['rows'],
-                    best_epoch=result['best_epoch'], threshold=json.dumps(report['threshold']),
-                    **{k: values[k] for k in metrics}))
-        paths.extend(p for p in directory.iterdir()
-                     if p.is_file() and p.suffix in ('.json', '.jsonl', '.npz', '.log'))
-        log = root/f'{task}_{suite}.log'
-        if log.is_file():
-            paths.append(log)
-with ZipFile(archive, 'x', ZIP_DEFLATED) as out:
-    for p in paths:
-        out.write(p, p.relative_to(root).as_posix())
-    summary = io.StringIO(newline='')
-    writer = csv.DictWriter(summary, fieldnames=list(rows[0]))
-    writer.writeheader()
-    writer.writerows(rows)
-    out.writestr('summary.csv', summary.getvalue().encode('utf-8-sig'))
-print('RESULT ZIP:', archive.resolve())
-'@ | & $Python - $Output $ZipPath ($Tasks -join ',') ($Suites -join ',')
+        & $Python scripts/pack_helixset_therapep.py $Output $ZipPath ($Tasks -join ',') ($Suites -join ',')
         if ($LASTEXITCODE -ne 0) { throw 'Result packaging failed.' }
     }
 }

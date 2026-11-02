@@ -99,6 +99,49 @@ RTX前台执行，请保持终端打开。训练时按Ctrl+C退出后，重复�
 
 打包文件在桌面，包含配置元数据、训练记录、Val/Test预测、日志和 `summary.csv`；不包含checkpoint或ESM缓存。汇总同时列出整体输出与正肽48功能指标。完整therapep49的空背景Jaccard计0，Val整体Accuracy上限约33.82%；正样本49维版含恒正治疗标志，整体指标包含其贡献，48维版无该列。三种不同队列的整体数字不能直接作净增益比较，应在共同正肽48功能视图下分析，且注明各自选模协议。当前变更只做静态和数据对齐检查，尚未执行这6次真实GPU训练。
 
+V100使用 [run_helixset_therapep.sh](scripts/run_helixset_therapep.sh)，保持上述模型、seed、batch、R-Drop/EMA、选模协议不变；每任务6个CPU线程、2个DataLoader进程，可通过 `CPU_THREADS`、`NUM_WORKERS` 修改。三任务各占一张用户分配的GPU，不是DDP。固定目录 `runs/helixset_therapep3_seed42_v100/<task>/<suite>/`，重复同一命令跳过完成实验、原位续训，未完成epoch重跑。保留Conda MFP-Nova的PyTorch2.4.1+cu121，不升级环境。
+
+```bash
+cd ~/wuzhencheng/projects/MFP-Nova
+conda activate MFP-Nova
+git pull --ff-only origin main
+# 确认同步成功后继续；共用缓存仅准备一次，完成后再启动三个队列
+export PYTHON_BIN="$(command -v python)"
+export CPU_THREADS=6 NUM_WORKERS=2
+export RUN_ROOT="$PWD/runs/helixset_therapep3_seed42_v100"
+mkdir -p "$RUN_ROOT"
+GPU=0 bash scripts/run_helixset_therapep.sh prepare
+
+nohup env GPU=0 bash scripts/run_helixset_therapep.sh train therapep49 \
+  >> "$RUN_ROOT/therapep49.log" 2>&1 < /dev/null &
+echo "therapep49 PID=$!"
+nohup env GPU=1 bash scripts/run_helixset_therapep.sh train therapep49_positive \
+  >> "$RUN_ROOT/therapep49_positive.log" 2>&1 < /dev/null &
+echo "therapep49_positive PID=$!"
+nohup env GPU=2 bash scripts/run_helixset_therapep.sh train therapep48 \
+  >> "$RUN_ROOT/therapep48.log" 2>&1 < /dev/null &
+echo "therapep48 PID=$!"
+```
+
+每个队列顺序执行traditional5和micro_f1两次独立训练，SSH断开后继续；GPU号按实际分配替换，映射后内部统一cuda:0。`tail -n 30 -f "$RUN_ROOT/therapep49.log"` 查看进度，Ctrl+C只退出日志查看。后台任务可用 `touch "$RUN_ROOT/therapep49/PAUSE"` 请求本轮结束后暂停；退出后 `rm "$RUN_ROOT/therapep49/PAUSE"`，重复该任务的nohup命令恢复。另两任务替换对应任务名，不能在进程尚未退出时启动同目录的另一个实例。仅运行一种协议时先 `export SUITES=micro_f1` 或 `export SUITES=traditional5`，评价和打包沿用同一SUITES。
+
+所有训练完成后，共用Test缓存仅准备一次，再分GPU评价并合并结果。打包逻辑由两平台共用的 [pack_helixset_therapep.py](scripts/pack_helixset_therapep.py) 实现，不包含权重/缓存。
+
+```bash
+GPU=0 bash scripts/run_helixset_therapep.sh prepare-test
+nohup env GPU=0 bash scripts/run_helixset_therapep.sh evaluate therapep49 \
+  >> "$RUN_ROOT/therapep49_evaluate.log" 2>&1 < /dev/null &
+nohup env GPU=1 bash scripts/run_helixset_therapep.sh evaluate therapep49_positive \
+  >> "$RUN_ROOT/therapep49_positive_evaluate.log" 2>&1 < /dev/null &
+nohup env GPU=2 bash scripts/run_helixset_therapep.sh evaluate therapep48 \
+  >> "$RUN_ROOT/therapep48_evaluate.log" 2>&1 < /dev/null &
+wait
+# 确认各任务评价成功完成后执行，缺少结果会明确报错
+bash scripts/run_helixset_therapep.sh pack
+```
+
+合并ZIP保存在固定RUN_ROOT目录内，包含6组Val/Test指标、预测、训练记录、日志与summary.csv。重新登录后恢复PYTHON_BIN、CPU_THREADS、NUM_WORKERS和同一个RUN_ROOT即可，不生成新时间戳运行目录。
+
 ## 文档导航
 
 - [第五模型 TheraSet 架构设计分析](docs/TheraSet-Architecture.md)：基线定义、四模型取舍、创新假设、公式与维度、消融、验证及 RTX 5070/V100 训练命令。
