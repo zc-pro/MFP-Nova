@@ -97,6 +97,8 @@ RTX前台执行，请保持终端打开。训练时按Ctrl+C退出后，重复�
 
 脚本默认固定Output为项目目录下的 `runs/helixset_therapep3_seed42`，可直接重复 `& .\scripts\run_helixset_therapep.ps1 -Action train`。相对Output按脚本所在项目的PowerShell路径解析，不使用可能仍指向C盘用户目录的.NET进程当前目录；启动时打印绝对Output。如果此前已使用带时间戳的Output，必须继续显式传入原路径，不改用默认目录，也不重新生成时间戳。仅跑一个协议时，给每条脚本命令加 `-Suites traditional5` 或 `-Suites micro_f1`；仅跑一个任务用 `-Tasks therapep48`。`prepare`提取缺少的Train/Val缓存，`evaluate`才提取缺少的Test缓存；缓存中断须按完成行数使用features的 `--resume-from`，不覆盖缓存目录。
 
+新终端不会保留 `$RunRoot`、`$Common`。恢复固定批次建议直接使用完整路径：`& .\scripts\run_helixset_therapep.ps1 -Action train -Output 'D:\Data\ChatGPT\mfp\MFP-Nova\runs\helixset_therapep3_seed42'`。空Output或项目根目录会明确报错，禁止退化为在项目根目录重新建任务。启动时应显示 `Resume existing checkpoint: .../last.pt`；只显示另一目录的 `New experiment` 不代表恢复旧进度。历史误启动的根目录任务不会被自动移动、删除或合并。
+
 打包文件在桌面，包含配置元数据、训练记录、Val/Test预测、日志和 `summary.csv`；不包含checkpoint或ESM缓存。汇总同时列出整体输出与正肽48功能指标。完整therapep49的空背景Jaccard计0，Val整体Accuracy上限约33.82%；正样本49维版含恒正治疗标志，整体指标包含其贡献，48维版无该列。三种不同队列的整体数字不能直接作净增益比较，应在共同正肽48功能视图下分析，且注明各自选模协议。当前变更只做静态和数据对齐检查，尚未执行这6次真实GPU训练。
 
 V100使用 [run_helixset_therapep.sh](scripts/run_helixset_therapep.sh)，保持上述模型、seed、batch、R-Drop/EMA、选模协议不变；每任务6个CPU线程、2个DataLoader进程，可通过 `CPU_THREADS`、`NUM_WORKERS` 修改。三任务各占一张用户分配的GPU，不是DDP。固定目录 `runs/helixset_therapep3_seed42_v100/<task>/<suite>/`，重复同一命令跳过完成实验、原位续训，未完成epoch重跑。保留Conda MFP-Nova的PyTorch2.4.1+cu121，不升级环境。

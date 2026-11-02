@@ -13,8 +13,15 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-Set-Location (Split-Path $PSScriptRoot -Parent)
+if ([string]::IsNullOrWhiteSpace($Output)) {
+    throw 'Output is empty. Reopening PowerShell clears $RunRoot. Omit -Output to use the default, or supply the original absolute batch directory.'
+}
+$ProjectRoot = Split-Path $PSScriptRoot -Parent
+Set-Location $ProjectRoot
 $Output = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Output)
+if ($Output.TrimEnd('\', '/') -eq $ProjectRoot.TrimEnd('\', '/')) {
+    throw 'Output must be the batch directory under runs, not the project root. Supply the original absolute batch directory.'
+}
 Write-Host "Output: $Output"
 $env:PYTHONPATH = Join-Path $PWD.Path 'src'
 $env:CUDA_VISIBLE_DEVICES = $Gpu
@@ -85,10 +92,14 @@ switch ($Action) {
                     '--metric-suite', $Suite, '--threshold-strategy', 'global',
                     '--epochs', '100', '--name', $RunDir)
                 if (Test-Path -LiteralPath "$RunDir/last.pt") {
+                    Write-Host "Resume existing checkpoint: $RunDir/last.pt"
                     $Arguments += @('--resume', "$RunDir/last.pt", '--resume-in-place')
                 } elseif (Test-Path -LiteralPath $RunDir) {
                     # Ctrl+C during epoch one leaves a directory but no committed checkpoint.
+                    Write-Host "No completed checkpoint in $RunDir; restart the first epoch in place."
                     $Arguments += @('--resume-in-place')
+                } else {
+                    Write-Host "New experiment: $RunDir"
                 }
                 Write-Host "Training: $Task/$Suite -> $RunDir"
                 Invoke-Mfp -Arguments $Arguments -LogPath $Log
