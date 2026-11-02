@@ -1,0 +1,92 @@
+--- a/evaluation.py
++++ b/evaluation.py
+@@ -186,7 +186,7 @@
+     return sorce_k / n if n > 0 else 0
+ 
+ 
+-def evaluate(y_hat, y):
++def evaluate(y_hat, y, thresholds=None):
+     """
+     使用各种指标评估模型预测
+     
+@@ -198,7 +198,7 @@
+         包含评估指标的字典，准确率和宏平均F1作为前两个
+     """
+     # 为每个类别找到最佳阈值
+-    best_thresholds = find_best_thresholds(y, y_hat)
++    best_thresholds = find_best_thresholds(y, y_hat) if thresholds is None else thresholds
+ 
+     # 应用阈值获得二值化预测
+     y_pred = np.zeros_like(y_hat)
+--- a/train.py
++++ b/train.py
+@@ -363,6 +363,7 @@
+                     'optimizer_state_dict': optimizer.state_dict(),
+                     'epoch': epoch,
+                     'best_val_score': best_val_score,
++                    'val_thresholds': find_best_thresholds(np.array(val_labels), np.array(val_preds)),
+                     'args': vars(args),
+                     'feature_types': model.feature_types,
+                     'optimize_features': getattr(model, 'optimize_features', False),
+@@ -404,7 +405,7 @@
+     
+     return model, history
+ 
+-def evaluate_model(model, test_loader, device, result_dir):
++def evaluate_model(model, test_loader, device, result_dir, thresholds):
+     """
+     评估模型
+ 
+@@ -452,7 +453,7 @@
+         test_labels = np.array(test_labels)
+         
+         # 计算最佳阈值
+-        best_thresholds = find_best_thresholds(test_labels, test_preds)
++        best_thresholds = thresholds
+         
+         # 应用阈值获得二值化预测
+         test_binary_preds = np.zeros_like(test_preds)
+@@ -460,7 +461,7 @@
+             test_binary_preds[:, i] = (test_preds[:, i] >= threshold).astype(int)
+         
+         # 评估测试集性能
+-        test_metrics = evaluate(test_preds, test_labels)
++        test_metrics = evaluate(test_preds, test_labels, thresholds=best_thresholds)
+         
+         # 可视化预测结果
+         visualize_predictions(test_labels, test_binary_preds, test_preds, result_dir)
+--- a/main.py
++++ b/main.py
+@@ -629,6 +629,8 @@
+     
+     # 验证特征并获取有效特征
+     valid_features, preextracted_features = feature_loader.validate_features(args.features)
++    if valid_features != args.features:
++        raise ValueError(f'Requested {args.features}, found {valid_features}')
+     
+     if not valid_features:
+         print("错误: 没有有效的特征可用")
+@@ -725,7 +727,10 @@
+         print("评估模型")
+         print("="*60)
+         
+-        test_metrics, best_thresholds = evaluate_model(model, test_loader, DEVICE, result_dir)
++        best = torch.load(os.path.join(result_dir, 'best_model.pth'), map_location='cpu')
++        thresholds = best['val_thresholds']
++        del best
++        test_metrics, best_thresholds = evaluate_model(model, test_loader, DEVICE, result_dir, thresholds)
+         
+         # 保存结果
+         results = {
+@@ -794,7 +799,10 @@
+         print("评估模型")
+         print("="*60)
+         
+-        test_metrics, best_thresholds = evaluate_model(model, test_loader, DEVICE, result_dir)
++        best = torch.load(args.model_path, map_location='cpu')
++        thresholds = best['val_thresholds']
++        del best
++        test_metrics, best_thresholds = evaluate_model(model, test_loader, DEVICE, result_dir, thresholds)
+         
+         # 保存结果
+         results = {
