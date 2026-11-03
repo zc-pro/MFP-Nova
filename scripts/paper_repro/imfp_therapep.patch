@@ -1,0 +1,96 @@
+--- a/utils/data_helpers.py
++++ b/utils/data_helpers.py
+@@ -5,6 +5,8 @@
+ import os
+ from torch.utils.data import Dataset, DataLoader
+ import numpy as np
++import csv
++
+ import six
+ 
+ 
+@@ -130,11 +132,16 @@
+         :param filepath: dataset path
+         :return:
+         """
+-        seq_label_dict = np.load(filepath, allow_pickle=True).item()
+-        print(len(seq_label_dict.keys()))
++        if str(filepath).endswith(".csv"):
++            with open(filepath, encoding="utf-8-sig", newline="") as stream:
++                items = [(row["Sequence"], np.asarray(json.loads(row["Label encoding"]), dtype=float))
++                         for row in csv.DictReader(stream)]
++        else:
++            items = list(np.load(filepath, allow_pickle=True).item().items())
++        print(len(items))
+         data = list()
+         max_len = 0
+-        for seq in seq_label_dict.keys():
++        for seq, l in items:
+             s = seq
+ 
+             # process sequences
+@@ -144,7 +151,6 @@
+             tensor_ = torch.tensor(tmp, dtype=torch.long)
+ 
+             # process labels
+-            l = seq_label_dict[seq]
+             l = l.astype(float) 
+             l = torch.tensor(l, dtype=torch.float)
+             
+--- a/Task/TaskForMultiPeptide_MFTP.py
++++ b/Task/TaskForMultiPeptide_MFTP.py
+@@ -79,7 +79,7 @@
+             "lr": config.learning_rate,
+         },
+         {
+-            "params": [p for n, p in model.named_parameters() if 'gat' in n],
++            "params": [p for n, p in model.named_parameters() if 'gat' in n or (getattr(config, "train_task_heads", False) and not n.startswith("bert."))],
+             "lr": config.learning_rate*10,
+         },
+     ]
+@@ -157,16 +157,17 @@
+ 
+     
+     # test model
+-    aiming, coverage, accuracy, absolute_true, absolute_false = TestModel(test_iter, adj_matrix, model, config.device, data_loader.PAD_IDX, config.res_path, config.model_num)
++    aiming, coverage, accuracy, absolute_true, absolute_false = TestModel(test_iter, adj_matrix, model, config.device, data_loader.PAD_IDX, config.res_path, config.model_num, save_predictions=getattr(config, "save_predictions", False))
+     logging.info(f"precision on val {aiming:.3f}")
+     logging.info(f"coverage on val {coverage:.3f}")
+     logging.info(f"accuracy on val {accuracy:.3f}")
+     logging.info(f"absolute_true on val {absolute_true:.3f}")
+     logging.info(f"absolute_false on val {absolute_false:.3f}")
+     print(f"{config.data_name}_seed{config.model_num}_lr{config.learning_rate}_E{config.epochs}_BS{config.batch_size}")
++    return model, adj_matrix, data_loader
+         
+ 
+-def TestModel(data_iter, adj_matrix, model, device, PAD_IDX, res_path, model_num):
++def TestModel(data_iter, adj_matrix, model, device, PAD_IDX, res_path, model_num, save_predictions=False):
+     import numpy as np
+     model.eval()
+     with torch.no_grad():
+@@ -189,8 +190,10 @@
+                 pred_res = y_pred
+                 real_res = label_ids
+             else:
+-                pred_res = np.vstack((y_pred, pred_res))
+-                real_res = np.vstack((label_ids, real_res))
++                pred_res = np.vstack((pred_res, y_pred))
++                real_res = np.vstack((real_res, label_ids))
++        if save_predictions:
++            np.savez_compressed(res_path + ".npz", probabilities=pred_res, targets=real_res)
+         aiming, coverage, accuracy, absolute_true, absolute_false = evaluate(pred_res>0.5, real_res)
+ 
+         model.train()
+--- a/models/BertForMultiLabelWithGAT_MFTP.py
++++ b/models/BertForMultiLabelWithGAT_MFTP.py
+@@ -11,8 +11,8 @@
+     """
+     lena = len(a)
+     lenb = len(b)
+-    left = np.row_stack((a, np.zeros((lenb, lena))))  
+-    right = np.row_stack((np.zeros((lena, lenb)), b))  
++    left = np.vstack((a, np.zeros((lenb, lena))))
++    right = np.vstack((np.zeros((lena, lenb)), b))
+     result = np.hstack((left, right)) 
+     return result
+ 

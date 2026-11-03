@@ -105,11 +105,13 @@ python "$KIT/metfan_therapep.py" prepare --task therapep48 --output "$out"
 export METFAN_ESM2="$PAPER_ROOT/pretrained/esm2_t33_650M_UR50D"
 export METFAN_PROTT5="$PAPER_ROOT/pretrained/prot_t5_xl_half_uniref50-enc"
 export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4
+export METFAN_PYTHON="$CONDA_PREFIX/bin/python"
+"$METFAN_PYTHON" -c 'import sys, torch; print(sys.executable, torch.__version__)'
 CUDA_VISIBLE_DEVICES=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
 nohup bash -c '
-  python "$KIT/metfan_therapep.py" features --output "$out" &&
-  python "$KIT/metfan_therapep.py" train --output "$out" --seed 42
-' >"$out/run.log" 2>&1 < /dev/null &
+  "$1" "$2" features --output "$3" &&
+  "$1" "$2" train --output "$3" --seed 42
+' _ "$METFAN_PYTHON" "$KIT/metfan_therapep.py" "$out" >"$out/run.log" 2>&1 < /dev/null &
 echo "PID=$! LOG=$out/run.log"
 tail -f "$out/run.log"
 ```
@@ -117,6 +119,51 @@ tail -f "$out/run.log"
 结果位于 `$out/training/seed42/0/textcnn_esm2_mean_prot_t5_mean_optimized/`，包含最佳checkpoint、原生结果、带row_id/ID与类名的Val/Test连续分数NPZ，以及 `comparison.json`。后者提供完整Test、正肽48功能视图、Macro/Micro-F1/AP、不可定义指标原因和最佳epoch。新入口按seed分别保存训练目录，支持复用同一套特征开展后续seed。
 
 首版各任务单独提取特征；跨任务按row_id复用混合队列表征仍属后续优化。48任务完整训练和Test验证后，两个49任务只需将prepare的 `--task` 改为对应名称，并使用各自的新out，再执行features/train。单类别Val的阈值固定为0.5，不会使用Test标签重新拟合阈值。
+
+### iMFP-LG 的 TheraPep 准备
+
+已增加 `imfp_therapep.py` 和 `imfp_therapep.patch`。CSV分支逐行读取，保留重复记录；NPY原输入分支保留。三个任务的类别数由本项目标签定义提供。TAPE、FGM、BCE和标签GAT保持原实现，最终权重按固定训练日程选取，决策沿用严格 `probability > 0.5`。
+
+新入口显式开启 `train_task_heads`，将原来遗漏的FC/CLSFC参数纳入任务组，与GAT同用5e-4学习率，TAPE保持5e-5。结果记录为 `method_variant=task_heads_trained`。原NPY复现入口默认不启用这一参数，保持此前的优化器参数范围。补丁同时按原始批次顺序累积预测，导出Val/Test连续分数和身份，以便检查标签对齐；图拼接的已弃用 `np.row_stack` 使用等价 `np.vstack`。
+
+METFAN 运行期间，为并行准备另一个模型，使用独立Git工作区读取新增入口。下面仅fetch及新增工作区，当前METFAN项目检出的源码和HEAD不更新；每个模型的源码提交记录因此与实际运行版本相符。该Git工作区读取原项目的只读CSV，不复制数据。
+
+```bash
+export BASE="$HOME/wuzhencheng/projects/MFP-Nova"
+export IMFP_PROJECT="$HOME/wuzhencheng/projects/MFP-Nova-imfp"
+git -C "$BASE" fetch origin main
+git -C "$BASE" worktree add --detach "$IMFP_PROJECT" origin/main
+export IMFP_KIT="$IMFP_PROJECT/scripts/paper_repro"
+export PAPER_ROOT="$HOME/paper-repro"
+
+conda activate repro-imfp
+export IMFP_PYTHON="$CONDA_PREFIX/bin/python"
+"$IMFP_PYTHON" -c 'import sys, torch; from transformers import AdamW; print(sys.executable, torch.__version__)'
+
+# 仅对已经完成原数据复现的iMFP-LG作者仓库应用一次。
+git -C "$PAPER_ROOT/iMFP-LG" apply --ignore-space-change "$IMFP_KIT/imfp_therapep.patch"
+export imfp_out="$PAPER_ROOT/therapep_runs/imfp_therapep48_$(date +%Y%m%d_%H%M%S)"
+"$IMFP_PYTHON" "$IMFP_KIT/imfp_therapep.py" prepare \
+  --task therapep48 --data-root "$BASE/data/therapep48" --output "$imfp_out"
+```
+
+预期保留Train 44,524、Val 5,565、Test 5,566条。该方法原生按批padding，74残基训练序列仍在TAPE位置长度范围内，故不像METFAN一样过滤该条。模型直接微调TAPE，不额外提取冻结特征。
+
+如GPU0已分配且空闲，可与GPU1上的METFAN分别运行。先做一轮连通性和耗时检查；这是短训练结果，不记为正式100轮性能。必须使用环境Python的绝对路径，避免新Bash解释器变化。
+
+```bash
+export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4
+CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+nohup "$IMFP_PYTHON" "$IMFP_KIT/imfp_therapep.py" train \
+  --output "$imfp_out" --seed 42 --epochs 1 --batch-size 32 \
+  >"$imfp_out/short_train.log" 2>&1 < /dev/null &
+echo "PID=$! LOG=$imfp_out/short_train.log"
+tail -f "$imfp_out/short_train.log"
+```
+
+确认这一轮能完成后，用相同out和 `--epochs 100` 提交正式实验，日志改为 `train.log`。两项分别写入 `training/seed42_epochs1/`、`training/seed42_epochs100/`，均随机初始化任务模型，只加载相同的通用TAPE权重。数据预备结果复用，短训练权重不作为正式训练初始化。Val/Test分数、原始ID、固定阈值和 `comparison.json` 均写入各自训练目录。
+
+本地用单层、768维的随机BERT初始化替身和真实CSV小批，覆盖48功能、49恒正标志及混合全零背景，检查原GAT/BCE/FGM的一轮执行、FC/CLSFC实际更新、重复行及输出对齐。本地Transformers较新，测试时仅在临时副本将已移除的HF AdamW换为Torch AdamW并匹配基础超参数；提交的代码仍使用V100已验证的Transformers4.24/HF AdamW。原始TAPE权重和16GB V100的完整批量运行仍需服务器短训练验证。
 
 ## V100 上复现论文原始实验
 
