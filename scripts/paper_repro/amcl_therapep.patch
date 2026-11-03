@@ -1,0 +1,175 @@
+--- a/DA.py
++++ b/DA.py
+@@ -19,7 +19,7 @@
+     return data, labels
+ 
+ 
+-def augment_peptide_dataset_with_reversals_and_back_translation(data, labels, N):
++def augment_peptide_dataset_with_reversals_and_back_translation(data, labels, N, function_count=None):
+     """
+     Augment peptide dataset including reversals, random shuffling, and back-translation enhancement.
+     Args:
+@@ -90,12 +90,12 @@
+         # Add original sequence and label
+         augmented_peptides.append(peptide)
+         augmented_labels.append(peptide_label[:])
+-        positions_to_check = list(range(21))  # Check the first 21 positions
++        positions_to_check = list(range(len(peptide_label[:function_count])))
+ 
+         # Use any() function to determine if augmentation is needed
+         should_augment = any(peptide_label[pos] == 1 for pos in positions_to_check if pos < len(peptide_label))
+ 
+-        if should_augment and np.sum(peptide_label) == 1:
++        if should_augment and np.sum(peptide_label[:function_count]) == 1:
+             i += 1
+             # Generate reversed sequence
+             augmented_peptides.append(peptide[::-1])
+@@ -189,17 +189,18 @@
+             file.write(label_str + "\n")
+             file.write(peptide + "\n")
+ 
+-# Set random seed to ensure reproducible results
+-random.seed(2024)
+-np.random.seed(2024)
+-# Main process
+-input_file = 'TP_test/dataset/train.txt'  # Path to input file
+-output_file = 'TP_test/dataset/augmented_train.txt'  # Path to save the augmented dataset
+-# Load original data
+-data, labels = load_data(input_file)
+-# Perform data augmentation
+-N = 3
+-augmented_peptides, augmented_labels = augment_peptide_dataset_with_reversals_and_back_translation(data, labels, N)
+-# Save augmented dataset
+-save_augmented_dataset(output_file, augmented_peptides, augmented_labels)
+-print(f"Data augmentation completed, augmented dataset saved to '{output_file}'")
+\ No newline at end of file
++if __name__ == "__main__":
++    # Set random seed to ensure reproducible results
++    random.seed(2024)
++    np.random.seed(2024)
++    # Main process
++    input_file = 'TP_test/dataset/train.txt'  # Path to input file
++    output_file = 'TP_test/dataset/augmented_train.txt'  # Path to save the augmented dataset
++    # Load original data
++    data, labels = load_data(input_file)
++    # Perform data augmentation
++    N = 3
++    augmented_peptides, augmented_labels = augment_peptide_dataset_with_reversals_and_back_translation(data, labels, N)
++    # Save augmented dataset
++    save_augmented_dataset(output_file, augmented_peptides, augmented_labels)
++    print(f"Data augmentation completed, augmented dataset saved to '{output_file}'")
+--- a/losses.py
++++ b/losses.py
+@@ -157,14 +157,17 @@
+ import torch.nn as nn
+ import torch.nn.functional as F
+ import numpy as np
+-Train_path = "dataset/augmented_train.txt"
+-class_freq = [0] * 21  # Initialize counts for each peptide
++import os
++Train_path = os.environ.get("AMCL_TRAIN_PATH", "dataset/augmented_train.txt")
++class_freq = None  # Initialize counts for each peptide
+ train_num=0
+ with open(Train_path, 'r') as file:
+     for line in file:
+         if line.startswith('>'):  # Assume each line with data starts with '>'
+             train_num+=1
+             line = line.strip()[1:]  # Remove the '>' and any whitespace
++            if class_freq is None:
++                class_freq = [0] * len(line)
+             for i, char in enumerate(line):
+                 if char == '1':
+                     class_freq[i] += 1
+@@ -199,7 +202,7 @@
+                      init_bias=0.1
+                  ),
+                  class_freq=None,
+-                 train_num=None):
++                 train_num=None, device="cuda"):
+         super(ResampleLoss, self).__init__()
+ 
+         assert (use_sigmoid is True) or (partial is False)
+@@ -235,7 +238,7 @@
+         self.CB_beta = CB_loss['CB_beta']
+         self.CB_mode = CB_loss['CB_mode']
+ 
+-        self.class_freq = torch.from_numpy(np.asarray(class_freq)).float().cuda()
++        self.class_freq = torch.as_tensor(np.asarray(class_freq), dtype=torch.float32, device=device)
+         self.num_classes = self.class_freq.shape[0]
+         self.train_num = train_num  # only used to be divided by class_freq
+         # regularization params
+@@ -246,7 +249,7 @@
+         self.init_bias = - torch.log(
+             self.train_num / self.class_freq - 1) * init_bias  ########################## bug fixed https://github.com/wutong16/DistributionBalancedLoss/issues/8
+ 
+-        self.freq_inv = torch.ones(self.class_freq.shape).cuda() / self.class_freq
++        self.freq_inv = torch.ones_like(self.class_freq) / self.class_freq
+         self.propotion_inv = self.train_num / self.class_freq
+ 
+     def forward(self,
+@@ -505,4 +508,4 @@
+                        [-1.0, 0.0],
+                        [0.0, -1.0]]])
+ 
+-    print("Input shape is (B,W,H):", u.shape, v.shape)
+\ No newline at end of file
++    print("Input shape is (B,W,H):", u.shape, v.shape)
+--- a/train.py
++++ b/train.py
+@@ -29,7 +29,7 @@
+ 
+ class DataTrain:
+     def __init__(self, model, optimizer, criterion_list, scheduler=None, loss_weights=None,
+-                 device="cuda", flooding_level=0.01):
++                 device="cuda", flooding_level=0.01, contrastive_label_count=None):
+         self.model = model.to(device)
+         self.optimizer = optimizer
+         self.criterion_list = criterion_list
+@@ -37,6 +37,7 @@
+         self.lr_scheduler = scheduler
+         self.device = device
+         self.flooding_level = flooding_level
++        self.contrastive_label_count = contrastive_label_count
+         self.contrastive_criterion = MultiLabelContrastiveLoss().to(device)
+ 
+     def train_step(self, train_iter, test_iter=None, epochs=None, model_name='', va=True):
+@@ -52,7 +53,7 @@
+                 train_label = train_label.to(self.device)
+ 
+                 result, features = self.model(train_data, return_features=True)
+-                contrast_loss = self.contrastive_criterion(features, train_label)
++                contrast_loss = self.contrastive_criterion(features, train_label[:, :self.contrastive_label_count])
+ 
+                 loss1 = self.criterion_list[0](result, train_label.float())
+                 loss2 = self.criterion_list[1](result, train_label.float())
+@@ -137,7 +138,7 @@
+     return metrics
+ def optimize_thresholds_with_freq(model, val_data, class_freq, train_num, device="cuda", init_thresholds=None):
+     """Threshold optimization considering class frequency"""
+-    init_thresholds = [0] * 21
++    init_thresholds = [0] * len(class_freq)
+     predictions = []
+     true_labels = []
+ 
+@@ -157,10 +158,13 @@
+     optimal_thresholds = []
+ 
+     # Optimize threshold for each class
+-    for i in range(21):
++    for i in range(len(class_freq)):
+         ratio = class_ratios[i]
+         class_preds = predictions[:, i]
+         class_labels = true_labels[:, i]
++        if np.unique(class_labels).size < 2:
++            optimal_thresholds.append(0.5)
++            continue
+ 
+         # Set search range
+         if ratio < 0.005:
+@@ -237,4 +241,4 @@
+ 
+             self.base_lr = self.final_lr + (self.base_lr_orig - self.final_lr) * \
+                            (1 + math.cos(math.pi * (epoch - 1 - self.warmup_steps) / self.max_steps)) / 2
+-        return self.base_lr # Return current learning rate
+\ No newline at end of file
++        return self.base_lr # Return current learning rate

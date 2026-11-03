@@ -38,7 +38,7 @@ Val 缺正例的类别和恒正治疗标志不搜索类别阈值，预先用0.5�
 
 **iMFP-LG。** BCE 接受全零行和恒正列；TAPE必须继续微调，不能改成冻结ESM替代。原代码将批内标签节点拼成一个大图，32批量时从21类改到49类，注意力矩阵元素数由451,584增到2,458,624，约5.44倍；这只描述图矩阵，不能据此估算整模型显存倍数。先在16GB V100 实测batch32，确有OOM再降低。FC/CLSFC优化器遗漏是原数据复现时已确认的问题，建议新任务加入优化器并清楚命名为修正设置；原结果仍保留。
 
-**AMCL。** 新增强只来源于相应 Train。单功能判断、尾类筛选、功能相似度均按前48个功能计算；49维任务的分类目标包含治疗标志，不能让该标志使所有单功能正肽都变成“多标签”而停止增强。原类别索引、500条阈值和21位类频率不能直接照搬，尾类选择沿用作者频率原则，在当前Train中重新确定并固定配置。
+**AMCL。** 新增强只来源于相应 Train。重读原DA源码可知，其 `positions_to_check=range(21)` 覆盖全部21功能，实际对所有单标签Train行增强，没有在该函数中做尾类筛选。因此新入口按前48个功能判断单标签，保留N=3和四条新增序列的原操作；49维分类目标仍含治疗标志。功能相似度也只用48个功能。DBL相关的头尾频率和全部类频率从当前增强Train重新计算，21位硬编码需去除。
 
 本次提取作者 DBL 类，在小型合成标签例上检查，CPU测试将硬编码CUDA张量映射到CPU。混合49的全零背景例得到有限loss和梯度；positive49的恒正列得到NaN；48功能例正常。因此明确需要处理的是恒正类初始偏置 log(0)，不能仅凭 repeat_rate=0 就断言混合版DBL会失败。建议功能列继续采用DBL，恒正治疗标志的DBL子项改为普通BCE，并保持原组合权重、记录输出归一化方式；正式训练前再以真实小批检验原FDL/DBL/对比组合。
 
@@ -164,6 +164,48 @@ tail -f "$imfp_out/short_train.log"
 确认这一轮能完成后，用相同out和 `--epochs 100` 提交正式实验，日志改为 `train.log`。两项分别写入 `training/seed42_epochs1/`、`training/seed42_epochs100/`，均随机初始化任务模型，只加载相同的通用TAPE权重。数据预备结果复用，短训练权重不作为正式训练初始化。Val/Test分数、原始ID、固定阈值和 `comparison.json` 均写入各自训练目录。
 
 本地用单层、768维的随机BERT初始化替身和真实CSV小批，覆盖48功能、49恒正标志及混合全零背景，检查原GAT/BCE/FGM的一轮执行、FC/CLSFC实际更新、重复行及输出对齐。本地Transformers较新，测试时仅在临时副本将已移除的HF AdamW换为Torch AdamW并匹配基础超参数；提交的代码仍使用V100已验证的Transformers4.24/HF AdamW。原始TAPE权重和16GB V100的完整批量运行仍需服务器短训练验证。
+
+### AMCL 的 TheraPep 准备
+
+新增 `amcl_therapep.py` 和 `amcl_therapep.patch`。prepare动作只使用当前任务Train，调用作者增强函数，按前48功能判断单标签并以N=3生成反转、相似残基替换和反向翻译变体。Val和Test保持原始序列及行身份。训练继续使用原TextCNN、FDL/DBL权重0.99/0.01、0.3倍对比损失、flooding、Adam及原余弦调度。此入口的阈值改在Val拟合，预测仍保留作者的 `sigmoid(10*(logit-t)) > t` 决策，AP从普通sigmoid(logit)连续分数计算。
+
+对positive49，DBL的功能48列正常计算，恒正治疗标志的该子项改用BCE，再按49个输出归一化；FDL仍覆盖全部49列。对mixed49保留全部49列的原DBL。两者对比损失均只使用功能48列，避免治疗标志使任意正肽之间产生额外功能重叠。Val中单一真值的类别不搜索阈值，固定t=0.5，此t仍按作者上述决策解释。
+
+真实therapep48的CPU增强检查得到Train 44,524条，其中17,310条为单功能标签行，增强后为113,764条，即44,524 + 4×17,310。原始Train有一条74残基序列，保留；Train/Val/Test分别padding到74/50/50。模型在这两种长度下均保持原池化输出尺寸。小批测试采用至少50的padding，符合原TextCNN固定池化维度要求。
+
+METFAN及iMFP-LG仍在运行时，另建AMCL的Git工作区。操作仅fetch和新增工作区，不更新正在运行的两个项目检出的HEAD。数据、权重不复制。
+
+```bash
+export BASE="$HOME/wuzhencheng/projects/MFP-Nova"
+export AMCL_PROJECT="$HOME/wuzhencheng/projects/MFP-Nova-amcl"
+git -C "$BASE" fetch origin main
+git -C "$BASE" worktree add --detach "$AMCL_PROJECT" origin/main
+export AMCL_KIT="$AMCL_PROJECT/scripts/paper_repro"
+export PAPER_ROOT="$HOME/paper-repro"
+conda activate repro-modern
+export AMCL_PYTHON="$HOME/.conda/envs/repro-modern/bin/python"
+
+git -C "$PAPER_ROOT/AMCL" apply --ignore-space-change "$AMCL_KIT/amcl_therapep.patch"
+export amcl_out="$PAPER_ROOT/therapep_runs/amcl_therapep48_$(date +%Y%m%d_%H%M%S)"
+"$AMCL_PYTHON" "$AMCL_KIT/amcl_therapep.py" prepare \
+  --task therapep48 --data-root "$BASE/data/therapep48" --output "$amcl_out" --seed 42
+```
+
+以上仅准备CPU增强，不占用训练GPU。两个现有GPU作业完成或有其他已分配空闲卡后，再选择该卡短训练。下面物理GPU0只作用户已确认可用时的示例。
+
+```bash
+export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4
+CUDA_VISIBLE_DEVICES=0 \
+nohup "$AMCL_PYTHON" "$AMCL_KIT/amcl_therapep.py" train \
+  --output "$amcl_out" --seed 42 --epochs 1 --batch-size 256 \
+  >"$amcl_out/short_train.log" 2>&1 < /dev/null &
+echo "PID=$! LOG=$amcl_out/short_train.log"
+tail -f "$amcl_out/short_train.log"
+```
+
+短训练正常后，正式设置为 `--epochs 200`，日志用train.log。两个实验分别写入 `training/seed42_epochs1/` 和 `training/seed42_epochs200/`；模型均从随机初始化开始，复用同一份Train增强文件。最终保存model.pth、Val阈值、带logits/普通概率/原生二值决策/row_id/ID的Val和Test NPZ，以及完整Test和正肽48功能视图的comparison.json。源码只在DA脚本直接运行时执行其旧默认流程，导入增强函数不再读取作者机器的TP_test路径。原始21类训练入口默认仍读其原增强文件。
+
+本地已对三个任务用合成覆盖标签的小批跑通原TextCNN、原组合损失、对比学习、flooding、Adam参数更新、Val阈值和按行导出，包含恒正49列及全零背景。另用真实完整therapep48验证了增强条数。完整V100训练及真实Test性能尚待执行。准备positive49/mixed49时使用独立out，指定相应任务及其真实CSV根目录，复用同一套代码。
 
 ## V100 上复现论文原始实验
 
