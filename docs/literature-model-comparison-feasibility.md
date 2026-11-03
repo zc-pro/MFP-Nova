@@ -1,8 +1,152 @@
 # 同类论文模型在 MFP-Nova 数据集上的重训练可行性分析
 
-**2026-11-03 的优先目标是在 Ubuntu / V100 上复现各论文原始实验。** 第一节给出操作顺序；后面的 TheraPep 三任务是后续迁移方案，最后的编号 1–7 节保留 10 月旧任务的仓库分析。
+**2026-11-04，五模型原数据首轮复现已完成，当前研究目标转为 TheraPep 三任务重训练。** 首节给出最新数据核对和适配方案。后面的 V100 章节保留首轮结果与命令，11月2日 TheraPep 分析和编号1–7节为历史判断，涉及可用资产、风险和实施顺序时以最新研究为准。
+
+## TheraPep 三任务重训练研究（2026-11-04）
+
+五模型已完成原数据首轮训练和 Test。下一步沿用 TheraPep-AI 发布划分，分别训练 `therapep49`、`therapep49_positive`、`therapep48`。各方法保留自己的预处理、特征、损失、训练阶段和原生决策，同时输出一致定义的评价指标。下面依据当前九份 CSV 和已复现的五个提交重新核查，覆盖此前仅做静态估计的判断。
+
+### 数据和输出
+
+| CLI任务 | 数据目录 | Train / Val / Test | 目标 |
+|---|---|---|---|
+| therapep49 | data/therapep_ai | 131,947 / 16,457 / 16,537 | 48功能 + is_therapeutic，含全零合成背景 |
+| therapep49_positive | data/therapep49_positive | 44,524 / 5,565 / 5,566 | 相同正肽的49维目标，最后一维恒1 |
+| therapep48 | data/therapep48 | 44,524 / 5,565 / 5,566 | 相同正肽的48功能目标，删去治疗标志 |
+
+两个变体与完整数据的正肽逐行核对通过，序列、功能标签和顺序一致，两个变体的 row_id/ID 也一致。项目实际任务名使用上表小写标识。第48个功能 Tumor_homing 保留。
+
+本次补充统计发现，正肽 Train 有4条重复记录，标签相同；混合 Train/Val/Test 分别有14/1/1条重复记录。混合 Train 与 Val、Train 与 Test 各有4条相同序列，均为全零背景，标签无冲突。两个正肽变体的三个划分之间没有完全相同序列。保留作者原始行和划分，不按序列建字典覆盖记录；编码缓存可按序列复用，训练样本仍按行读取。完全相同序列的统计不代表同源隔离结论。
+
+Train 中48个功能都有正例，最少为 AntiTubercular 9条、Angiogenic 11条。Val 的这两类没有正例，Test 的 Angiogenic 没有正例。原 TPpred-LE/SA-MTP 指标函数逐类无条件调用 roc_auc_score，在当前 sklearn 环境会因单类别真值而中断，需要对不可定义的 AUROC 返回空值并记录有效类别数。全48功能的 F1 按固定标签集合计算；Macro-AP 应明确无正例类的处理及分母，具体指标复用方式见下一段。
+
+Val 缺正例的类别和恒正治疗标志不搜索类别阈值，预先用0.5。其余可搜索的阈值只在 Val 确定。SA-MTP 的原15类 F1/MCC/fixed 表不直接按位置迁移，建议在全部可识别功能类上采用作者通用 F1 搜索作为新任务起点，写明这项迁移设置。
+
+具体接入时复用项目 `evaluate_metrics`，Macro-AP 按有正例类别平均，并报告 `ap_labels_with_positives` 和逐类空值。该字段与原生PR曲线梯形面积AUPR区分。Macro-F1继续保留完整标签集合。
+
+### 五模型的具体改造
+
+| 模型 | 可以直接保留 | 必须修改 | 当前可行性 |
+|---|---|---|---|
+| METFAN | TextCNN、两种语言模型、池化、特征优化、FDL、Val Macro-F1选模及现有Val阈值补丁 | 按行读取CSV；输出48/49；同一有效行索引生成两套特征；单类别阈值处理；导出身份和连续分数 | 最适合作为第一个三任务训练实现 |
+| iMFP-LG | 已取得的TAPE、微调、FGM、标签GAT、BCE、原固定日程与0.5阈值 | NPY序列字典改为CSV行记录；config.num_labels；确认优化器是否训练FC/CLSFC；测量49节点图显存 | 三任务均可，已具备正确预训练资产 |
+| AMCL | TextCNN、FDL/DBL/对比损失、增强操作、原训练日程与阈值规则 | 所有21维常量；当前Train增强和类频率；功能列与治疗标志分开处理；恒正类DBL数值；阈值拟合改为Val | 48任务优先，49任务需明确损失与增强适配 |
+| TPpred-LE | one-hot/PSSM、标签解码、两个训练算法、分类器重采样 | 15维label_input与Embedding；数据读入；新PSSM映射；最佳轮保存；缺失类别评价 | 可行，主要准备成本是PSSM |
+| SA-MTP | 冻结ESM2、PSIPRED SS2、动态图、GAT、FiLM、原早停 | 15维token与Embedding；新SS2和序列ID；最佳轮保存；新任务阈值和单类别评价 | 可行，主要准备成本是SS2及残基缓存 |
+
+**METFAN。** 本地用每个任务4条真实 Train 的序列/标签，加随机1280/1024维池化输入，检查作者完整融合模型48/49维输出及 BCE 反向，均为有限值。该检查只验证接口和梯度，不是语言模型特征验证、原FDL完整训练或真实性能。TheraPep Train 长度超过50的行分别为混合版3条、两个正肽版各1条；Val/Test 无超长行。保留作者过滤规则时，实际 Train 为131,944/44,523/44,523条，对全部模态使用同一索引。
+
+**iMFP-LG。** BCE 接受全零行和恒正列；TAPE必须继续微调，不能改成冻结ESM替代。原代码将批内标签节点拼成一个大图，32批量时从21类改到49类，注意力矩阵元素数由451,584增到2,458,624，约5.44倍；这只描述图矩阵，不能据此估算整模型显存倍数。先在16GB V100 实测batch32，确有OOM再降低。FC/CLSFC优化器遗漏是原数据复现时已确认的问题，建议新任务加入优化器并清楚命名为修正设置；原结果仍保留。
+
+**AMCL。** 新增强只来源于相应 Train。单功能判断、尾类筛选、功能相似度均按前48个功能计算；49维任务的分类目标包含治疗标志，不能让该标志使所有单功能正肽都变成“多标签”而停止增强。原类别索引、500条阈值和21位类频率不能直接照搬，尾类选择沿用作者频率原则，在当前Train中重新确定并固定配置。
+
+本次提取作者 DBL 类，在小型合成标签例上检查，CPU测试将硬编码CUDA张量映射到CPU。混合49的全零背景例得到有限loss和梯度；positive49的恒正列得到NaN；48功能例正常。因此明确需要处理的是恒正类初始偏置 log(0)，不能仅凭 repeat_rate=0 就断言混合版DBL会失败。建议功能列继续采用DBL，恒正治疗标志的DBL子项改为普通BCE，并保持原组合权重、记录输出归一化方式；正式训练前再以真实小批检验原FDL/DBL/对比组合。
+
+**TPpred-LE。** 本次直接提取并运行作者 square 采样器的小型标签例。混合49全零行得到非零且有限的采样权重，原实现已经考虑每一目标类的正负状态，无需主动排除背景。positive49恒正列最终权重同样有限，负类分配的空除法会产生警告；可只对实际存在的状态计算，避免无意义除零，保持原采样分布。此前“全零行可能被赋零采样权重”的泛化怀疑不适用于已核查的这个 Sampler。PSSM沿用作者搜索和无匹配时BLOSUM回退，统计实际覆盖率，不能将全体PSSM人为换成BLOSUM。
+
+**SA-MTP。** 当前10,237份SS2和PSSM来自旧MTP15样本，不能按编号套给TheraPep。对新样本确认可生成作者所需H/E/C概率；正肽与合成背景用同一生成流程。缺SS2回退全连接图的运行应标为结构缺失配置。最佳轮须即时保存或复制参数，随后在恢复的权重上拟合Val阈值。该修正同样用于TPpred-LE。新模型均随机初始化任务相关头，不加载旧MTP/MFTP的监督分类权重。
+
+### 可复用资产与资源
+
+V100 已有 ESM2-650M、ProtT5和TAPE 权重，以及三个可用Conda环境，可直接继续使用。旧数据的微调权重、SS2、PSSM和预计算特征只有在序列、编码器、残基顺序、长度处理及数值设置一致时才能逐条复用。MFP-Nova原主任务的特征不能按行号直接套入TheraPep。
+
+建议先对完整混合队列生成通用特征，再按row_id为两个正肽变体取子集。训练任务各自独立，PSSM/SS2和冻结表征可复用。METFAN 的 ESM2/ProtT5 均值特征与 SA-MTP 的残基表征应分别按其原处理生成；前者本轮用FP16提取，后者原实现为FP32，直接互换会改变数值设置。
+
+按50残基、1280维、FP32估算，SA-MTP 单独混合Train的padding表征约31.46 GiB，三个划分合计约39.32 GiB；实际内存还含原始缓存、图和模型。三个正肽划分合计约13.27 GiB。迁移前需改为按批读取/填充或合适的磁盘数组，避免一次同时持有多份padding拷贝。METFAN两支均值特征合计2304维，混合三划分约1.42 GiB，资源门槛明显较低。以上是张量体积估算，没有宣称实测显存和工期。
+
+### 训练、比较和实施顺序
+
+每个模型在三个任务分别训练，共15个首轮训练配置。seed先用42作适配试验；固定方法设置后再做必要多seed。TPpred-LE的一个配置包含原两阶段，不能把15个配置直接理解为15个单阶段GPU作业。各方法沿用自己的batch、优化器、损失、训练阶段和选模原则。
+
+每个任务先报告完整Test，再将三次训练固定下来的权重、阈值投到同一批5,566条正肽的前48个功能上。主表给Micro/Macro-F1、Micro/Macro-AP、样本Jaccard、完全匹配率、Hamming loss。需要时给固定0.5的补充结果，用已有分数计算，沿用原生决策的主结果也应保留。
+
+混合49另外报告治疗标志和合成背景功能误报率。positive49的治疗标志恒1，不能据整体49维分数判断功能提高。完全背景正确预测的Jaccard按项目定义计0，混合全Test的样本Jaccard即使完美预测也只有约33.66%；因此不能拿它与正肽任务的Jaccard直接比较。
+
+推荐实施顺序如下。
+
+1. **METFAN先完成therapep48。** 增加一个普通CSV入口，保留数据行身份、两套特征和当前Val阈值修正。真实小批检验原FDL和参数更新，短训练后再跑一个完整seed。
+2. **METFAN扩展positive49和mixed49，同时接iMFP-LG。** 这两种方法无需先建设PSSM/SS2流水线；iMFP-LG先确认优化器修正和49节点显存。
+3. **AMCL先48后49。** 固定尾类与增强定义，先验证恒正类DBL适配，再跑两个49任务。
+4. **准备TPpred-LE的PSSM与SA-MTP的SS2。** 落实生成覆盖、CPU/存储条件后再完成两种结构/进化方法的三个任务。避免先占用GPU等待未就绪的输入。
+5. **与项目模型对照。** 读取同任务、同split的TheraPep-AI和HelixSet结果，核对模型版本和选模设置。此前原数据五模型分数不直接放入TheraPep表。
+
+### 下一步执行入口
+
+已增加 `scripts/paper_repro/metfan_therapep.py`，支持三个任务的CPU数据准备、特征生成、训练三个动作。第一项完整实验先运行 therapep48 / seed42。原 `run_v100.sh` 继续用于原论文数据，TheraPep改用新入口。
+
+本地已检查三任务的导出条数和行身份，验证旧Val阈值补丁与新增TheraPep补丁可依次应用。对每个任务取4条真实序列/标签，用随机池化特征运行作者完整融合模型、原FDL、反向和一次参数更新，结果有限。另用小型融合测试替身、随机池化输入和真实CSV小批，跑通原生FDL/Adam一轮训练到最佳权重恢复、固定阈值、身份对齐NPZ及指标JSON的CLI流程。未在本机生成真实语言模型特征或进行完整训练，这些检查不产生模型性能结果。
+
+首次在V100的MFP-Nova目录同步脚本。若此前仅按本会话命令将服务器 `metfan_features.py` 的单行设置改成 `use_fast=False`，这项修复已包含在新提交中，可先 `git restore -- scripts/paper_repro/metfan_features.py` 再拉取；如还做了其他本地修改，先检查 `git diff` 保留所需修改。不要在运行中的源码目录更新。
+
+```bash
+cd "$HOME/wuzhencheng/projects/MFP-Nova"
+git pull --ff-only origin main
+conda activate repro-modern
+export KIT="$PWD/scripts/paper_repro"
+export PAPER_ROOT="$HOME/paper-repro"
+
+# 原始TheraPep CSV或变体尚未放在服务器时，使用项目已有命令准备。
+python -m mfp_nova.cli download-therapep
+python -m mfp_nova.cli prepare-therapep-variants
+
+# METFAN原仓库已经应用过metfan_val_thresholds.patch，再应用这份增量补丁一次。
+git -C "$PAPER_ROOT/METFAN" apply --ignore-space-change "$KIT/metfan_therapep.patch"
+
+# out为本轮新目录，准备动作自行创建。后续两个动作继续使用同一个out。
+export out="$PAPER_ROOT/therapep_runs/metfan_therapep48_$(date +%Y%m%d_%H%M%S)"
+python "$KIT/metfan_therapep.py" prepare --task therapep48 --output "$out"
+```
+
+预期显示Train源数据44,524条、保留44,523条，Val 5,565条、Test 5,566条。输出保留row_id/ID的映射和48类顺序；过滤仅涉及Train的一条超长序列，原始CSV不修改。
+
+沿用分配的GPU，此处按用户此前明确选择的物理GPU1执行。提取和训练顺序在同一个后台作业内完成，特征失败会停止作业。
+
+```bash
+export METFAN_ESM2="$PAPER_ROOT/pretrained/esm2_t33_650M_UR50D"
+export METFAN_PROTT5="$PAPER_ROOT/pretrained/prot_t5_xl_half_uniref50-enc"
+export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4
+CUDA_VISIBLE_DEVICES=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+nohup bash -c '
+  python "$KIT/metfan_therapep.py" features --output "$out" &&
+  python "$KIT/metfan_therapep.py" train --output "$out" --seed 42
+' >"$out/run.log" 2>&1 < /dev/null &
+echo "PID=$! LOG=$out/run.log"
+tail -f "$out/run.log"
+```
+
+结果位于 `$out/training/seed42/0/textcnn_esm2_mean_prot_t5_mean_optimized/`，包含最佳checkpoint、原生结果、带row_id/ID与类名的Val/Test连续分数NPZ，以及 `comparison.json`。后者提供完整Test、正肽48功能视图、Macro/Micro-F1/AP、不可定义指标原因和最佳epoch。新入口按seed分别保存训练目录，支持复用同一套特征开展后续seed。
+
+首版各任务单独提取特征；跨任务按row_id复用混合队列表征仍属后续优化。48任务完整训练和Test验证后，两个49任务只需将prepare的 `--task` 改为对应名称，并使用各自的新out，再执行features/train。单类别Val的阈值固定为0.5，不会使用Test标签重新拟合阈值。
 
 ## V100 上复现论文原始实验
+
+### 首轮实际运行结果（2026-11-03）
+
+五模型的逐项效果分析、论文对照与源码差异集中在 [原数据复现效果分析](D:/Data/Code/MFP-Nova/docs/五模型-V100-原数据复现效果分析.md)。
+
+以下来自用户提供的 V100 训练日志和 Test CSV，均为单次运行；此处未重新执行远端推理。五个选定方法已各完成一次原始主基准训练和独立测试。AMCL 另完成作者发布权重复测，五指标与论文表 1 在日志三位小数精度上一致。
+
+MTP15 的 Train/Val/Test 为 8,190/1,023/1,024。下表为百分数；横线表示本次提供的输出没有该项。
+
+| 方法/结果 | 样本 Jaccard | Micro-F1 | Macro-F1 | 完全匹配率 | Hamming loss ↓ |
+|---|---:|---:|---:|---:|---:|
+| TPpred-LE 发布权重 | 55.39 | 60.95 | 43.79 | 43.75 | 7.50 |
+| TPpred-LE seed46 阶段A | 53.68 | 59.45 | 42.81 | 42.29 | 7.61 |
+| TPpred-LE seed46 阶段B | 52.32 | 58.08 | 43.18 | 36.33 | 9.15 |
+| SA-MTP seed50 混合阈值 | — | 58.90 | 43.02 | 38.18 | 8.89 |
+| METFAN seed42 完整融合 | 59.69 | — | 48.60 | 46.73 | 8.60 |
+
+TPpred-LE 结果目录为 `~/paper-repro/results/TPpred-LE.O4kGdp/`。SA-MTP 为 `SA-MTP.kgEohV/`，Epoch 13 的 Val loss 最低为 0.200873，第28轮早停；公开实现的引用保存实际留下第28轮参数，应标为原代码结果。TPpred-LE 同样保留了原引用保存行为。METFAN 为 `METFAN.aa5che/0/textcnn_esm2_mean_prot_t5_mean_optimized/`，第239轮早停，恢复第189轮保存的权重，最佳 Val Macro-F1 为0.5640。METFAN 使用本项目重建的 ESM2/ProtT5 特征和 Val 阈值补丁，精确 checkpoint 和池化设置见后文。
+
+MFTP21 结果同样为百分数。iMFP-LG 原 NPY Test 读取1,975条；AMCL 原编码器过滤后为1,969条。保留原生处理时须注明这6条覆盖差异。
+
+| 方法/结果 | 样本 Precision | 样本 Recall | 样本 Jaccard | 完全匹配率 | Hamming loss ↓ |
+|---|---:|---:|---:|---:|---:|
+| AMCL 发布权重复测 | 76.2 | 71.9 | 70.7 | 65.2 | 3.2 |
+| AMCL 重建训练入口，200轮 | 75.0 | 70.7 | 69.5 | 63.7 | 3.3 |
+| iMFP-LG 编号0 / seed0，100轮 | 70.0 | 71.2 | 65.8 | 57.0 | 3.8 |
+
+AMCL 本次目录为 `~/paper-repro/results/AMCL.2xm3sd/`，权重 `amcl.pth`。iMFP-LG 将最终权重保存为对应 `iMFP-LG.*/model0.bin`，日志在第100轮之后打印的“on val”五项实际调用 `TestModel(test_iter, ...)`，属于独立 Test。原入口未输出 Macro/Micro-F1，不从样本均值 Precision/Recall 推算这两项。原来的 `MFTP_alldata` 全数据任务权重未用于此测试。当前结果支持原数据训练通路已跑通；稳定的重复实验及最佳轮保存修正结果尚待完成。
 
 **本轮重点复现五个模型，每个先在作者主划分上完成一次训练与测试。** MTP15 选 TPpred-LE、SA-MTP、METFAN，共用 1,024 条原始测试记录；MFTP21 选 AMCL、iMFP-LG，共用 1,975 条原始测试记录。各自保留原生预处理，汇报实际进入评分的样本数，两个数据集分表。新增的 iMFP-LG 优先做 MFTP21 单个模型编号，MFBP5 留到后续；METFAN 排最后，先落实 ESM2/ProtT5 特征，再运行完整融合模型，用验证集确定阈值后单独报告独立测试成绩。
 
@@ -53,7 +197,7 @@ python -m pip install 'numpy<2' scikit-learn six transformers==4.24.0 'huggingfa
 
 conda create -y -n repro-modern --clone MFP-Nova
 conda activate repro-modern
-python -m pip install 'transformers==4.40.2' sentencepiece protobuf seaborn pandas scikit-learn matplotlib tqdm
+python -m pip install 'numpy==1.26.4' 'transformers==4.44.2' 'matplotlib==3.9.2' 'contourpy==1.3.0' 'seaborn==0.13.2' sentencepiece protobuf pandas scikit-learn tqdm
 ```
 
 **3．准备论文输入。** 五个仓库已经带有各自的主划分。TPpred-LE 首选作者原 PSSM；如果已 clone SA-MTP，则可直接复用同一 MTP15 的 PSSM。下面做一次索引文件名检查再建立链接，省去重新跑 PSI-BLAST。只在新 clone 上运行。

@@ -15,15 +15,19 @@ def main():
     parser.add_argument("feature", choices=["esm2_mean", "prot_t5_mean"])
     parser.add_argument("checkpoint")
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--data-dir", type=Path, help="Root with train/train.txt, val/val.txt, test/test.txt")
     args = parser.parse_args()
     t5 = args.feature == "prot_t5_mean"
     cls = T5EncoderModel if t5 else EsmModel
-    tokenizer = AutoTokenizer.from_pretrained(args.checkpoint, do_lower_case=False)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.checkpoint, do_lower_case=False, use_fast=False
+    )
     model = cls.from_pretrained(args.checkpoint, torch_dtype=torch.float16).cuda().eval()
     folder = Path(os.environ.get("METFAN_FEATURES", "features")) / args.feature
     folder.mkdir(parents=True, exist_ok=True)
     for split in ("train", "val", "test"):
-        seqs, labels = getSequenceData(".", split)
+        directory = str(args.data_dir / split) if args.data_dir is not None else "."
+        seqs, labels = getSequenceData(directory, split)
         # Recover exactly the residue identities, order and filtering used by TextCNN.
         encoded, _, lengths = PadEncode(seqs, labels, 50)
         residues = " ACDEFGHIKLMNPQRSTVWY"
@@ -40,9 +44,14 @@ def main():
                 raise ValueError("Tokenization did not yield one token per residue")
             hidden = model(**inputs).last_hidden_state.float()
             pooled.append(((hidden * mask.unsqueeze(-1)).sum(1) / mask.sum(1, keepdim=True)).cpu())
+            if start % 1000 < args.batch_size:
+                print(args.feature, split, min(start + len(batch), len(sequences)),
+                      "/", len(sequences), flush=True)
         features = torch.cat(pooled)
         if features.shape[1] != (1024 if t5 else 1280):
             raise ValueError(f"Unexpected embedding width: {features.shape[1]}")
+        if not torch.isfinite(features).all():
+            raise ValueError(f"Nonfinite embeddings: {args.feature}/{split}")
         torch.save(features, folder / f"{split}_{args.feature}.pt")
         print(args.checkpoint, split, tuple(features.shape), flush=True)
 

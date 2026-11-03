@@ -1,0 +1,46 @@
+--- a/evaluation.py
++++ b/evaluation.py
+@@ -27,6 +27,9 @@
+     best_thresholds = []
+     
+     for i in range(num_classes):
++        if np.unique(y_true[:, i]).size < 2:
++            best_thresholds.append(0.5)
++            continue
+         best_f1 = 0
+         best_threshold = 0.5
+         for threshold in np.arange(0, 1, 0.01):
+--- a/train.py
++++ b/train.py
+@@ -362,8 +362,8 @@
+                     'model_state_dict': model.state_dict(),
+                     'optimizer_state_dict': optimizer.state_dict(),
+                     'epoch': epoch,
+-                    'best_val_score': best_val_score,
+-                    'val_thresholds': find_best_thresholds(np.array(val_labels), np.array(val_preds)),
++                    'best_val_score': float(best_val_score),
++                    'val_thresholds': [float(v) for v in find_best_thresholds(np.array(val_labels), np.array(val_preds))],
+                     'args': vars(args),
+                     'feature_types': model.feature_types,
+                     'optimize_features': getattr(model, 'optimize_features', False),
+@@ -371,6 +371,10 @@
+                 }
+                 best_model_path = os.path.join(result_dir, "best_model.pth")
+                 torch.save(checkpoint, best_model_path)
++                np.savez_compressed(
++                    os.path.join(result_dir, "val_predictions.npz"),
++                    targets=np.array(val_labels), probabilities=np.array(val_preds),
++                    thresholds=np.array(checkpoint["val_thresholds"]))
+                 print(f"保存最佳模型到: {best_model_path}")
+             else:
+                 counter += 1
+@@ -454,6 +458,9 @@
+         
+         # 计算最佳阈值
+         best_thresholds = thresholds
++        np.savez_compressed(
++            os.path.join(result_dir, "test_predictions.npz"),
++            targets=test_labels, probabilities=test_preds, thresholds=np.array(best_thresholds))
+         
+         # 应用阈值获得二值化预测
+         test_binary_preds = np.zeros_like(test_preds)
