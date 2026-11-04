@@ -2,6 +2,89 @@
 
 **2026-11-04，五模型原数据首轮复现已完成，当前研究目标转为 TheraPep 三任务重训练。** 首节给出最新数据核对和适配方案。后面的 V100 章节保留首轮结果与命令，11月2日 TheraPep 分析和编号1–7节为历史判断，涉及可用资产、风险和实施顺序时以最新研究为准。
 
+## TheraPep48 已运行结果与下一步（2026-11-04）
+
+依据本轮V100粘贴日志，以下均为seed42、Test 5566条、48功能的统一指标。iMFP-LG只有1轮试跑，不能作为100轮正式结果。不同方法沿用各自训练和决策设置。
+
+| 模型 | 训练阶段 | Micro-F1 | Macro-F1 | Micro-AP | Macro-AP | Jaccard | 完全匹配 | Hamming loss |
+|---|---|---|---|---|---|---|---|---|
+| METFAN | 347轮早停，恢复最佳297轮 | .420454 | .475387 | .826793 | .457008 | .255248 | .000000 | .106776 |
+| iMFP-LG | **1轮试跑** | .677273 | .158323 | .753688 | .295072 | .541721 | .328063 | .030296 |
+| AMCL | 固定200轮 | .580437 | .215667 | .656806 | .270277 | .526802 | .346389 | .033522 |
+
+METFAN对Antileishmania、Antimalarial、Antitrypanosomic、Blood-brain_barrier_penetrating四列的5566条Test全部预测阳性；实际阳性分别5、6、4、9条。四列贡献22240个假阳性，占全部25193个假阳性的88.28%。平均每条预测6.39个标签，实际为2.46个。需要先读出实际阈值和Val分数，不能将问题简单归因于模型没有学到信号。原生Macro-F1 .496221把Test完全为空且预测也为空的Angiogenic计为1，统一值.475387计为0，差1/48。
+
+iMFP-LG仍有28个Test有阳性类别未预测任何阳性，AMCL正式200轮有17个。AMCL平均预测1.38个标签，Micro-Precision .808325、Recall .452785，主要表现为漏检。Test Angiogenic无正例，Macro-AP分母47，Macro-F1仍用全48类。AMCL的1轮结果仅验证流程，正式结果来自seed42_epochs200。
+
+### V100：先诊断METFAN，同时补齐iMFP-LG正式训练
+
+本次新增 `metfan_therapep.py diagnose`。从原最佳checkpoint导出的Val/Test分数进行CPU分析，不重新训练或生成语言模型特征，保留原comparison.json、NPZ、权重。输出独立的threshold_analysis.json，包括原Val粗网格、预先固定0.5、Val精确F1三种决策的完整指标、逐类支持度、阈值和预测阳性数。精确F1仅在Val不同分数处搜索，相同最优F1取较高阈值；单类别Val列仍固定0.5。先拟合新阈值再读取Test；不根据Test挑策略，也不重新选择checkpoint。这是已有checkpoint的补充决策实验，不能称为重新训练后的改进模型。拟合后的Val成绩为拟合内结果。
+
+在已完成的TheraPep48任务上使用以下命令。当前三个作业的工作区不更新，用单独Git工作区读取新脚本。
+
+```bash
+export BASE="$HOME/wuzhencheng/projects/MFP-Nova"
+export NEXT_PROJECT="$HOME/wuzhencheng/projects/MFP-Nova-paper-next"
+git -C "$BASE" fetch origin main
+git -C "$BASE" worktree add --detach "$NEXT_PROJECT" origin/main
+export NEXT_KIT="$NEXT_PROJECT/scripts/paper_repro"
+export PAPER_ROOT="$HOME/paper-repro"
+export MODERN_PYTHON="$HOME/.conda/envs/repro-modern/bin/python"
+export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4
+export metfan_out="$PAPER_ROOT/therapep_runs/metfan_therapep48_20261104_011944"
+
+CUDA_VISIBLE_DEVICES="" "$MODERN_PYTHON" "$NEXT_KIT/metfan_therapep.py" diagnose \
+  --output "$metfan_out" --seed 42 >"$metfan_out/threshold_analysis.log" 2>&1
+cat "$metfan_out/threshold_analysis.log"
+```
+
+若NEXT_PROJECT已经由上述命令创建，再次使用时复用该目录，不重复worktree add。输出会给出四列的实际原生/精确阈值；现有日志尚未包含这些阈值，不能预先断言一定为0。精确搜索也可能合法地选择整列阳性，效果要以真实输出为准。
+
+iMFP-LG正式训练复用之前准备的数据和已应用的作者仓库补丁，不重复prepare或apply。先执行下面的进程/GPU查看，确认GPU0仍分配给本实验，且没有已启动的100轮任务；若正式任务已在运行或完成，继续查看其train.log即可。
+
+```bash
+pgrep -af '[i]mfp_therapep.py.*train'
+nvidia-smi
+```
+
+确认尚未启动正式任务后运行：
+
+```bash
+export IMFP_KIT="$HOME/wuzhencheng/projects/MFP-Nova-imfp/scripts/paper_repro"
+export IMFP_PYTHON="$HOME/.conda/envs/repro-imfp/bin/python"
+export imfp_out="$HOME/paper-repro/therapep_runs/imfp_therapep48_20261104_015157"
+export GPU_ID=0
+export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 PYTHONUNBUFFERED=1
+CUDA_VISIBLE_DEVICES="$GPU_ID" HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+nohup "$IMFP_PYTHON" "$IMFP_KIT/imfp_therapep.py" train \
+  --output "$imfp_out" --seed 42 --epochs 100 --batch-size 32 \
+  >"$imfp_out/train.log" 2>&1 < /dev/null &
+echo "PID=$! LOG=$imfp_out/train.log"
+tail -f "$imfp_out/train.log"
+```
+
+这从相同通用TAPE权重重新初始化任务模型，保留1轮试跑，输出training/seed42_epochs100。按试跑1398秒/轮估算，100轮约39小时，加最终评估，实际受硬件负载影响。固定100轮不因本次Test表现改变。
+
+### 准备TPpred-LE和SA-MTP的新样本特征
+
+新增structure_inputs.py只导出输入，还没有实现这两模型的TheraPep训练。一次生成供两方法使用的原始全长查询、各split的seqs.fasta/labels.csv及row_id/ID/feature_id映射。仅特征查询按完全相同序列合并，训练和评价仍保留全部行及原顺序。TheraPep48共55651条不同序列，Train/Val/Test仍为44524/5565/5566，训练中的74残基序列保留；模型最终按各自原生规则处理长度。不同数据任务的feature_id编号不能按位置互换，需要通过序列对应。
+
+```bash
+export structure_out="$PAPER_ROOT/therapep_runs/structure_therapep48_$(date +%Y%m%d_%H%M%S)"
+CUDA_VISIBLE_DEVICES="" "$MODERN_PYTHON" "$NEXT_KIT/structure_inputs.py" \
+  --task therapep48 --data-root "$BASE/data/therapep48" --output "$structure_out"
+
+# 只检查当前环境是否能找到程序，不安装、不下载数据库、不启动特征计算。
+command -v psiblast || true
+command -v blastdbcmd || true
+command -v runpsipred || true
+command -v runpsipred_single || true
+printf 'BLASTDB=%s\n' "${BLASTDB:-}"
+df -h "$PAPER_ROOT"
+```
+
+这里列出的PSIPRED命令是资源定位线索，不表示作者要求使用single模式。下一步需落实可用PSI-BLAST数据库、PSIPRED版本/模型与匹配的SS2生成流程，再接训练入口。TPpred-LE原搜索是3轮、evalue .01、默认6线程；数据库不足不能把所有查询静默替换为BLOSUM。SA-MTP必须为新序列生成H/E/C概率；不能把旧MTP15的SS2套到新编号或把缺结构的全连接图结果当完整方法。查询导出不占用训练GPU。
+
 ## TheraPep 三任务重训练研究（2026-11-04）
 
 五模型已完成原数据首轮训练和 Test。下一步沿用 TheraPep-AI 发布划分，分别训练 `therapep49`、`therapep49_positive`、`therapep48`。各方法保留自己的预处理、特征、损失、训练阶段和原生决策，同时输出一致定义的评价指标。下面依据当前九份 CSV 和已复现的五个提交重新核查，覆盖此前仅做静态估计的判断。

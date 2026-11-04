@@ -11,6 +11,7 @@ from importlib.metadata import version
 
 import numpy as np
 import torch
+from sklearn.metrics import precision_recall_curve
 
 PROJECT = Path(__file__).resolve().parents[2]
 KIT = Path(__file__).resolve().parent
@@ -116,9 +117,78 @@ def train(repo, output, seed):
     print(f"Completed. Results: {result}", flush=True)
 
 
+def exact_f1_thresholds(targets, probabilities):
+    """Fit F1 at distinct Validation scores; choose the highest threshold on ties."""
+    thresholds = np.full(targets.shape[1], 0.5, dtype=float)
+    for c in range(targets.shape[1]):
+        if np.unique(targets[:, c]).size < 2:
+            continue
+        precision, recall, candidates = precision_recall_curve(targets[:, c], probabilities[:, c])
+        denominator = precision[:-1] + recall[:-1]
+        f1 = np.divide(2 * precision[:-1] * recall[:-1], denominator,
+                       out=np.zeros_like(denominator), where=denominator != 0)
+        thresholds[c] = candidates[np.flatnonzero(f1 == f1.max())[-1]]
+    return thresholds
+
+
+def diagnose(output, seed):
+    """Analyze a completed checkpoint without training or replacing native results."""
+    result = output / "training" / f"seed{seed}" / "0" / "textcnn_esm2_mean_prot_t5_mean_optimized"
+    with np.load(result / "val_predictions.npz") as archive:
+        val_y, val_p = archive["targets"], archive["probabilities"]
+        labels = archive["label_names"].tolist()
+        original = archive["thresholds"]
+    # Fit all new decisions before reading Test scores or targets.
+    exact = exact_f1_thresholds(val_y, val_p)
+    with np.load(result / "test_predictions.npz") as archive:
+        test_y, test_p = archive["targets"], archive["probabilities"]
+        if not np.array_equal(archive["thresholds"], original):
+            raise ValueError("Val and Test must use the same original checkpoint thresholds")
+        if archive["label_names"].tolist() != labels:
+            raise ValueError("Val and Test label orders differ")
+    report = {
+        "model": "METFAN", "seed": seed,
+        "task": json.loads((output / "task.json").read_text(encoding="utf-8"))["task"],
+        "checkpoint": "existing best_model.pth; no retraining or checkpoint reselection",
+        "protocol": "Supplementary decision comparison; exact F1 fit on Validation only; "
+                    "highest threshold on ties; single-class columns fixed at 0.5. "
+                    "Keep original native results; do not choose a strategy by Test performance.",
+        "label_names": labels, "strategies": {},
+    }
+    keys = ("micro_f1", "macro_f1", "sample_jaccard", "exact_match", "hamming_loss")
+    for name, thresholds in (("native_val_grid", original),
+                             ("fixed_0.5", np.full(len(labels), 0.5)),
+                             ("val_exact_f1", exact)):
+        entry = {"thresholds": thresholds.tolist()}
+        for split, y, p in (("val", val_y, val_p), ("test", test_y, test_p)):
+            predicted = p >= thresholds
+            entry[split] = {
+                "metrics": evaluate_metrics(y, p, predicted=predicted),
+                "positive_support": y.sum(0).astype(int).tolist(),
+                "predicted_positive_count": predicted.sum(0).astype(int).tolist(),
+                "all_positive_labels": [labels[c] for c in np.flatnonzero(predicted.all(0))],
+                "mean_predicted_labels": float(predicted.sum(1).mean()),
+            }
+            if split == "test":
+                positive = y[:, :48].any(1)
+                entry["positive_function48"] = evaluate_metrics(
+                    y[positive, :48], p[positive, :48], predicted=predicted[positive, :48])
+        report["strategies"][name] = entry
+        print(name, json.dumps({k: round(entry["test"]["metrics"][k], 6) for k in keys}), flush=True)
+    native_counts = report["strategies"]["native_val_grid"]["test"]["predicted_positive_count"]
+    print("Native all-positive or zero-threshold columns (Val/Test support, threshold, predicted Test rows):")
+    for c, label in enumerate(labels):
+        if native_counts[c] == len(test_y) or original[c] == 0:
+            print(f"{label}: {int(val_y[:, c].sum())}/{int(test_y[:, c].sum())}, "
+                  f"native={original[c]:.8g}, exact={exact[c]:.8g}, Test predicted={native_counts[c]}")
+    path = result / "threshold_analysis.json"
+    path.write_text(json.dumps(report, indent=2, allow_nan=False), encoding="utf-8")
+    print(f"Saved: {path}", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("prepare", "features", "train"))
+    parser.add_argument("action", choices=("prepare", "features", "train", "diagnose"))
     parser.add_argument("--task", choices=TRACKS, default="therapep48")
     parser.add_argument("--data-root", type=Path)
     parser.add_argument("--repo", type=Path, default=Path.home() / "paper-repro/METFAN")
@@ -134,6 +204,8 @@ def main():
         prepare(args.task, root, output)
     elif args.action == "features":
         extract(repo, output, args.esm2, args.prott5, args.feature_batch_size)
+    elif args.action == "diagnose":
+        diagnose(output, args.seed)
     else:
         train(repo, output, args.seed)
 
