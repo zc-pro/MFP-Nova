@@ -2,6 +2,76 @@
 
 **2026-11-04，五模型原数据首轮复现已完成，当前研究目标转为 TheraPep 三任务重训练。** 首节给出最新数据核对和适配方案。后面的 V100 章节保留首轮结果与命令，11月2日 TheraPep 分析和编号1–7节为历史判断，涉及可用资产、风险和实施顺序时以最新研究为准。
 
+## SA-MTP-single：不下载搜索数据库的重训练（2026-11-04）
+
+用户因存储成本取消TPpred-LE后，恢复SA-MTP，按低磁盘方案推进。**本入口明确命名SA-MTP-single，是结构特征来源改变的变体，不作为完整原方法结果。** SS2通过已安装PSIPRED4.0的seq2mtx、psipred、psipass2逐序列生成，不下载NR/UniRef90、不用统一结构或全连接图代替真实预测。官方说明单序列结构预测效果较弱，参见[PSIPRED README](https://github.com/psipred/psipred/blob/master/README)。TPpred-LE继续取消。
+
+本地TheraPep48实际统计有55651条不同序列、1017728个残基。完整FP32 ESM2逐残基缓存约4.85GiB，50×50图缓存约0.52GiB；模型、SS2和输出另计。按批补齐到50，不再保存约13.27GiB的补齐特征副本；预留20GiB工作空间为保守估计，不包含已有ESM2权重和运行内存。短试跑也会建立全队列大小的缓存文件，只填入当前子集；完成列表防止未填充区域参与训练。
+
+使用现有structure_inputs导出目录，保持全部Train/Val/Test行及ID。SS2和ESM2均对原始全长序列生成，构图后对超过50的行按作者前25+后25截取。原生seq2mtx要求序列至少5个残基，当前Train/Val/Test分别有1851/228/233条更短序列。因此**仅在单序列SS2预测时两端补X至5，随后裁回真实残基**；ESM2仍输入原序列，不删除短肽。这项必要适配记录在task.json及comparison.json。PSIPRED输出是三个独立sigmoid分数，不强制它们的和恰为1，保留作者图函数的处理。
+
+复用作者TPMLC_single、GAT、FiLM、BCE、FiLM正则1e-4及原生train_epoch。默认batch64、AdamW lr1e-4/weight_decay0，3轮FiLM warm-up后联合训练最多30轮，Val BCE选模、patience15，改进时立即保存权重并在选阈值前恢复。48/49标签Embedding参数化；补接解码器memory padding mask，防止补齐残基参与交叉注意力。原15类F1/MCC/fixed表不套用TheraPep，当前统一采用作者0.05..0.95逐类F1网格，只在Val拟合，单类别Val列固定0.5，另报固定0.5结果。
+
+保留已发布源码的图行为：融合图由固定0.25计算；源码虽注册可学习lambda，但GAT.forward未使用该参数，本入口不将其描述为实际可学习融合。Train的DropEdge0.1在加载时采样一次，Val/Test不丢边；补齐后的无效位置不影响真实图。没有为复现而额外改造这一算法。
+
+### V100准备和真实工具小批运行
+
+使用独立工作区，不更新正在进行iMFP-LG10轮任务的源码。Python复用repro-modern，PSIPRED二进制复用repro-features，不升级训练环境。GPU1仅为之前该实验使用的卡号，可通过GPU_ID修改。
+
+```bash
+export BASE="$HOME/wuzhencheng/projects/MFP-Nova"
+export SA_PROJECT="$HOME/wuzhencheng/projects/MFP-Nova-sa"
+git -C "$BASE" fetch origin main
+git -C "$BASE" worktree add --detach "$SA_PROJECT" origin/main
+export SA_SCRIPT="$SA_PROJECT/scripts/paper_repro/sa_mtp_therapep.py"
+export SA_REPO="$HOME/paper-repro/SA-MTP"
+export SA_PYTHON="$HOME/.conda/envs/repro-modern/bin/python"
+export SA_INPUT="$HOME/paper-repro/therapep_runs/structure_therapep48_20261104_135404"
+export sa_out="$HOME/paper-repro/therapep_runs/sa_mtp_single_therapep48_$(date +%Y%m%d_%H%M%S)"
+
+git -C "$SA_REPO" apply --ignore-space-change "$SA_PROJECT/scripts/paper_repro/sa_mtp_therapep.patch"
+"$SA_PYTHON" "$SA_SCRIPT" prepare --input "$SA_INPUT" --output "$sa_out"
+
+export GPU_ID=1
+export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 PYTHONUNBUFFERED=1 MPLBACKEND=Agg
+CUDA_VISIBLE_DEVICES="$GPU_ID" HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+nohup bash -c '
+  set -e
+  for stage in ss2 features graphs; do
+    "$SA_PYTHON" "$SA_SCRIPT" "$stage" --repo "$SA_REPO" \
+      --output "$sa_out" --limit-per-split 8
+  done
+  "$SA_PYTHON" "$SA_SCRIPT" train --repo "$SA_REPO" --output "$sa_out" \
+    --seed 42 --epochs 1 --warmup-epochs 1 --batch-size 8 --limit-per-split 8
+' >"$sa_out/smoke.log" 2>&1 < /dev/null &
+echo "PID=$! LOG=$sa_out/smoke.log"
+tail -f "$sa_out/smoke.log"
+```
+
+日志应依次出现SS2、ESM2、Graphs进度，1轮warm-up和1轮联合训练，最后Completed。每划分最多8条，仅验证真实工具/编码器/训练链，不报告为正式性能。首次prepare和apply各做一次；后续复用输出目录和已应用补丁。Ctrl+C退出tail不影响nohup任务。
+
+### 全量TheraPep48正式训练
+
+真实工具小批运行正常后，在同一输出目录复用已生成特征，执行下面全量命令。ss2在CPU逐序列运行，ESM2生成和训练在指定GPU先后运行；不启动并发搜索或下载任务。
+
+```bash
+CUDA_VISIBLE_DEVICES="$GPU_ID" HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+nohup bash -c '
+  set -e
+  for stage in ss2 features graphs; do
+    "$SA_PYTHON" "$SA_SCRIPT" "$stage" --repo "$SA_REPO" --output "$sa_out"
+  done
+  "$SA_PYTHON" "$SA_SCRIPT" train --repo "$SA_REPO" --output "$sa_out" \
+    --seed 42 --epochs 30 --warmup-epochs 3 --batch-size 64
+' >"$sa_out/train.log" 2>&1 < /dev/null &
+echo "PID=$! LOG=$sa_out/train.log"
+tail -f "$sa_out/train.log"
+```
+
+正式目录training/seed42_epochs30_limit0，与小批目录seed42_epochs1_limit8独立。输出最佳checkpoint、history.json、Val阈值、带row_id/ID的Val/Test连续分数与二值预测，以及完整Test/正肽48功能/固定0.5的comparison.json。正式任务从随机任务头和相同冻结ESM特征开始，不接着小批权重训练。若换终端，重新export已有SA_SCRIPT、SA_REPO、SA_PYTHON、sa_out等实际路径即可，不重复prepare。
+
+本地用随机残基向量和合成结构分数检查原生48/49输出、padding隔离、BCE/FiLM反向与更新，以及实际原生训练循环的短训练/最佳权重恢复/身份导出。SS2调用的接口检查使用工具替身，不宣称本地验证了原生Linux二进制或真实语言模型特征；上述V100小批命令用于验证这两项实际依赖。
+
 ## TheraPep48 已运行结果与下一步（2026-11-04）
 
 依据本轮V100粘贴日志，以下均为seed42、Test 5566条、48功能的统一指标。iMFP-LG只有1轮试跑，不能作为100轮正式结果。不同方法沿用各自训练和决策设置。

@@ -1,0 +1,20 @@
+--- a/models/tppred.py
++++ b/models/tppred.py
+@@ -171,7 +171,7 @@
+             self.esm2_projection = None
+ 
+         self.input_embedding = nn.Embedding(20, d_model)
+-        self.label_embedding = nn.Embedding(15, d_model)
++        self.label_embedding = nn.Embedding(out_dim, d_model)
+ 
+         self.position_encoding = PositionalEncoding(d_model)
+ 
+@@ -262,6 +262,7 @@
+         atts_cross = []
+         y = self.label_embedding(labels)
+         for i, decoder in enumerate(self.decoder_layers):
+-            y, att_tgt, att_cross = decoder(y, x, tgt_mask=att_mask)
++            y, att_tgt, att_cross = decoder(
++                y, x, tgt_mask=att_mask, memory_key_padding_mask=key_mask)
+             atts_tgt.append(att_tgt)
+             atts_cross.append(att_cross)
