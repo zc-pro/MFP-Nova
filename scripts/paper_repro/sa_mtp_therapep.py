@@ -175,8 +175,22 @@ def positions(length):
     return np.r_[np.arange(25), np.arange(length - 25, length)]
 
 
-def graphs(output, limit):
+def padded_graph(output, name, sequence, embedding):
     from utils.graph_builder import build_dynamic_adjacency_matrix
+    ss2_path = output / "ss2" / f"{name}.ss2"
+    read_ss2(ss2_path, sequence)
+    graph = build_dynamic_adjacency_matrix(ss2_path, embedding, beta=4.0,
+                                           lambda_weight=0.25, top_k=None, training=False)
+    # Check the full graph before truncation: NaNs can change its top-k topology.
+    if not np.isfinite(graph).all():
+        raise ValueError(f"Non-finite graph for {name}; apply sa_mtp_js.patch and repair the cache")
+    keep = positions(len(sequence))
+    padded = np.zeros((50, 50), dtype=np.float32)
+    padded[:len(keep), :len(keep)] = graph[np.ix_(keep, keep)]
+    return padded
+
+
+def graphs(output, limit):
     info = load_info(output)
     records, offsets, index = feature_layout(info)
     folder = output / "features"
@@ -195,20 +209,40 @@ def graphs(output, limit):
         for n, (name, sequence) in enumerate(selected, 1):
             if name not in encoded:
                 raise ValueError(f"ESM2 features have not been generated for {name}")
-            ss2_path = output / "ss2" / f"{name}.ss2"
-            read_ss2(ss2_path, sequence)
             i = index[name]
             embedding = np.asarray(embeddings[offsets[i]:offsets[i+1]])
-            graph = build_dynamic_adjacency_matrix(ss2_path, embedding, beta=4.0,
-                                                   lambda_weight=0.25, top_k=None, training=False)
-            keep = positions(len(sequence))
-            cache[i] = 0
-            cache[i, :len(keep), :len(keep)] = graph[np.ix_(keep, keep)]
+            cache[i] = padded_graph(output, name, sequence, embedding)
             cache.flush()
             stream.write(name + "\n")
             stream.flush()
             if n % 1000 == 0 or n == len(selected):
                 print(f"Graphs newly built {n}/{len(selected)}", flush=True)
+
+
+def repair_graphs(output):
+    """One-time repair of completed legacy graphs; keep SS2, ESM2 and finite short graphs."""
+    info = load_info(output)
+    records, offsets, index = feature_layout(info)
+    folder = output / "features"
+    embeddings = np.load(folder / "esm2.npy", mmap_mode="r")
+    cache = np.load(folder / "graphs.npy", mmap_mode="r+")
+    ready = set((folder / "graphs_completed.txt").read_text().splitlines())
+    repaired = []
+    for name, sequence in records:
+        if name not in ready:
+            continue
+        i = index[name]
+        # For a truncated graph, invalid edges outside the retained residues might
+        # have displaced valid top-k edges. Rebuild these few long sequences too.
+        if not np.isfinite(cache[i]).all() or len(sequence) > 50:
+            embedding = np.asarray(embeddings[offsets[i]:offsets[i+1]])
+            cache[i] = padded_graph(output, name, sequence, embedding)
+            repaired.append(name)
+            print(f"Repaired graph {name}; length={len(sequence)}", flush=True)
+    cache.flush()
+    print(f"Graph repair complete: checked={len(ready)}, rebuilt={len(repaired)}; "
+          "SS2 and ESM2 retained. Run graphs next to finish any missing entries.", flush=True)
+    return repaired
 
 
 class Peptides(Dataset):
@@ -234,6 +268,8 @@ class Peptides(Dataset):
         for name, _ in self.records:
             if name not in ready:
                 raise ValueError(f"Features/SS2/graph have not been completed for {name}")
+            if not np.isfinite(self.graphs[self.index[name]]).all():
+                raise ValueError(f"Non-finite cached graph for {name}; run repair-graphs before training")
         self.train_graphs = None
         if split == "train":
             # The released loader samples DropEdge once when loading Train, not every epoch.
@@ -272,19 +308,21 @@ def predict(model, loader):
                            for x, _, mask, tokens, graph in loader])
 
 
-def train(output, repo, seed, epochs, warmup, batch_size, limit):
+def train(output, repo, seed, epochs, warmup, batch_size, limit, run_name=None):
     from models.tppred import TPMLC_single
     from run_network import Model
     from utils.threshold_optimizer import find_optimal_threshold
     subprocess.run(["git", "apply", "--reverse", "--check", "--ignore-space-change",
                     str(KIT / "sa_mtp_therapep.patch")], cwd=repo, check=True)
+    subprocess.run(["git", "apply", "--reverse", "--check", "--ignore-space-change",
+                    str(KIT / "sa_mtp_js.patch")], cwd=repo, check=True)
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     info = load_info(output)
-    result = output / "training" / f"seed{seed}_epochs{epochs}_limit{limit}"
+    result = output / "training" / (run_name or f"seed{seed}_epochs{epochs}_limit{limit}")
     result.mkdir(parents=True, exist_ok=False)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     datasets, batches = loaders(output, batch_size, limit, device)
@@ -304,6 +342,7 @@ def train(output, repo, seed, epochs, warmup, batch_size, limit):
                 "short_sequence_policy": info["short_sequence_policy"],
                 "graph_note": "Released graph construction with fixed fusion 0.25; registered lambda "
                               "is unused by the released GAT forward. Train DropEdge sampled once.",
+                "graph_js": "float64 base-2 JS divergence via rel_entr; clamp negative roundoff before exp",
                 "threshold_protocol": "Val-only per-class F1 on 0.05..0.95 grid; single-class Val columns "
                                       "fixed at 0.5; fixed-0.5 results also reported"}
     print(json.dumps(settings, indent=2), flush=True)
@@ -376,7 +415,7 @@ def train(output, repo, seed, epochs, warmup, batch_size, limit):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("prepare", "ss2", "features", "graphs", "train"))
+    parser.add_argument("action", choices=("prepare", "ss2", "features", "graphs", "repair-graphs", "train"))
     parser.add_argument("--input", type=Path, help="Existing structure_inputs.py output directory")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--repo", type=Path, default=Path.home() / "paper-repro/SA-MTP")
@@ -388,6 +427,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--warmup-epochs", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--run-name", help="Training experiment name; existing output is never overwritten")
     args = parser.parse_args()
     if min(args.epochs, args.batch_size, args.feature_batch_size) < 1 or min(args.warmup_epochs, args.limit_per_split) < 0:
         parser.error("epochs/batch sizes must be positive; warmup/limit must be nonnegative")
@@ -403,8 +443,11 @@ def main():
         features(output, args.esm2.resolve(), args.feature_batch_size, args.limit_per_split)
     elif args.action == "graphs":
         graphs(output, args.limit_per_split)
+    elif args.action == "repair-graphs":
+        repair_graphs(output)
     else:
-        train(output, repo, args.seed, args.epochs, args.warmup_epochs, args.batch_size, args.limit_per_split)
+        train(output, repo, args.seed, args.epochs, args.warmup_epochs, args.batch_size,
+              args.limit_per_split, args.run_name)
 
 
 if __name__ == "__main__":

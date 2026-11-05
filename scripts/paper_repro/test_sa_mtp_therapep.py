@@ -108,6 +108,44 @@ def test_single_sequence_short_peptide_is_padded_then_cropped(tmp_path, monkeypa
     assert len(padded_queries) == 3
 
 
+def test_stable_js_matches_reference_and_handles_near_equal_distributions(native_repo):
+    from scipy.spatial.distance import jensenshannon
+    from utils.graph_builder import compute_js_divergence_matrix
+    scores = np.array([[0.7, 0.2, 0.2], [0.1, 0.8, 0.2], [0.05, 0.15, 0.9]])
+    expected = np.array([[np.exp(-4 * jensenshannon(p, q, base=2)**2)
+                          for q in scores] for p in scores])
+    actual = compute_js_divergence_matrix(scores, beta=4)
+    np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-14)
+    # Three proportional, rounded SS2 score vectors plus a vector with zero components.
+    edge = np.array([[0.001, 0.009, 0.007], [0.003, 0.027, 0.021],
+                     [0.007, 0.063, 0.049], [0, 0, 1]])
+    stable = compute_js_divergence_matrix(edge, beta=4)
+    assert np.isfinite(stable).all()
+    np.testing.assert_allclose(stable[:3, :3], 1, atol=1e-14)
+    np.testing.assert_array_equal(stable, stable.T)
+    np.testing.assert_array_equal(np.diag(stable), 1)
+
+
+def test_repair_changes_bad_graph_only_and_preserves_completion(native_repo, tmp_path):
+    output = tmp_path / "run"
+    cached_fixture(tmp_path / "input", output, 48)
+    path = output / "features/graphs.npy"
+    before = np.load(path)
+    corrupt = before.copy()
+    corrupt[0, 0, 1] = np.nan
+    np.save(path, corrupt)
+    with pytest.raises(ValueError, match="Non-finite cached graph"):
+        sa.Peptides(output, "val")
+    repaired = sa.repair_graphs(output)
+    assert repaired == ["pep0", "pep2"]  # invalid graph plus the 74-residue query
+    after = np.load(path)
+    assert np.isfinite(after).all()
+    np.testing.assert_array_equal(after[1], before[1])
+    np.testing.assert_allclose(after, before)
+    assert (output / "features/graphs_completed.txt").read_text().splitlines() == ["pep0", "pep1", "pep2"]
+    assert len(sa.Peptides(output, "val")) == 4
+
+
 @pytest.mark.parametrize("labels", [48, 49])
 def test_native_model_update_and_padding_mask(native_repo, tmp_path, labels):
     from models.tppred import TPMLC_single

@@ -1,0 +1,54 @@
+--- a/utils/graph_builder.py
++++ b/utils/graph_builder.py
+@@ -5,7 +5,7 @@
+ import numpy as np
+ import torch
+ import os
+-from scipy.spatial.distance import jensenshannon
++from scipy.special import rel_entr
+ from scipy.stats import entropy
+ 
+ 
+@@ -67,31 +67,17 @@
+ 
+ 
+ def compute_js_divergence_matrix(ss_probs, beta=4.0):
+-    """
+-    计算残基对之间的JS散度并转换为相似度矩阵
+-    M_ss[i,j] = exp(-β * D_JS(S_i, S_j))
+-    
+-    Args:
+-        ss_probs: shape (L, 3), 二级结构预测概率
+-        beta: 指数核参数，默认4.0
+-    
+-    Returns:
+-        similarity_matrix: shape (L, L), 结构相似度矩阵
+-    """
+-    L = ss_probs.shape[0]
+-    similarity_matrix = np.zeros((L, L))
+-    
+-    for i in range(L):
+-        for j in range(L):
+-            if i == j:
+-                similarity_matrix[i, j] = 1.0
+-            else:
+-                # 计算JS散度
+-                js_div = jensenshannon(ss_probs[i], ss_probs[j], base=2) ** 2
+-                # 转换为相似度
+-                similarity_matrix[i, j] = np.exp(-beta * js_div)
+-    
+-    return similarity_matrix
++    """Same base-2 JS kernel, without a roundoff-sensitive sqrt then square."""
++    probabilities = np.asarray(ss_probs, dtype=np.float64)
++    probabilities = probabilities / probabilities.sum(axis=1, keepdims=True)
++    p = probabilities[:, None, :]
++    q = probabilities[None, :, :]
++    midpoint = (p + q) / 2.0
++    divergence = (rel_entr(p, midpoint).sum(axis=-1)
++                  + rel_entr(q, midpoint).sum(axis=-1)) / (2.0 * np.log(2.0))
++    # A valid JS divergence is nonnegative; cancellation can leave tiny negatives.
++    np.maximum(divergence, 0.0, out=divergence)
++    return np.exp(-beta * divergence)
+ 
+ 
+ def weight_by_confidence(similarity_matrix, confidence):

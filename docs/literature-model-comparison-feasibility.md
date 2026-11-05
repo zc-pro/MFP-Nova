@@ -14,6 +14,44 @@
 
 保留已发布源码的图行为：融合图由固定0.25计算；源码虽注册可学习lambda，但GAT.forward未使用该参数，本入口不将其描述为实际可学习融合。Train的DropEdge0.1在加载时采样一次，Val/Test不丢边；补齐后的无效位置不影响真实图。没有为复现而额外改造这一算法。
 
+### 11月5日：JS数值警告修复与缓存续跑
+
+V100当前已完成全部55651条SS2和ESM2，图缓存完成计数44027。构图出现SciPy的`invalid value encountered in sqrt`，与其已记录的近似相同分布产生微小负JS值的问题一致，参见[SciPy问题20083](https://github.com/scipy/scipy/issues/20083)。不能把该警告当作无影响：NaN可能进入稀疏图；原GAT使用`adj > 0`，NaN会使边被静默屏蔽，不一定表现为训练loss为NaN。
+
+新增sa_mtp_js.patch：直接用float64的rel_entr计算base-2 JS散度，负舍入误差截为0，再计算原exp(-4*JS)核，避免先sqrt再平方；融合、置信度、top-k和DropEdge保持原规则。新的图在完整长度上检查有限值，缓存读取时拒绝非有限图。repair-graphs动作只扫描已标记完成的图，重建含非有限值的图；另重建超过50残基的查询，覆盖截断前坏边可能改变top-k的问题。其余正常图及全部SS2、ESM2保留，不重新生成。缺失的图由普通graphs动作继续处理，不把NaN直接填成0。
+
+先结束本次SA-MTP后台队列及其子进程，再更新已停止的SA工作区。不要对其他用户的任务执行终止操作。若已在坏图上开始正式训练，修复后从随机任务参数重新训练，使用新实验名保留旧输出，不接着旧checkpoint训练。
+
+```bash
+export BASE="$HOME/wuzhencheng/projects/MFP-Nova"
+export SA_PROJECT="$HOME/wuzhencheng/projects/MFP-Nova-sa"
+export SA_REPO="$HOME/paper-repro/SA-MTP"
+export SA_SCRIPT="$SA_PROJECT/scripts/paper_repro/sa_mtp_therapep.py"
+export SA_PYTHON="$HOME/.conda/envs/repro-modern/bin/python"
+export sa_out="$HOME/paper-repro/therapep_runs/sa_mtp_single_therapep48_20261104_160627"
+
+git -C "$BASE" fetch origin main
+git -C "$SA_PROJECT" checkout --detach origin/main
+# 原标签/padding补丁已应用，只补这次数值修复。
+git -C "$SA_REPO" apply --ignore-space-change "$SA_PROJECT/scripts/paper_repro/sa_mtp_js.patch"
+
+export GPU_ID=1
+export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 PYTHONUNBUFFERED=1 MPLBACKEND=Agg
+CUDA_VISIBLE_DEVICES="$GPU_ID" HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+nohup bash -c '
+  set -e
+  "$SA_PYTHON" "$SA_SCRIPT" repair-graphs --repo "$SA_REPO" --output "$sa_out"
+  "$SA_PYTHON" "$SA_SCRIPT" graphs --repo "$SA_REPO" --output "$sa_out"
+  "$SA_PYTHON" "$SA_SCRIPT" train --repo "$SA_REPO" --output "$sa_out" \
+    --seed 42 --epochs 30 --warmup-epochs 3 --batch-size 64 \
+    --run-name seed42_epochs30_jsstable
+' >"$sa_out/resume_js.log" 2>&1 < /dev/null &
+echo "PID=$! LOG=$sa_out/resume_js.log"
+tail -f "$sa_out/resume_js.log"
+```
+
+日志会先给出实际修复数量，再完成余图并训练。正式结果目录为training/seed42_epochs30_jsstable。新训练结果记录graph_js和实际代码提交；原8条小批结果不能视为正式性能。后续新任务需同时应用标签/padding补丁和数值补丁。
+
 ### V100准备和真实工具小批运行
 
 使用独立工作区，不更新正在进行iMFP-LG10轮任务的源码。Python复用repro-modern，PSIPRED二进制复用repro-features，不升级训练环境。GPU1仅为之前该实验使用的卡号，可通过GPU_ID修改。
@@ -30,6 +68,7 @@ export SA_INPUT="$HOME/paper-repro/therapep_runs/structure_therapep48_20261104_1
 export sa_out="$HOME/paper-repro/therapep_runs/sa_mtp_single_therapep48_$(date +%Y%m%d_%H%M%S)"
 
 git -C "$SA_REPO" apply --ignore-space-change "$SA_PROJECT/scripts/paper_repro/sa_mtp_therapep.patch"
+git -C "$SA_REPO" apply --ignore-space-change "$SA_PROJECT/scripts/paper_repro/sa_mtp_js.patch"
 "$SA_PYTHON" "$SA_SCRIPT" prepare --input "$SA_INPUT" --output "$sa_out"
 
 export GPU_ID=1
