@@ -127,6 +127,8 @@ echo "therapep48 PID=$!"
 
 每个队列顺序执行traditional5和micro_f1两次独立训练，SSH断开后继续；GPU号按实际分配替换，映射后内部统一cuda:0。`tail -n 30 -f "$RUN_ROOT/therapep49.log"` 查看进度，Ctrl+C只退出日志查看。后台任务可用 `touch "$RUN_ROOT/therapep49/PAUSE"` 请求本轮结束后暂停；退出后 `rm "$RUN_ROOT/therapep49/PAUSE"`，重复该任务的nohup命令恢复。另两任务替换对应任务名，不能在进程尚未退出时启动同目录的另一个实例。仅运行一种协议时先 `export SUITES=micro_f1` 或 `export SUITES=traditional5`，评价和打包沿用同一SUITES。
 
+CUDA训练用多个DataLoader worker时启用页锁定内存与异步输入复制；验证标签保存独立数组，避免长验证集持有worker共享张量的文件描述符（Linux `received 0 items of ancdata`）。已有V100训练可在完整epoch暂停、同步后，用同一目录和 `NUM_WORKERS=2` 恢复；worker数是执行参数，不改变checkpoint中的batch、精度或选模协议。每轮 `Timing` 的 `Train` 包含 `DataWait`（主进程取下一批的等待），`Val` 包含在线/EMA验证和分组指标；用相同R-Drop阶段的轮次比较速度。
+
 所有训练完成后，共用Test缓存仅准备一次，再分GPU评价并合并结果。打包逻辑由两平台共用的 [pack_helixset_therapep.py](scripts/pack_helixset_therapep.py) 实现，不包含权重/缓存。
 
 ```bash

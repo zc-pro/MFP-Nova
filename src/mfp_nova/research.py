@@ -43,7 +43,8 @@ def make_model(name, arguments):
 
 
 def to_device(batch, device):
-    return {key: value.to(device) for key, value in batch.items()}
+    non_blocking = torch.device(device).type == "cuda"
+    return {key: value.to(device, non_blocking=non_blocking) for key, value in batch.items()}
 
 
 def autocast_context(device, precision="fp32"):
@@ -71,7 +72,8 @@ def predict_loader(model, loader, device, precision="fp32", loss_settings=None):
                                            loss_settings.get("unlabeled_weight", .3))
                 loss_total += float(loss)*len(batch["y"])
                 rows += len(batch["y"])
-        targets.append(batch["y"].numpy())
+        # A NumPy view keeps the worker's shared tensor (and its FD) alive.
+        targets.append(batch["y"].numpy().copy())
         probabilities.append(output["logits"].float().sigmoid().cpu().numpy())
     result = np.concatenate(targets), np.concatenate(probabilities)
     return (*result, loss_total/rows) if loss_settings is not None else result
@@ -371,9 +373,12 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     if datasets[0].meta["dataset"] != source.statistics["dataset"]:
         raise ValueError("Cache dataset version differs from multimodal data")
     generator = torch.Generator().manual_seed(settings["seed"])
-    loaders = [DataLoader(data, batch_size=settings["batch_size"], shuffle=shuffle, num_workers=settings["num_workers"],
-                          collate_fn=collate_multimodal, generator=generator if shuffle else None)
+    num_workers = settings["num_workers"]
+    pin_memory = device.type == "cuda" and num_workers > 0
+    loaders = [DataLoader(data, batch_size=settings["batch_size"], shuffle=shuffle, num_workers=num_workers,
+                          pin_memory=pin_memory, collate_fn=collate_multimodal, generator=generator if shuffle else None)
                for data, shuffle in zip(datasets, (True, False))]
+    print(f"DataLoader | workers={num_workers} pin_memory={pin_memory}", flush=True)
     args = {"input_dim": datasets[0].meta["input_dim"], "num_labels": len(source.data.labels),
             "vocab_size": len(source.statistics["chemical_vocab"])+2,
             "statistics": source.statistics["labels"], **config["model"]}
@@ -540,7 +545,10 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         online_targets, online_probabilities = [], []
         loss_settings = epoch_loss_settings(config, epoch)
         optimizer.zero_grad(set_to_none=True)
+        data_wait_seconds = 0.
+        batch_done = time.perf_counter()
         for batch_index, batch in enumerate(loaders[0]):
+            data_wait_seconds += time.perf_counter() - batch_done
             batch = to_device(batch, device)
             teacher_logits = None
             if loss_settings.get("consistency", 0) > 0 and int(ema.n_averaged) > 0:
@@ -597,8 +605,11 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
             count += n
             if settings.get("max_steps") and global_step>=settings["max_steps"]:
                 break
+            batch_done = time.perf_counter()
+        train_seconds = time.perf_counter() - epoch_start
         train_report = metrics(np.concatenate(online_targets), np.concatenate(online_probabilities), source.statistics)
         del online_targets, online_probabilities
+        validation_start = time.perf_counter()
         y, probabilities, validation_loss = predict_loader(model, loaders[1], device, precision, config["loss"])
         report = metrics(y, probabilities, source.statistics)
         selected_model, validation_weights = model, "online"
@@ -619,6 +630,7 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
                 report = metrics(y, probabilities, source.statistics)
         groups = evaluate_groups(y, probabilities, validation_groups, .5, source.statistics["labels"]["support"],
                                  source.statistics["function_projection"])
+        validation_seconds = time.perf_counter() - validation_start
         if report["macro_ap"] is None:
             raise ValueError("No positive Validation labels for checkpoint selection")
         key, selection_threshold, selection_report = (
@@ -689,7 +701,8 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         numpy_rng = np.random.get_state()
         candidate_checkpoint = ({"alternate_best": alternate_best, "selection_tracking_start_epoch": candidate_start}
                                 if save_candidates else {})
-        history.update(seconds=time.perf_counter()-epoch_start, elapsed_seconds=elapsed_before+time.perf_counter()-started)
+        history.update(seconds=time.perf_counter()-epoch_start, elapsed_seconds=elapsed_before+time.perf_counter()-started,
+                       train_seconds=train_seconds, data_wait_seconds=data_wait_seconds, validation_seconds=validation_seconds)
         save_last_checkpoint({**static, **ema_checkpoint, **candidate_checkpoint, "history_record": history,
                     "best_weights": best_weights, "model_state": checkpoint_state(model), "optimizer_state": optimizer.state_dict(),
                     "scheduler_state": scheduler.state_dict(), "best_model_state": best_state,
@@ -704,6 +717,7 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         with (run/"history.jsonl").open("a", encoding="utf-8") as f:
             f.write(json.dumps(history, allow_nan=False)+"\n")
         print(format_epoch(config["model_name"], source.data.track, settings["seed"], settings["epochs"], history, settings["patience"]), flush=True)
+        print(f"Timing | Train={train_seconds:.1f}s DataWait={data_wait_seconds:.1f}s Val={validation_seconds:.1f}s", flush=True)
         if "metric_suite" in settings:
             print(f"Selection | suite={suite} key={key} best={best_key}@{best_epoch} "
                   f"threshold={selection_threshold} | {format_primary(suite, selection_report)}", flush=True)
