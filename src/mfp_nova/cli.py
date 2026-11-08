@@ -48,6 +48,10 @@ def main(argv=None):
             sub.add_argument("--resume", help="last.pt with optimizer and RNG state; creates a new run")
             sub.add_argument("--stage", choices=("A", "B", "C"), help="PrivilegedBridge training phase")
             sub.add_argument("--initialize-from", help="Selected preceding PrivilegedBridge phase checkpoint")
+            sub.add_argument("--termiscale-routing", choices=("content", "position", "uniform"),
+                             help="TermiScale: content+position, position-only, or equal scale weights")
+            sub.add_argument("--termiscale-pooling", choices=("conditional", "fixed", "uniform"),
+                             help="TermiScale: conditional endpoints, learned label-only endpoints, or uniform LME")
             sub.add_argument("--resume-in-place", action="store_true", help="Research models: append to the same interrupted run")
             sub.add_argument("--stop-file", help="Research models: pause after a complete epoch when this file exists")
             sub.add_argument("--ablate", nargs="*", help="Model switches to disable, e.g. feedback high_order")
@@ -149,6 +153,13 @@ def main(argv=None):
         config_path = args.config or f"configs/{model_name}.yaml"
         config = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
         if args.command == "train":
+            if args.termiscale_routing is not None or args.termiscale_pooling is not None:
+                if args.model != "termiscale":
+                    raise ValueError("TermiScale routing/pooling options require --model termiscale")
+                for key in ("routing", "pooling"):
+                    value = getattr(args, "termiscale_"+key)
+                    if value is not None:
+                        config["model"][key] = value
             if args.stage is not None or args.initialize_from is not None:
                 if args.model != "privilegedbridge":
                     raise ValueError("stage/initialize-from are PrivilegedBridge options")

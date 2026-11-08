@@ -1427,3 +1427,17 @@ TheraSet major15可训练参数较HelixSet减少85.53%，实测每轮约快6.16�
 弱项包括fine39 antiinflammatory：Val40个正例只召回1个，AP2.14%、F1 3.03%；growth_regulatory召回7/36，thrombolytic__unknown召回7/37。独立多功能检测仍漏掉major15的885/2,118和fine39的908/2,108；真正同时恢复至少两个已标注独立功能的比例仅47.69%/46.54%。0为未标注，统计中的FP不是经实验确认的无活性。
 
 结论：这两次是有效的完整seed42 Train/Val结果，支持TheraSet作为较低成本候选继续比较；尚不能证明对TheraPep适配CNN的净增益，也不能确认各创新模块有效或跨seed稳定。下一步先补CNN对照及有针对性的消融，再做统一多Seed和一次独立Test评价。分析数据与图保存在`runs/analysis/theraset_seed42_20261028/`，不提交运行输出。
+
+### 2026-11-08：TermiScale fine39 / seed42 V100首轮正式训练日志
+
+来源为用户回传终端日志，运行名termiscale_fine39_seed42_v100_20261108_201826。尚未取得本次results.json、metadata.json、概率或checkpoint，以下不是独立重载复算结果。单650M缓存、AA34、FP32、batch64×累积1、workers2、OMP/MKL6、物理GPU1；无Test结果。
+
+日志覆盖epoch1–45。第30轮后15轮选模目标未改进，第45轮达到正常早停条件；完成落盘仍以results.json为准。主选模traditional5/global，EMA；第30轮阈值0.62：Val样本Jaccard50.556%、完全匹配34.881%、样本Prec54.22%、Cov62.48%、Hamming3.62%，该候选Macro-AP约45.44%。这些是Selection阈值下的结果；Val行固定0.5的监控值不混入。第21轮可见候选Macro-AP约46.34%，AP备选最终以best_ap记录确认，不把它拼到第30轮主候选上。
+
+收敛：Val主ASL在第13轮约0.0211最低，随后升至第45轮0.0384；Train总loss持续降至0.0028，后期出现明显过拟合。Train为随机在线权重、Val多为EMA，二者并非同一确定模型的精确训练/验证差；但loss与排序/选模走势共同支持泛化停滞。第6轮R-Drop从0.02启动，第10轮达0.1；EMA每轮增加617次，至第45轮24,680次，与617更新/轮一致。
+
+资源：第6–45轮epoch Time中位40.45秒、Train22.75秒、Val11.2秒、DataWait0.3秒；后三者中位数不能直接相加解释同一轮全部时间。第30–45轮epoch中位38.55秒；日志累计约31分钟，完整R-Drop/EMA峰值allocated约0.77GiB。不是整卡显存或包括全部启动/收尾成本的端到端计时。
+
+性能参照：既有V100 fine39/traditional5 TheraSet纯AA34 CNN为Jaccard57.01%、AT44.54%、Macro-AP51.38%；完整TheraSet为58.72%/47.12%/54.97%。本次主候选分别落后纯CNN约6.45/9.66/5.94个百分点；两者架构、输入与初始化轨迹不完全相同，不当作单个模块的净效应。当前可以确认低开销，尚不支持性能超越。
+
+后续先取得完整训练产物确认选模/数据范围，并按原协议完成MotifSpan。TermiScale优先比较均匀LME、固定端点混合、静态尺度等必要消融及同输入强CNN，定位端点/路由归纳偏置；不因单次落后直接扩容、增大有效batch或改Test选模。不把这份日志当成已有五seed或独立Test结论。

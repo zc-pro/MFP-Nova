@@ -32,7 +32,7 @@
 
 ## 新三模型：实现状态与运行
 
-2026-11-08：三模型主配置已接入训练、恢复、评价和推理。验证包括CPU PyTorch2.4.1模型/梯度检查、短训练、PB阶段衔接/恢复/精简导出，以及真实fine39缓存、rich48样本的前后向；没有新模型的正式GPU性能成绩。主配置单650M+AA34，D/修饰扩展关闭；150M-F单路和双路支持输入维数接口。OT、结构摘要、共享隐桥和49维背景配对共同选模仍属于后续实验。
+2026-11-08：三模型主配置已接入训练、恢复、评价和推理。验证包括CPU PyTorch2.4.1模型/梯度检查、短训练、PB阶段衔接/恢复/精简导出，以及真实fine39缓存、rich48样本的前后向；V100三模型GPU检查通过，PB限A阶段。TermiScale首轮fine39/seed42日志显示Val Jaccard50.556%、第45轮达到早停条件，存在明显过拟合，尚未取得原始结果文件，也没有独立Test结果，详见[实验记录](docs/experiment-history.md)。主配置单650M+AA34，D/修饰扩展关闭；150M-F单路和双路支持输入维数接口。OT、结构摘要、共享隐桥和49维背景配对共同选模仍属于后续实验。
 
 fine39单650M主规格的下游参数：TermiScale 1,703,808；MotifSpan 1,466,811；PB A基座1,449,383，B可训练Teacher413,314，C可训练Student+桥1,548,201。rich48的PB部署部分为1,551,666。编码器冻结参数与提缓存成本另计。
 
@@ -78,6 +78,43 @@ echo "PID=$!; log=runs/new_models_fine39_s42.log"
 ```
 
 这些是正式训练命令。短诊断在相同平台命令追加limit-samples、max-steps或epochs，并在只有2–3轮时显式将ema-start-epoch、rdrop-start-epoch、rdrop-ramp-epochs设为1，以覆盖正式双视图路径；诊断结果不用于性能比较。PB阶段内恢复省去initialize-from，保留stage并使用该阶段last.pt；需要原目录续训时同时指定resume-in-place和原name。主配置的fixed/conditional读取、固定分段/空间关系、Teacher类型与KD类型可通过各普通YAML中的明确开关做对照，不需要新模型副本。
+
+### 首轮结果后的四组后续实验
+
+使用 [run_candidate_followup.py](scripts/run_candidate_followup.py) 在单卡依次执行下面四组Train/Val，不重跑已有TermiScale主实验。统一fine39、seed42、单650M+AA34、FP32、64×1、AdamW 2e-4、100轮上限/耐心15、相同R-Drop/EMA及traditional5/global选模；三个TermiScale对照分别只改变表中一项。
+
+| 顺序 / job | 实验 | 检验的问题 |
+|---|---|---|
+| 1 / motifspan | MotifSpan主配置 | 有序区域及关系压缩能否改善泛化 |
+| 2 / uniform_pool | TermiScale pooling=uniform | 均匀LME与端点测度的差异 |
+| 3 / no_condition | TermiScale pooling=fixed | 样本条件混合是否必要；fixed仍学习每标签的端点混合 |
+| 4 / uniform_scales | TermiScale routing=uniform | 固定等权三尺度与动态路由的差异 |
+
+三个TermiScale对照都保留位置输入；uniform_pool不是完全移除端点信息，uniform_scales仍计算三种卷积。比较主候选及其自身AP备选，避免将不同epoch指标拼成同一个结果。先看统一Val结果，再决定是否调整正则化或扩展多Seed。
+
+RTX5070 / PowerShell（项目根目录，前台）：
+
+```powershell
+conda activate MFP-Nova
+python scripts/run_candidate_followup.py --task fine39 --seed 42 --device cuda:0 --num-workers 0 --cpu-threads 6
+```
+
+V100 / Bash（项目根目录，后台；物理GPU1映射到逻辑cuda:0）：
+
+```bash
+conda activate MFP-Nova
+GPU=1
+CPU_THREADS=6
+stamp=$(date +%Y%m%d_%H%M%S)
+mkdir -p runs
+nohup env CUDA_VISIBLE_DEVICES="$GPU" \
+  python scripts/run_candidate_followup.py --task fine39 --seed 42 \
+  --device cuda:0 --num-workers 2 --cpu-threads "$CPU_THREADS" \
+  > "runs/candidate_followup_fine39_$stamp.log" 2>&1 < /dev/null &
+echo "PID=$!; log=runs/candidate_followup_fine39_$stamp.log"
+```
+
+父日志显示执行进度，逐epoch日志见 `runs/motifspan_fine39_seed42_motifspan_followup.log` 及 `runs/termiscale_fine39_seed42_{uniform_pool,no_condition,uniform_scales}_followup.log`。只运行第一组可追加 `--jobs motifspan`。相同命令再次执行会跳过本脚本命名目录中已有results.json的实验，从中断实验的last.pt原地续训；不要同时启动两份相同任务/seed的队列。手动续训TermiScale对照时也须保留对应routing/pooling开关，防止恢复成另一实验。
 
 ## 项目结构
 

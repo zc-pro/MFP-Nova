@@ -39,6 +39,17 @@ def test_default_sweep_not_expanded():
     assert set(experiments.SUPPORTED_MODELS)-set(experiments.MODELS) == {"termiscale", "motifspan", "privilegedbridge"}
 
 
+def test_termiscale_controls_are_explicit_and_model_specific(monkeypatch):
+    calls = []
+    monkeypatch.setattr(research, "train", lambda config, run, **kwargs: calls.append(config))
+    cli.main(["train", "--model", "termiscale", "--termiscale-routing", "uniform",
+              "--termiscale-pooling", "fixed"])
+    assert calls[0]["model"]["routing"] == "uniform"
+    assert calls[0]["model"]["pooling"] == "fixed"
+    with pytest.raises(ValueError, match="require --model termiscale"):
+        cli.main(["train", "--model", "motifspan", "--termiscale-pooling", "uniform"])
+
+
 @pytest.mark.parametrize("name", ["termiscale", "motifspan", "privilegedbridge"])
 def test_runtime_input_check_accepts_minimal_sequence_batch(name):
     import torch

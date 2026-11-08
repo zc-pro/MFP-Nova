@@ -41,6 +41,11 @@ def test_training_resume_and_evaluate(tmp_path, name):
     np.savez(tmp_path/"inputs.npz", **{k: v.numpy() for k, v in batch.items() if k != "y"})
     predictions = research.predict_inputs(tmp_path/"first/best.pt", tmp_path/"inputs.npz")
     assert len(predictions) == 2 and predictions[0]["evidence_scope"] == "sequence_only"
+    if name == "termiscale":
+        different = copy.deepcopy(c)
+        different["model"]["pooling"] = "uniform"
+        with pytest.raises(ValueError, match="pooling differs"):
+            research.train(different, "wrong_control", resume=tmp_path/"first/last.pt")
     c["train"]["epochs"] = 2
     continued = research.train(c, "continued", resume=tmp_path/"first/last.pt")
     assert continued["epochs_completed"] == 2

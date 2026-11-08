@@ -1021,3 +1021,23 @@ rich48的48列含作者别名/层级，不把预测标签数量自动当作独�
 4. 输入及训练配方完全一致时，rich48纯序列结果就是同作者成员的48维序列实验，可用于therapep48比较；不重复提缓存、重训或将一次结果算两份独立证据。
 
 资源排期以第9.8节为准：9个主结果seed42约18–49单GPU小时的情景预算，跑满上限约40–110小时；消融、baseline与缓存成本另算。实现后先用真实完整epoch替换估算，再承诺日历日程，不把这些预算当作已实测训练时长。
+
+### 9.10 V100首轮GPU检查结果（2026-11-08，用户回传）
+
+用户在物理GPU1、CUDA_VISIBLE_DEVICES=1、逻辑cuda:0，FP32、128条fine39诊断样本上运行gpu-check。summary包含TermiScale、MotifSpan、PrivilegedBridge三项，说明三者至少一个配置通过资源/关键梯度/更新检查及有界训练、恢复和再次Val读取。PB仅为A阶段，不是完整A/B/C验证。这里据用户回传的精简结果记录，未取得原始profile.json及environment.json，硬件/模式沿用本次V100运行上下文。
+
+| 模型 | B16 samples/s / allocated GiB | B32 samples/s / allocated GiB | B64 samples/s / allocated GiB |
+|---|---|---|---|
+| TermiScale | 413.29 / 0.219 | 852.30 / 0.396 | 1281.69 / 0.761 |
+| MotifSpan | 117.77 / 0.117 | 86.81 / 0.200 | 307.77 / 0.372 |
+| PB A | 447.95 / 0.124 | 842.91 / 0.217 | 1501.13 / 0.397 |
+
+所有表内配置status=ok；自动推荐均为FP32、batch64。资源profile使用最大R-Drop权重0.1、双视图，包含优化器状态但不包含完整训练器的EMA副本；allocated不等于整卡占用。表内资源测量只预热和测少量step，且样本已经预载到内存。MotifSpan B32低于B16是本次短测现象，不证明B32普遍更慢，可能涉及调度、CPU或GPU运行波动，尚无profiler依据。
+
+以39,455条Train按短测吞吐线性外推，Train计算/内存样本成批部分约TermiScale30.8秒、MotifSpan128.2秒、PB-A26.3秒；rich48若长度/运算分布相同约34.7/144.7/29.7秒。它们不含完整数据读取、online/EMA Val、指标、初始化或checkpoint开销，不能当作完整epoch实测。MotifSpan约为TermiScale的4.16倍单样本耗时；当前更值得定位前缀循环和自动微分图的执行热点，而不是减少参数或先用AMP压显存。低显存不能证明低计算成本。
+
+上一轮短训练max_steps8，chosen B64时128条Train每轮2次更新，共约4轮；恢复再2步至第5轮，未到第6轮R-Drop/EMA启动。因此短训练日志views=1、EMA-updates=0与资源profile的完整双视图并不冲突，也不能据此声称GPU EMA更新链路已在本次有界训练中验证。正式训练第6轮及以后记录这两项即可。
+
+主实验保持有效batch64、优先物理64×1。随后回传的TermiScale/fine39/seed42首轮日志显示第45轮达到早停条件，完整R-Drop/EMA阶段每轮约40.45秒，Val Jaccard50.556%，存在明显过拟合；细节见[实验记录](experiment-history.md)。下一步依次运行MotifSpan主实验、TermiScale均匀LME/标签固定混合/等权尺度三个单因素对照，执行入口和两平台命令见[README](../README.md#首轮结果后的四组后续实验)。固定混合仍学习标签端点权重；三个对照都保留位置输入，不将它们误称为完全去掉端点信息。
+
+已有batch64数值/资源检查不重复开展。若后续专门优化吞吐，可只增测128/256；采用更大有效batch的正式训练须单独记录，并与匹配基线统一比较，不能将更新次数变化当作纯实现加速。

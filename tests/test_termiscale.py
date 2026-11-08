@@ -55,3 +55,22 @@ def test_dual_and_rdrop_short_optimization():
         opt.step()
         assert torch.isfinite(loss)
     assert net.features.projection.weight.grad[:, 12:].abs().sum() > 0
+
+
+def test_control_semantics_uniform_pool_label_only_and_equal_scales():
+    batch = synthetic_batch()
+    uniform = model(pooling="uniform").eval()
+    out = uniform(batch, return_evidence=True)
+    actual = out["log_measure"].exp().masked_fill(~batch["mask"][..., None], 0)
+    expected = (batch["mask"].float()/batch["mask"].sum(1, keepdim=True))[..., None].expand_as(actual)
+    torch.testing.assert_close(actual, expected)
+    fixed = model(pooling="fixed").eval()
+    with torch.no_grad():
+        fixed.condition_weights.normal_()
+    evidence = fixed(batch, return_evidence=True)
+    torch.testing.assert_close(evidence["mixture"][0], evidence["mixture"][1])
+    evidence["logits"].square().sum().backward()
+    assert fixed.condition_weights.grad is None
+    assert fixed.measure_bias.grad.abs().sum() > 0
+    equal = model(routing="uniform").eval()(batch, return_evidence=True)
+    torch.testing.assert_close(equal["scale_weights"], torch.full_like(equal["scale_weights"], 1/3))
