@@ -6,6 +6,7 @@ from zipfile import ZipFile
 
 import pytest
 import torch
+import numpy as np
 
 from mfp_nova import research
 from mfp_nova.theraset_ablation import (BATCHES, VARIANTS, command, find_run,
@@ -30,6 +31,20 @@ def test_matrix_and_task_protocols():
             assert config['data']['features'] == 'features/therapep_ai/esm2_650m'
             assert config['loss']['modality_dropout'] == 0
             assert not any(config['model'][k] for k in ('chemical_evidence', 'property_evidence', 'structure_evidence'))
+
+
+def test_followup_combination_and_structured_control_reuse(tmp_path):
+    variant = 'no_label_context_single_prototype'
+    assert list(jobs(['fine39'], variants=[variant])) == [
+        ('fine39', variant, 'traditional5'), ('fine39', variant, 'micro_f1')]
+    config = job_config('fine39', 'micro_f1', variant)
+    assert config['model']['label_context'] is False
+    assert config['model']['prototype_readout'] is False
+    assert config['model']['pair_readout'] is True
+    control = tmp_path/'old/fine39/no_label_context/micro_f1'
+    completed_run(control, job_config('fine39', 'micro_f1', 'no_label_context'))
+    assert find_run(tmp_path/'new', 'fine39', 'no_label_context', 'micro_f1', tmp_path/'old') == control
+    assert find_run(tmp_path/'new', 'fine39', variant, 'micro_f1', tmp_path/'old') != control
 
 
 def test_cli_passes_pause_controls_and_keeps_explicit_therapep_suite(monkeypatch):
@@ -71,7 +86,8 @@ def test_reuse_only_matching_controls_and_resume_command(tmp_path):
 
 
 @pytest.mark.parametrize('suite', ['traditional5', 'micro_f1'])
-def test_paused_theraset_resumes_same_epoch_history_and_weights(tmp_path, monkeypatch, suite):
+@pytest.mark.parametrize('variant', ['full', 'no_label_context_single_prototype'])
+def test_paused_theraset_resumes_same_epoch_history_and_weights(tmp_path, monkeypatch, suite, variant):
     torch.set_num_threads(1)
     root, features = multimodal_fixture(tmp_path)
     config = {'model_name': 'theraset',
@@ -85,6 +101,8 @@ def test_paused_theraset_resumes_same_epoch_history_and_weights(tmp_path, monkey
                         'ema_decay': .9, 'ema_start_epoch': 1, 'rdrop_start_epoch': 1, 'rdrop_ramp_epochs': 1,
                         'metric_suite': suite, 'save_selection_candidates': True,
                         'export_validation_predictions': True, 'output': str(tmp_path)}}
+    for switch in VARIANTS[variant]:
+        config['model'][switch] = False
     full_result = research.train(copy.deepcopy(config), 'full')
     stop = tmp_path/'PAUSE'
     real_format = research.format_epoch
@@ -114,6 +132,18 @@ def test_paused_theraset_resumes_same_epoch_history_and_weights(tmp_path, monkey
     assert full_result['validation'] == resumed['validation']
     assert [json.loads(l)['epoch'] for l in history_path.read_text().splitlines()] == [1, 2, 3]
     assert not (tmp_path/'partial/last.pt.tmp').exists()
+    if variant != 'full':
+        from mfp_nova.theraset_diagnostics import diagnose
+        measured = diagnose(tmp_path/'partial', device='cpu', cpu_threads=1)
+        with np.load(tmp_path/'partial/evidence_validation.npz') as evidence, np.load(tmp_path/'partial/best_validation.npz') as ordinary:
+            np.testing.assert_array_equal(evidence['row_id'], ordinary['row_id'])
+            # Extra readouts may change vectorized FP32 rounding by a few ULPs.
+            np.testing.assert_allclose(evidence['probabilities'], ordinary['probabilities'], rtol=1e-6, atol=1e-7)
+            transition = measured['comparisons']['fixed05']['transitions']
+            assert transition['changed'] == transition['repaired'] + transition['harmed']
+            assert measured['active_prototypes_per_label'] == [1]*15
+            np.testing.assert_allclose(evidence['source_weights'].sum(-1), 1, atol=1e-6)
+        assert measured['comparisons']['saved_threshold']['final'] == resumed['validation']
 
 
 def test_interrupted_save_preserves_last_complete_checkpoint(tmp_path, monkeypatch):
@@ -204,6 +234,8 @@ def test_pack_named_results_without_weights_including_reused_baseline(tmp_path):
     completed_run(control, job_config('fine39', 'micro_f1', 'full'))
     (control/'best.pt').write_bytes(b'large weight')
     (control/'best_validation.npz').write_bytes(b'predictions')
+    (control/'evidence_diagnostics.json').write_text('{}')
+    (control/'evidence_validation.npz').write_bytes(b'diagnostic predictions')
     args = Namespace(output=str(output), tasks=['fine39'], suites=['micro_f1'], variants=['full'],
                      reuse_root=str(reuse), zip=None, platform='v100')
     pack(args)
@@ -211,6 +243,8 @@ def test_pack_named_results_without_weights_including_reused_baseline(tmp_path):
     with ZipFile(package) as z:
         assert 'summary.csv' in z.namelist()
         assert any(n.endswith('/best_validation.npz') for n in z.namelist())
+        assert 'reused/fine39/full/micro_f1/evidence_diagnostics.json' in z.namelist()
+        assert 'reused/fine39/full/micro_f1/evidence_validation.npz' in z.namelist()
         assert not any(n.endswith('.pt') for n in z.namelist())
 
 

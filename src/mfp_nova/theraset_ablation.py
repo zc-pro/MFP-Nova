@@ -30,6 +30,12 @@ VARIANTS = {
     'no_label_context': ('label_context',),
     'no_rdrop': (),
 }
+# Preserve the original 54-run experiment as the default matrix.
+DEFAULT_VARIANTS = tuple(VARIANTS)
+VARIANTS.update({
+    'no_label_context_single_prototype': ('label_context', 'prototype_readout'),
+    'no_label_context_no_pair': ('label_context', 'pair_readout'),
+})
 # These options are already disabled for every author-published row.
 THERAPEP_REDUNDANT = {'cnn_chemical', 'no_property', 'no_structure'}
 
@@ -46,7 +52,7 @@ def job_config(task, suite, variant, device='cuda:0'):
     return config
 
 
-def jobs(tasks=TASKS, suites=SUITES, variants=tuple(VARIANTS)):
+def jobs(tasks=TASKS, suites=SUITES, variants=DEFAULT_VARIANTS):
     for task in tasks:
         for variant in variants:
             if task == 'therapep49' and variant in THERAPEP_REDUNDANT:
@@ -74,9 +80,12 @@ def find_run(output, task, variant, suite, reuse_root, device='cuda:0'):
             raise ValueError(f'Experiment settings differ in {directory}; choose a new --output')
     if (directory/'results.json').exists() or (directory/'last.pt').exists():
         return directory
-    # Reuse complete controls only, never select an old run by its score.
-    if variant == 'full' and reuse_root is not None:
-        for candidate in sorted(Path(reuse_root).glob('theraset_*')):
+    # Reuse an explicitly identified completed experiment, never choose by score.
+    if reuse_root is not None:
+        candidates = [Path(reuse_root)/task/variant/suite]
+        if variant == 'full':
+            candidates.extend(sorted(Path(reuse_root).glob('theraset_*')))
+        for candidate in candidates:
             if not (candidate/'results.json').is_file() or not (candidate/'metadata.json').is_file():
                 continue
             saved = json.loads((candidate/'metadata.json').read_text(encoding='utf-8'))
@@ -117,6 +126,8 @@ def run(args):
         directory = find_run(output, task, variant, suite, args.reuse_root, args.device)
         if (directory/'results.json').exists():
             print(f'SKIP completed: {task}/{variant}/{suite}: {directory}', flush=True)
+            if getattr(args, 'diagnostics', False) and not (directory/'evidence_diagnostics.json').is_file():
+                diagnose_run(directory, args)
             continue
         argv = command(task, variant, suite, directory, args.device, stop_file)
         print(f'{"RESUME" if (directory/"last.pt").exists() else "START"}: {task}/{variant}/{suite}', flush=True)
@@ -143,7 +154,22 @@ def run(args):
             if stop_file.exists():
                 return
             raise RuntimeError(f'Training ended without results.json: {directory}')
+        if getattr(args, 'diagnostics', False):
+            diagnose_run(directory, args)
     print('Selected seed42 ablations completed.', flush=True)
+
+
+def diagnose_run(directory, args):
+    # Separate process releases the training CUDA context before the Val pass.
+    subprocess.run([sys.executable, '-u', '-m', 'mfp_nova.theraset_diagnostics',
+                    '--run', str(directory), '--device', args.device,
+                    '--cpu-threads', str(args.cpu_threads)], check=True, cwd=PROJECT)
+
+
+def diagnose(args):
+    for task, variant, suite in jobs(args.tasks, args.suites, args.variants):
+        directory = find_run(Path(args.output).resolve(), task, variant, suite, args.reuse_root, args.device)
+        diagnose_run(directory, args)
 
 
 def prepare(args):
@@ -169,25 +195,26 @@ def prepare(args):
 
 def pack(args):
     output = Path(args.output).resolve()
-    rows, directories = [], set()
+    rows, directories = [], {}
     fields = ('accuracy', 'precision', 'coverage', 'absolute_true', 'absolute_false',
               'micro_f1', 'macro_f1', 'micro_ap', 'macro_ap', 'head_macro_ap', 'medium_macro_ap', 'tail_macro_ap')
     for task, variant, suite in jobs(args.tasks, args.suites, args.variants):
         directory = find_run(output, task, variant, suite, args.reuse_root)
         result_path = directory/'results.json'
         record = {'task': task, 'variant': variant, 'suite': suite, 'seed': 42,
-                  'batch_size': BATCHES[task], 'directory': str(directory), 'completed': result_path.exists()}
+                  'batch_size': BATCHES[task], 'directory': str(directory), 'completed': result_path.exists(),
+                  'diagnostics_completed': (directory/'evidence_diagnostics.json').is_file()}
         if result_path.exists():
             result = json.loads(result_path.read_text(encoding='utf-8'))
             record.update({k: result.get(k) for k in ('best_epoch', 'epochs_completed', 'threshold', 'weight_source', 'elapsed_seconds', 'peak_cuda_memory_bytes')})
             record.update({k: result['validation'].get(k) for k in fields})
         rows.append(record)
         if directory.is_dir():
-            directories.add(directory)
+            directories[directory] = (task, variant, suite)
     completed = sum(r['completed'] for r in rows)
     tasks_tag = '_'.join(f'{task}-b{BATCHES[task]}' for task in args.tasks)
     suites_tag = '-'.join(s.replace('_', '') for s in args.suites)
-    variants_tag = 'all-ablations' if set(args.variants) == set(VARIANTS) else '-'.join(args.variants)
+    variants_tag = 'all-ablations' if set(args.variants) == set(DEFAULT_VARIANTS) else '-'.join(args.variants)
     filename = (f'theraset_{variants_tag}_seed42_{args.platform}_{tasks_tag}_{suites_tag}_'
                 f'{completed}of{len(rows)}_{datetime.now():%Y%m%d_%H%M%S}.zip')
     destination = Path(args.zip).resolve() if args.zip else output.parent/filename
@@ -203,7 +230,7 @@ def pack(args):
         archive.write(summary_path, 'summary.csv')
         for directory in sorted(directories):
             prefix = ('runs/'+directory.relative_to(output).as_posix() if directory.is_relative_to(output)
-                      else 'reused/'+directory.name)
+                      else 'reused/'+'/'.join(directories[directory]))
             for file in sorted(directory.rglob('*')):
                 if file.is_file() and file.suffix.lower() in {'.json', '.jsonl', '.npz', '.csv', '.log'}:
                     archive.write(file, prefix+'/'+file.relative_to(directory).as_posix())
@@ -215,14 +242,15 @@ def pack(args):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=('plan', 'prepare', 'run', 'pause', 'pack'))
+    parser.add_argument('action', choices=('plan', 'prepare', 'run', 'pause', 'pack', 'diagnose'))
     parser.add_argument('--output', default='runs/theraset_ablation_seed42')
     parser.add_argument('--tasks', nargs='+', choices=TASKS, default=list(TASKS))
     parser.add_argument('--suites', nargs='+', choices=SUITES, default=list(SUITES))
-    parser.add_argument('--variants', nargs='+', choices=tuple(VARIANTS), default=list(VARIANTS))
+    parser.add_argument('--variants', nargs='+', choices=tuple(VARIANTS), default=list(DEFAULT_VARIANTS))
     parser.add_argument('--reuse-root', default='runs', help='Reuse matching completed full controls from this directory')
     parser.add_argument('--device', default='cuda:0')
     parser.add_argument('--cpu-threads', type=int, default=4)
+    parser.add_argument('--diagnostics', action='store_true', help='run: export direct/final Val readouts after each completed job')
     parser.add_argument('--platform', choices=('rtx5070', 'v100'), default='rtx5070', help='Platform label in the result package filename')
     parser.add_argument('--zip', help='pack: destination ZIP, excluding weights/caches')
     args = parser.parse_args(argv)
@@ -241,7 +269,7 @@ def main(argv=None):
         (output/'PAUSE').touch()
         print(f'Pause requested: {output / "PAUSE"}; active jobs stop after their current epoch.')
     else:
-        {'prepare': prepare, 'run': run, 'pack': pack}[args.action](args)
+        {'prepare': prepare, 'run': run, 'pack': pack, 'diagnose': diagnose}[args.action](args)
 
 
 if __name__ == '__main__':
