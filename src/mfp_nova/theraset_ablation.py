@@ -1,4 +1,4 @@
-"""Seed42 TheraSet ablations from section 8 of the architecture document."""
+"""TheraSet ablations and paired-seed follow-up experiments."""
 import argparse
 import copy
 import csv
@@ -40,10 +40,10 @@ VARIANTS.update({
 THERAPEP_REDUNDANT = {'cnn_chemical', 'no_property', 'no_structure'}
 
 
-def job_config(task, suite, variant, device='cuda:0'):
+def job_config(task, suite, variant, device='cuda:0', seed=42):
     config = yaml.safe_load((PROJECT/'configs/theraset.yaml').read_text(encoding='utf-8'))
     configure_task(config, task)
-    config['train'].update(seed=42, batch_size=BATCHES[task], accumulation_steps=1,
+    config['train'].update(seed=seed, batch_size=BATCHES[task], accumulation_steps=1,
                            precision='fp32', metric_suite=suite, device=device)
     for switch in VARIANTS[variant]:
         config['model'][switch] = False
@@ -70,8 +70,8 @@ def same_experiment(saved, expected):
     return saved == expected
 
 
-def find_run(output, task, variant, suite, reuse_root, device='cuda:0'):
-    expected = job_config(task, suite, variant, device)
+def find_run(output, task, variant, suite, reuse_root, device='cuda:0', seed=42):
+    expected = job_config(task, suite, variant, device, seed)
     directory = output/task/variant/suite
     metadata = directory/'metadata.json'
     if metadata.exists():
@@ -94,10 +94,10 @@ def find_run(output, task, variant, suite, reuse_root, device='cuda:0'):
     return directory
 
 
-def command(task, variant, suite, directory, device, stop_file):
+def command(task, variant, suite, directory, device, stop_file, seed=42):
     argv = [sys.executable, '-u', '-m', 'mfp_nova.cli', 'train', '--model', 'theraset',
             '--config', str(PROJECT/'configs/theraset.yaml'), '--task', task,
-            '--seed', '42', '--metric-suite', suite, '--device', device, '--precision', 'fp32',
+            '--seed', str(seed), '--metric-suite', suite, '--device', device, '--precision', 'fp32',
             '--batch-size', str(BATCHES[task]), '--accumulation-steps', '1',
             '--num-workers', '0', '--name', str(directory.resolve()), '--stop-file', str(stop_file)]
     if VARIANTS[variant]:
@@ -112,6 +112,7 @@ def command(task, variant, suite, directory, device, stop_file):
 
 
 def run(args):
+    seed = getattr(args, 'seed', 42)
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=True)
     stop_file = output/'PAUSE'
@@ -123,13 +124,13 @@ def run(args):
         if stop_file.exists():
             print(f'Queue paused. Remove {stop_file} and repeat this run command.', flush=True)
             return
-        directory = find_run(output, task, variant, suite, args.reuse_root, args.device)
+        directory = find_run(output, task, variant, suite, args.reuse_root, args.device, seed)
         if (directory/'results.json').exists():
             print(f'SKIP completed: {task}/{variant}/{suite}: {directory}', flush=True)
             if getattr(args, 'diagnostics', False) and not (directory/'evidence_diagnostics.json').is_file():
                 diagnose_run(directory, args)
             continue
-        argv = command(task, variant, suite, directory, args.device, stop_file)
+        argv = command(task, variant, suite, directory, args.device, stop_file, seed)
         print(f'{"RESUME" if (directory/"last.pt").exists() else "START"}: {task}/{variant}/{suite}', flush=True)
         print(subprocess.list2cmdline(argv), flush=True)
         directory.parent.mkdir(parents=True, exist_ok=True)
@@ -156,7 +157,7 @@ def run(args):
             raise RuntimeError(f'Training ended without results.json: {directory}')
         if getattr(args, 'diagnostics', False):
             diagnose_run(directory, args)
-    print('Selected seed42 ablations completed.', flush=True)
+    print(f'Selected seed{seed} ablations completed.', flush=True)
 
 
 def diagnose_run(directory, args):
@@ -168,7 +169,7 @@ def diagnose_run(directory, args):
 
 def diagnose(args):
     for task, variant, suite in jobs(args.tasks, args.suites, args.variants):
-        directory = find_run(Path(args.output).resolve(), task, variant, suite, args.reuse_root, args.device)
+        directory = find_run(Path(args.output).resolve(), task, variant, suite, args.reuse_root, args.device, args.seed)
         diagnose_run(directory, args)
 
 
@@ -181,7 +182,7 @@ def prepare(args):
             continue
         if task == 'therapep49' and task not in args.tasks:
             continue
-        config = job_config(task, 'micro_f1', 'full', args.device)
+        config = job_config(task, 'micro_f1', 'full', args.device, args.seed)
         for view, key in (('primary', 'features'), ('peptide', 'peptide_features')):
             for split in ('train', 'val'):
                 if (PROJECT/config['data'][key]/split/'metadata.json').is_file():
@@ -194,14 +195,15 @@ def prepare(args):
 
 
 def pack(args):
+    seed = getattr(args, 'seed', 42)
     output = Path(args.output).resolve()
     rows, directories = [], {}
     fields = ('accuracy', 'precision', 'coverage', 'absolute_true', 'absolute_false',
               'micro_f1', 'macro_f1', 'micro_ap', 'macro_ap', 'head_macro_ap', 'medium_macro_ap', 'tail_macro_ap')
     for task, variant, suite in jobs(args.tasks, args.suites, args.variants):
-        directory = find_run(output, task, variant, suite, args.reuse_root)
+        directory = find_run(output, task, variant, suite, args.reuse_root, seed=seed)
         result_path = directory/'results.json'
-        record = {'task': task, 'variant': variant, 'suite': suite, 'seed': 42,
+        record = {'task': task, 'variant': variant, 'suite': suite, 'seed': seed,
                   'batch_size': BATCHES[task], 'directory': str(directory), 'completed': result_path.exists(),
                   'diagnostics_completed': (directory/'evidence_diagnostics.json').is_file()}
         if result_path.exists():
@@ -215,7 +217,7 @@ def pack(args):
     tasks_tag = '_'.join(f'{task}-b{BATCHES[task]}' for task in args.tasks)
     suites_tag = '-'.join(s.replace('_', '') for s in args.suites)
     variants_tag = 'all-ablations' if set(args.variants) == set(DEFAULT_VARIANTS) else '-'.join(args.variants)
-    filename = (f'theraset_{variants_tag}_seed42_{args.platform}_{tasks_tag}_{suites_tag}_'
+    filename = (f'theraset_{variants_tag}_seed{seed}_{args.platform}_{tasks_tag}_{suites_tag}_'
                 f'{completed}of{len(rows)}_{datetime.now():%Y%m%d_%H%M%S}.zip')
     destination = Path(args.zip).resolve() if args.zip else output.parent/filename
     columns = list(dict.fromkeys(k for row in rows for k in row))
@@ -243,25 +245,28 @@ def pack(args):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=('plan', 'prepare', 'run', 'pause', 'pack', 'diagnose'))
-    parser.add_argument('--output', default='runs/theraset_ablation_seed42')
+    parser.add_argument('--output', help='Default: runs/theraset_ablation_seed<seed>')
+    parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--tasks', nargs='+', choices=TASKS, default=list(TASKS))
     parser.add_argument('--suites', nargs='+', choices=SUITES, default=list(SUITES))
     parser.add_argument('--variants', nargs='+', choices=tuple(VARIANTS), default=list(DEFAULT_VARIANTS))
-    parser.add_argument('--reuse-root', default='runs', help='Reuse matching completed full controls from this directory')
+    parser.add_argument('--reuse-root', default='runs', help='Reuse matching completed controls from this directory')
     parser.add_argument('--device', default='cuda:0')
     parser.add_argument('--cpu-threads', type=int, default=4)
     parser.add_argument('--diagnostics', action='store_true', help='run: export direct/final Val readouts after each completed job')
     parser.add_argument('--platform', choices=('rtx5070', 'v100'), default='rtx5070', help='Platform label in the result package filename')
     parser.add_argument('--zip', help='pack: destination ZIP, excluding weights/caches')
     args = parser.parse_args(argv)
+    if args.output is None:
+        args.output = f'runs/theraset_ablation_seed{args.seed}'
     os.chdir(PROJECT)
     if args.action == 'plan':
         counts = {'completed': 0, 'resume': 0, 'new': 0}
         for task, variant, suite in jobs(args.tasks, args.suites, args.variants):
-            directory = find_run(Path(args.output).resolve(), task, variant, suite, args.reuse_root, args.device)
+            directory = find_run(Path(args.output).resolve(), task, variant, suite, args.reuse_root, args.device, args.seed)
             state = 'completed' if (directory/'results.json').exists() else 'resume' if (directory/'last.pt').exists() else 'new'
             counts[state] += 1
-            print(f'{task:10} {variant:18} {suite:13} b{BATCHES[task]:3} {state:10} {directory}')
+            print(f'seed{args.seed:<3} {task:10} {variant:18} {suite:13} b{BATCHES[task]:3} {state:10} {directory}')
         print(counts)
     elif args.action == 'pause':
         output = Path(args.output)

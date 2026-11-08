@@ -47,6 +47,26 @@ def test_followup_combination_and_structured_control_reuse(tmp_path):
     assert find_run(tmp_path/'new', 'fine39', variant, 'micro_f1', tmp_path/'old') != control
 
 
+@pytest.mark.parametrize('seed', [101, 202])
+def test_followup_seed_keeps_old_control_separate_and_reaches_cli(tmp_path, monkeypatch, seed):
+    from mfp_nova.cli import main
+    variant = 'no_label_context_single_prototype'
+    config = job_config('fine39', 'micro_f1', variant, seed=seed)
+    assert config['train']['seed'] == seed
+    old = tmp_path/'old/fine39/no_label_context/micro_f1'
+    completed_run(old, job_config('fine39', 'micro_f1', 'no_label_context'))
+    assert find_run(tmp_path/'new', 'fine39', 'no_label_context', 'micro_f1', tmp_path/'old', seed=seed) != old
+    directory = tmp_path/f'seed{seed}/fine39/{variant}/micro_f1'
+    argv = command('fine39', variant, 'micro_f1', directory, 'cpu', tmp_path/'PAUSE', seed=seed)
+    captured = []
+    monkeypatch.setattr(research, 'train', lambda cfg, name, **kwargs: captured.append(cfg))
+    main(argv[argv.index('train'):])
+    assert captured[0]['train']['seed'] == seed
+    assert captured[0]['train']['batch_size'] == 64
+    assert captured[0]['model']['label_context'] is False
+    assert captured[0]['model']['prototype_readout'] is False
+
+
 def test_cli_passes_pause_controls_and_keeps_explicit_therapep_suite(monkeypatch):
     from mfp_nova.cli import main
     captured = []
@@ -86,8 +106,9 @@ def test_reuse_only_matching_controls_and_resume_command(tmp_path):
 
 
 @pytest.mark.parametrize('suite', ['traditional5', 'micro_f1'])
-@pytest.mark.parametrize('variant', ['full', 'no_label_context_single_prototype'])
-def test_paused_theraset_resumes_same_epoch_history_and_weights(tmp_path, monkeypatch, suite, variant):
+@pytest.mark.parametrize('variant,seed', [('full', 42), ('no_label_context_single_prototype', 42),
+                                         ('no_label_context_single_prototype', 101)])
+def test_paused_theraset_resumes_same_epoch_history_and_weights(tmp_path, monkeypatch, suite, variant, seed):
     torch.set_num_threads(1)
     root, features = multimodal_fixture(tmp_path)
     config = {'model_name': 'theraset',
@@ -95,7 +116,7 @@ def test_paused_theraset_resumes_same_epoch_history_and_weights(tmp_path, monkey
               'data': {'root': str(root), 'track': 'major15', 'features': str(features)},
               'encoder': {'name': 'fixture', 'revision': 'main', 'max_length': 80},
               'loss': {'modality_dropout': .1, 'rdrop': .1},
-              'train': {'device': 'cpu', 'seed': 42, 'epochs': 3, 'batch_size': 2,
+              'train': {'device': 'cpu', 'seed': seed, 'epochs': 3, 'batch_size': 2,
                         'learning_rate': .001, 'weight_decay': 0, 'patience': 0, 'num_workers': 0,
                         'warmup_epochs': 0, 'aux_warmup_epochs': 0, 'accumulation_steps': 1,
                         'ema_decay': .9, 'ema_start_epoch': 1, 'rdrop_start_epoch': 1, 'rdrop_ramp_epochs': 1,
@@ -135,6 +156,7 @@ def test_paused_theraset_resumes_same_epoch_history_and_weights(tmp_path, monkey
     if variant != 'full':
         from mfp_nova.theraset_diagnostics import diagnose
         measured = diagnose(tmp_path/'partial', device='cpu', cpu_threads=1)
+        assert measured['seed'] == seed
         with np.load(tmp_path/'partial/evidence_validation.npz') as evidence, np.load(tmp_path/'partial/best_validation.npz') as ordinary:
             np.testing.assert_array_equal(evidence['row_id'], ordinary['row_id'])
             # Extra readouts may change vectorized FP32 rounding by a few ULPs.
@@ -246,6 +268,19 @@ def test_pack_named_results_without_weights_including_reused_baseline(tmp_path):
         assert 'reused/fine39/full/micro_f1/evidence_diagnostics.json' in z.namelist()
         assert 'reused/fine39/full/micro_f1/evidence_validation.npz' in z.namelist()
         assert not any(n.endswith('.pt') for n in z.namelist())
+
+
+def test_pack_seed101_names_the_seed_and_diagnostics(tmp_path):
+    output = tmp_path/'seed101'
+    directory = output/'fine39/no_label_context/micro_f1'
+    completed_run(directory, job_config('fine39', 'micro_f1', 'no_label_context', seed=101))
+    pack(Namespace(output=str(output), tasks=['fine39'], suites=['micro_f1'], variants=['no_label_context'],
+                   reuse_root=None, zip=None, platform='v100', seed=101))
+    package = next(tmp_path.glob('theraset_no_label_context_seed101_v100_fine39-b64_microf1_1of1_*.zip'))
+    with ZipFile(package) as archive:
+        import csv
+        summary = list(csv.DictReader(archive.read('summary.csv').decode('utf-8-sig').splitlines()))
+        assert summary[0]['seed'] == '101'
 
 
 def test_queue_resumes_unfinished_jobs_and_skips_finished(tmp_path, monkeypatch):
