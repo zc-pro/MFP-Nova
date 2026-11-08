@@ -46,6 +46,9 @@ def inspect(feature_root, device):
 
 
 PROBES = {
+    "termiscale": ["features.projection.weight", "blocks.0.router.weight", "label.weight", "condition_weights"],
+    "motifspan": ["features.projection.weight", "velocity_out.weight", "left.weight", "detail_query.weight"],
+    "privilegedbridge": ["sequence.features.projection.weight", "sequence.label_weight"],
     "trirelay": ["sequence.plm.weight", "geometry.layers.0.backbone.attention.in_proj_weight", "interactions.0.links.0.attention.in_proj_weight",
                  "feedback.0.attention.in_proj_weight", "relations.factor.0.0.weight"],
     "geofactor": ["sequence.plm.weight", "layers.0.member_up.weight", "layers.0.residue.contact.attention.in_proj_weight",
@@ -70,8 +73,9 @@ def check_inputs(model, samples, device, precision):
         corrupted["esm"] = batch["esm"].masked_fill(~batch["mask"][..., None], 100)
         if "esm_peptide" in batch:
             corrupted["esm_peptide"] = batch["esm_peptide"].masked_fill(~batch["mask"][..., None], 100)
-        corrupted["geometry"] = batch["geometry"].masked_fill(~batch["struct_mask"][..., None], 100)
-        corrupted["coords"] = batch["coords"].masked_fill(~batch["struct_mask"][..., None], 100)
+        if "geometry" in batch:
+            corrupted["geometry"] = batch["geometry"].masked_fill(~batch["struct_mask"][..., None], 100)
+            corrupted["coords"] = batch["coords"].masked_fill(~batch["struct_mask"][..., None], 100)
         padded = model(corrupted)
     torch.testing.assert_close(original["logits"], padded["logits"], rtol=.005 if precision!="fp32" else 1e-4, atol=.005 if precision!="fp32" else 1e-4)
     if not torch.isfinite(original["logits"]).all():
@@ -85,7 +89,8 @@ def check_inputs(model, samples, device, precision):
                 raise ValueError("Missing structures received nonzero fusion/routing weights")
     result = {"logits_shape": list(original["logits"].shape), "logits_finite": True,
               "padding_max_abs_difference": float((original["logits"]-padded["logits"]).abs().max()),
-              "D_rows": int(batch["d"].any(1).sum()), "missing_structure_rows": int((~batch["struct_mask"].any(1)).sum())}
+              "D_rows": int(batch["d"].any(1).sum()) if "d" in batch else 0,
+              "missing_structure_rows": int((~batch["struct_mask"].any(1)).sum()) if "struct_mask" in batch else None}
     model.train()
     return result
 
@@ -101,9 +106,18 @@ def profile(config, source, dataset, device, batches, precisions, measured_steps
     records = []
     for precision in precisions:
         model = make_model(config["model_name"], arguments).to(device).train()
+        if config["model_name"] == "privilegedbridge" and model.stage != "A":
+            previous, saved = load_model(config["train"]["initialize_from"], device)
+            model.initialize_from(previous)
+            del previous
         input_check = check_inputs(model, samples, device, precision)
         parameters = dict(model.named_parameters())
         probe_keys = list(PROBES[config["model_name"]])
+        if config["model_name"] == "privilegedbridge":
+            if model.stage == "B":
+                probe_keys = ["teacher.residual.0.0.weight", "teacher.residual.1.0.weight"]
+            elif model.stage == "C":
+                probe_keys = ["sequence.features.projection.weight", "bridges.0.2.weight", "bridges.1.2.weight"]
         if config["data"]["track"] in THERAPEP_TRACKS:
             probe_keys = [key for key in probe_keys if not any(
                 absent in key for absent in ("geometry", "interactions.", "collaboration."))]
@@ -152,7 +166,9 @@ def profile(config, source, dataset, device, batches, precisions, measured_steps
                         for key in before:
                             module_updates[key]["updated"] = bool((before[key]!=parameters[key]).any())
                         if "peptide_encoder" in dataset.meta:
-                            key = "sequence.plm.weight"
+                            key = ("features.projection.weight" if config["model_name"] in ("termiscale", "motifspan") else
+                                   "sequence.features.projection.weight" if config["model_name"] == "privilegedbridge" else
+                                   "sequence.plm.weight")
                             boundary = dataset.meta["input_dim"]
                             for view, columns in (("primary", slice(None, boundary)), ("peptide", slice(boundary, None))):
                                 gradient = parameters[key].grad[:, columns]
@@ -193,11 +209,11 @@ def profile(config, source, dataset, device, batches, precisions, measured_steps
 
 def run(models, tasks, feature_root, device, output, esm="650m", batches=(2, 4, 8, 16),
         precisions=("fp32", "fp16"), steps=32, samples=128, data_root="data/therapeutic_2025", peptide_feature_root=None):
-    if len(set(tasks)) == 1 and tasks[0] in THERAPEP_TRACKS:
+    if len(set(tasks)) == 1 and tasks[0] in (*THERAPEP_TRACKS, "rich48"):
         if str(data_root) == "data/therapeutic_2025":
-            data_root = THERAPEP_ROOTS[tasks[0]]
+            data_root = "data/therapeutic_2025/rich48" if tasks[0] == "rich48" else THERAPEP_ROOTS[tasks[0]]
         if str(feature_root) == f"features/esm2_{esm}":
-            feature_root = f"features/therapep_ai/esm2_{esm}"
+            feature_root = f"features/rich48/esm2_{esm}" if tasks[0] == "rich48" else f"features/therapep_ai/esm2_{esm}"
     environment = inspect(feature_root, device)
     print(json.dumps(environment, ensure_ascii=False, indent=2), flush=True)
     active = environment["gpu"]["other_compute_processes"]
@@ -219,16 +235,18 @@ def run(models, tasks, feature_root, device, output, esm="650m", batches=(2, 4, 
             config = yaml.safe_load(Path(f"configs/{name}.yaml").read_text(encoding="utf-8"))
             from .therapep import configure_task
             configure_task(config, task)
-            if task not in THERAPEP_TRACKS or str(data_root) != "data/therapeutic_2025":
+            if task not in (*THERAPEP_TRACKS, "rich48") or str(data_root) != "data/therapeutic_2025":
                 config["data"]["root"] = str(data_root)
-            if task not in THERAPEP_TRACKS or str(feature_root) != f"features/esm2_{esm}":
+            if task not in (*THERAPEP_TRACKS, "rich48") or str(feature_root) != f"features/esm2_{esm}":
                 config["data"]["features"] = str(feature_root)
-            if peptide_feature_root is not None and name in ("helixset", "theraset"):
+            if peptide_feature_root is not None and name in ("helixset", "theraset", "termiscale", "motifspan", "privilegedbridge"):
                 config["data"]["peptide_features"] = str(peptide_feature_root)
             config["encoder"]["name"] = "facebook/esm2_t33_650M_UR50D" if esm=="650m" else "facebook/esm2_t12_35M_UR50D"
-            source = MultimodalData(config["data"]["root"], task)
+            sequence_only = name in ("termiscale", "motifspan")
+            source = MultimodalData(config["data"]["root"], task, sequence_only=sequence_only)
             task_features = config["data"]["features"]
-            data = MultimodalPeptides(source, task_features, "train", samples, config["data"].get("peptide_features"))
+            data = MultimodalPeptides(source, task_features, "train", samples, config["data"].get("peptide_features"),
+                                     sequence_only=sequence_only or (name == "privilegedbridge" and config["model"].get("stage", "A") == "A"))
             validate_cache(data, config)
             groups = source.groups(data.indices, source.data.y[data.indices])
             integration = {"rows": len(data), "esm_dim": data.meta["input_dim"], "encoder": data.meta,

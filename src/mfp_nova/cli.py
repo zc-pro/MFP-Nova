@@ -4,7 +4,7 @@ from pathlib import Path
 
 import yaml
 
-from .models import RESEARCH_MODELS
+from .models import RESEARCH_MODELS, LEGACY_MODELS
 from .data import TRACKS
 from .therapep import TRACKS as THERAPEP_TRACKS
 
@@ -20,6 +20,10 @@ def main(argv=None):
     variants = commands.add_parser("prepare-therapep-variants", help="Create aligned positive-only 49/48-label CSVs")
     variants.add_argument("--source", default="data/therapep_ai")
     variants.add_argument("--output-root", default="data")
+    rich = commands.add_parser("prepare-rich48", help="Match author positive48 members to raw multimodal records")
+    rich.add_argument("--author-root", default="data/therapep_ai")
+    rich.add_argument("--source-root", default="data/therapeutic_2025")
+    rich.add_argument("--output", default="data/therapeutic_2025/rich48")
     for command in ("features", "train"):
         sub = commands.add_parser(command)
         sub.add_argument("--config")
@@ -42,6 +46,8 @@ def main(argv=None):
                              help="Research models: primary report and checkpoint selection protocol")
             sub.add_argument("--task", choices=TRACKS, help="Alias for --track")
             sub.add_argument("--resume", help="last.pt with optimizer and RNG state; creates a new run")
+            sub.add_argument("--stage", choices=("A", "B", "C"), help="PrivilegedBridge training phase")
+            sub.add_argument("--initialize-from", help="Selected preceding PrivilegedBridge phase checkpoint")
             sub.add_argument("--resume-in-place", action="store_true", help="Research models: append to the same interrupted run")
             sub.add_argument("--stop-file", help="Research models: pause after a complete epoch when this file exists")
             sub.add_argument("--ablate", nargs="*", help="Model switches to disable, e.g. feedback high_order")
@@ -61,6 +67,8 @@ def main(argv=None):
             sub.add_argument("--ema-start-epoch", type=int, help="First EMA update epoch (default: after LR warmup)")
             sub.add_argument("--consistency-weight", type=float, help="TriRelay: optional clean-EMA / masked-student consistency (candidate: 0.1)")
             sub.add_argument("--rdrop-weight", type=float, help="HelixSet/TheraSet: symmetric Bernoulli dropout consistency; 0 disables it")
+            sub.add_argument("--rdrop-start-epoch", type=int, help="First R-Drop epoch for supported models")
+            sub.add_argument("--rdrop-ramp-epochs", type=int, help="R-Drop weight ramp length")
             sub.add_argument("--consistency-start-epoch", type=int, help="First consistency epoch (default: EMA start + 1)")
             sub.add_argument("--consistency-ramp-epochs", type=int, help="Consistency weight ramp length (default: 5)")
             sub.add_argument("--function-aux-weight", type=float, help="TriRelay: real paired major15/fine39 auxiliary supervision (candidate: 0.1)")
@@ -106,7 +114,7 @@ def main(argv=None):
     summarize.add_argument("--split", choices=("val", "test"), default="val")
     summarize.add_argument("--output", help="Optional JSON; otherwise print")
     gpu_check = commands.add_parser("gpu-check", help="Real-cache full-model server probes and bounded short training")
-    gpu_check.add_argument("--models", nargs="+", choices=RESEARCH_MODELS, default=list(RESEARCH_MODELS))
+    gpu_check.add_argument("--models", nargs="+", choices=RESEARCH_MODELS, default=list(LEGACY_MODELS))
     gpu_check.add_argument("--tasks", nargs="+", choices=TRACKS, default=["major15", "fine39"])
     gpu_check.add_argument("--esm", choices=("35m", "650m"), default="650m")
     gpu_check.add_argument("--feature-root")
@@ -120,7 +128,10 @@ def main(argv=None):
     gpu_check.add_argument("--output")
     gpu_check.add_argument("--inspect-only", action="store_true", help="Read GPU occupancy/cache metadata without training")
     args = parser.parse_args(argv)
-    if args.command == "prepare-therapep-variants":
+    if args.command == "prepare-rich48":
+        from .rich48 import build_rich48
+        print(json.dumps(build_rich48(args.author_root, args.source_root, args.output), ensure_ascii=False, indent=2))
+    elif args.command == "prepare-therapep-variants":
         from .therapep import prepare_positive_variants
         print(json.dumps(prepare_positive_variants(args.source, args.output_root), ensure_ascii=False, indent=2))
     elif args.command == "download-therapep":
@@ -137,6 +148,17 @@ def main(argv=None):
         model_name = args.model if args.command == "train" else "sequence"
         config_path = args.config or f"configs/{model_name}.yaml"
         config = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
+        if args.command == "train":
+            if args.stage is not None or args.initialize_from is not None:
+                if args.model != "privilegedbridge":
+                    raise ValueError("stage/initialize-from are PrivilegedBridge options")
+            if args.resume and args.initialize_from:
+                raise ValueError("Use resume within a phase or initialize-from between phases")
+            if args.model == "privilegedbridge":
+                from .models.privilegedbridge import configure_stage
+                configure_stage(config, args.stage or config["model"].get("stage", "A"))
+                if args.initialize_from:
+                    config["train"]["initialize_from"] = args.initialize_from
         from .therapep import configure_task
         configure_task(config, (args.task if args.command == "train" else None)
                        or args.track or config["data"]["track"])
@@ -147,8 +169,10 @@ def main(argv=None):
             if config.get("model", {}).get("esm_tail") and args.esm != "650m":
                 raise ValueError("This HelixSet ESM-tail configuration uses ESM650M")
             config["encoder"]["name"] = "facebook/esm2_t12_35M_UR50D" if args.esm=="35m" else "facebook/esm2_t33_650M_UR50D"
-            config["data"]["features"] = (f"features/therapep_ai/esm2_{args.esm}"
-                                           if config["data"]["track"] in THERAPEP_TRACKS else f"features/esm2_{args.esm}")
+            track = config["data"]["track"]
+            config["data"]["features"] = (f"features/rich48/esm2_{args.esm}" if track == "rich48" else
+                                           f"features/therapep_ai/esm2_{args.esm}" if track in THERAPEP_TRACKS else
+                                           f"features/esm2_{args.esm}")
             layer = config["encoder"].get("representation_layer")
             if layer is not None:
                 config["data"]["features"] += f"_layer{layer}"
@@ -207,6 +231,7 @@ def main(argv=None):
                 if args.limit_samples:
                     config["train"]["limit_samples"] = args.limit_samples
                 for key in ("precision", "accumulation_steps", "lr_decay_epochs", "max_steps", "reconstruction_decay", "reconstruction_floor", "ema_decay", "ema_start_epoch",
+                            "rdrop_start_epoch", "rdrop_ramp_epochs",
                             "consistency_weight", "consistency_start_epoch", "consistency_ramp_epochs",
                             "function_aux_weight", "function_hierarchy_weight",
                             "reconstruction_gradient", "reconstruction_grad_ratio", "branch_supervision",
@@ -235,8 +260,8 @@ def main(argv=None):
                 if value is not None:
                     config["train"][key] = value
             if args.rdrop_weight is not None:
-                if model_name not in ("helixset", "theraset"):
-                    raise ValueError("--rdrop-weight requires HelixSet or TheraSet")
+                if model_name not in ("helixset", "theraset", "termiscale", "motifspan", "privilegedbridge"):
+                    raise ValueError("This model does not support R-Drop")
                 config["loss"]["rdrop"] = args.rdrop_weight
             if args.loss is not None:
                 if model_name != "sequence":

@@ -7,7 +7,7 @@ import torch
 from torch.utils.data import Dataset
 from .therapep import TRACKS as THERAPEP_TRACKS
 
-TRACKS = ("major15", "fine39", *THERAPEP_TRACKS)
+TRACKS = ("major15", "fine39", "rich48", *THERAPEP_TRACKS)
 
 
 class PeptideData:
@@ -44,7 +44,7 @@ class PeptideData:
             raise ValueError(f"Unknown split: {split}")
         if augment and split != "train":
             raise ValueError("Augmentation is train-only")
-        if augment and self.track in THERAPEP_TRACKS:
+        if augment and self.track in (*THERAPEP_TRACKS, "rich48"):
             raise ValueError("TheraPep tasks preserve published rows; no augmentation is defined")
         key = "train_aug_mask" if augment else f"{split}_original_mask"
         mask = self.masks[key].copy()

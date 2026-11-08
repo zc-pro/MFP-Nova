@@ -24,6 +24,15 @@ from .metric_protocol import protocol_description, primary_metrics, selection, f
 
 
 def make_model(name, arguments):
+    if name == "termiscale":
+        from .models.termiscale import TermiScale
+        return TermiScale(**arguments)
+    if name == "motifspan":
+        from .models.motifspan import MotifSpan
+        return MotifSpan(**arguments)
+    if name == "privilegedbridge":
+        from .models.privilegedbridge import PrivilegedBridge
+        return PrivilegedBridge(**arguments)
     if name == "theraset":
         from .models.theraset import TheraSet
         return TheraSet(**arguments)
@@ -142,8 +151,8 @@ def validate_cache(dataset, config, reference=None):
     if (peptide is None) != (settings is None):
         raise ValueError("Peptide encoder configuration and cache must be supplied together")
     if peptide is not None:
-        if config["model_name"] not in ("helixset", "theraset"):
-            raise ValueError("Dual frozen encoders are supported by HelixSet and TheraSet")
+        if config["model_name"] not in ("helixset", "theraset", "termiscale", "motifspan", "privilegedbridge"):
+            raise ValueError("This architecture does not support dual frozen encoders")
         if peptide["name"] != settings["name"] or peptide["max_length"] != settings["max_length"]:
             raise ValueError("Configured peptide encoder differs from cache")
         if settings["revision"] not in (peptide["requested_revision"], peptide["resolved_revision"]):
@@ -171,11 +180,15 @@ def epoch_loss_settings(config, epoch):
     for key in ('direct', 'branch', 'reconstruction', 'prototype', 'diversity', 'balance', 'factor',
                 'evidence', 'annotation_set'):
         if key in loss:
+            if key == "branch" and config.get("model_name") == "privilegedbridge" and config["model"].get("stage") == "B":
+                continue  # PB's specified teacher objective uses a fixed 0.2 branch term.
             loss[key] *= ramp
     if "rdrop" in loss:
         start = settings.get("rdrop_start_epoch", 6)
         duration = settings.get("rdrop_ramp_epochs", 5)
         loss["rdrop"] *= min(1., max(0., (epoch-start+1)/duration))
+    if config.get("model_name") == "privilegedbridge" and config["model"].get("stage") == "C":
+        loss["kd"] = loss.get("kd", .2)*min(1., epoch/5)
     decay = settings.get('reconstruction_decay')
     if decay is not None:
         start, end = decay
@@ -221,7 +234,12 @@ def restore_model_state(model, state):
 
 def make_optimizer(model, settings):
     parameters = [(key, value) for key, value in model.named_parameters() if value.requires_grad]
-    if getattr(model, "esm_tail", None) is not None:
+    if getattr(model, "stage", None) == "C":
+        groups = [{"params": [p for key, p in parameters if key.startswith("sequence.")]},
+                  {"params": [p for key, p in parameters if key.startswith("bridges.")],
+                   "lr": settings.get("bridge_learning_rate", 2e-4)}]
+        groups = [g for g in groups if g["params"]]
+    elif getattr(model, "esm_tail", None) is not None:
         groups = [{"params": [p for key, p in parameters if not key.startswith("esm_tail.")]},
                   {"params": [p for key, p in parameters if key.startswith("esm_tail.")],
                    "lr": settings.get("esm_learning_rate", 1e-5)}]
@@ -263,9 +281,22 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         torch.cuda.set_device(device)
     seed_everything(settings["seed"])
     checkpoint = torch.load(resume, map_location="cpu", weights_only=True) if resume else None
+    pb = config["model_name"] == "privilegedbridge"
+    initial = None
+    initialize = settings.get("initialize_from")
+    if pb and checkpoint is None and config["model"].get("stage", "A") in ("B", "C"):
+        if not initialize:
+            raise ValueError("PB B/C require initialize_from pointing to the selected preceding phase")
+        initial = torch.load(initialize, map_location="cpu", weights_only=True)
+        if initial["model_name"] != "privilegedbridge" or initial["track"] != config["data"]["track"]:
+            raise ValueError("PB initialization model/task differs")
+        if config["model"].get("stage") == "C":
+            config["model"]["teacher_mode"] = initial["model_args"].get("teacher_mode", "zero_reference")
     if checkpoint is not None:
         # Resume preserves the trained model/priors/protocol; only execution controls change.
         original = checkpoint["config"]
+        if pb and config["model"].get("stage", "A") != original["model"].get("stage", "A"):
+            raise ValueError("PB phase changes require initialize_from, not resume")
         if ("lr_decay_epochs" in settings and settings["lr_decay_epochs"] !=
                 original["train"].get("lr_decay_epochs", checkpoint["planned_epochs"])):
             raise ValueError("Changing the LR decay horizon requires a new run, not resume")
@@ -306,11 +337,13 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
                 settings[key] = value
     suite = settings.get("metric_suite", "task_specific")
     rdrop = config["loss"].get("rdrop", 0)
+    if pb and config["model"].get("stage", "A") == "B" and (rdrop or settings.get("ema_decay") is not None):
+        raise ValueError("PB teacher phase B uses deterministic training without R-Drop/EMA")
     if not math.isfinite(rdrop) or rdrop < 0:
         raise ValueError("R-Drop weight must be finite and nonnegative")
     if rdrop:
-        if config["model_name"] not in ("helixset", "theraset"):
-            raise ValueError("R-Drop currently supports HelixSet and TheraSet")
+        if config["model_name"] not in ("helixset", "theraset", "termiscale", "motifspan", "privilegedbridge"):
+            raise ValueError("This model does not support R-Drop")
         if settings.get("rdrop_start_epoch", 6) < 1 or settings.get("rdrop_ramp_epochs", 5) < 1:
             raise ValueError("R-Drop start epoch and ramp length must be positive")
     protocol = protocol_description(suite, settings.get("threshold_strategy", "global"))
@@ -357,9 +390,14 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         raise ValueError("Use reconstruction_gradient=sum/cap/project and a finite nonnegative gradient ratio")
     if reconstruction_gradient != "sum" and config["model_name"] != "trirelay":
         raise ValueError("Reconstruction gradient balancing currently supports TriRelay")
+    reference_checkpoint = checkpoint or initial
+    sequence_only = config["model_name"] in ("termiscale", "motifspan")
     source = MultimodalData(config["data"]["root"], config["data"]["track"],
-                           checkpoint["statistics"] if checkpoint else None,
-                           config.get("min_factor_support", 20), config.get("max_factors", 32))
+                           reference_checkpoint["statistics"] if reference_checkpoint else None,
+                           config.get("min_factor_support", 20), config.get("max_factors", 32),
+                           sequence_only=sequence_only)
+    if pb and config["model"].get("stage", "A") != "A" and source.data.track in THERAPEP_TRACKS:
+        raise ValueError("PB B/C need observed auxiliary inputs; use rich48 or stage A for author sequence tasks")
     if function_aux:
         source.enable_function_auxiliary()
     limit = settings.get("limit_samples")
@@ -367,8 +405,9 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     # Diagnostic optimization subsets retain full original-Train priors/statistics:
     # shrinking the subset must not erase empirical factors or prototype capacity.
     datasets = [MultimodalPeptides(source, config["data"]["features"], split, limit,
-                                   config["data"].get("peptide_features")) for split in ("train", "val")]
-    validate_cache(datasets[0], config, checkpoint["encoder"] if checkpoint else None)
+                                   config["data"].get("peptide_features"),
+                                   sequence_only=sequence_only or (pb and config["model"].get("stage", "A") == "A")) for split in ("train", "val")]
+    validate_cache(datasets[0], config, reference_checkpoint["encoder"] if reference_checkpoint else None)
     validate_cache(datasets[1], config, datasets[0].meta)
     if datasets[0].meta["dataset"] != source.statistics["dataset"]:
         raise ValueError("Cache dataset version differs from multimodal data")
@@ -387,6 +426,11 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     if function_aux:
         args["function_aux_statistics"] = source.statistics["function_auxiliary"]
     model = make_model(config["model_name"], args).to(device)
+    if initial is not None:
+        previous = make_model("privilegedbridge", initial["model_args"]).to(device)
+        restore_model_state(previous, initial["model_state"])
+        model.initialize_from(previous)
+        del previous, initial
     run = Path(settings["output"])/name
     if resume_in_place:
         if (run/'results.json').exists():
@@ -488,6 +532,10 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
             "Author-published 49-bit targets; synthetic backgrounds when present are assigned zeros; therapeutic flag is supervised")
         metadata["split_protocol"] = "Published CSV members, including duplicates; no cluster isolation imposed"
         metadata["modality_scope"] = "Sequence only for every source; no positive-only structure/descriptor availability shortcut"
+    if source.data.track == "rich48":
+        metadata["label_semantics"] = "48 author functional targets; 0 is unannotated; no therapeutic flag"
+        metadata["split_protocol"] = "Author positive members retained; no homology isolation imposed"
+        metadata["modality_scope"] = "Source-matched raw structure/properties and annotation masks; Train-only preprocessing"
     if getattr(model, "esm_tail", None) is not None:
         metadata["esm_adaptation"] = {
             "mode": "frozen_prefix_cached_trainable_tail_lora",
@@ -540,11 +588,13 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         totals, count, skipped = {}, 0, 0
         gradient_records = []
         epoch_start = time.perf_counter()
+        epoch_start_step = global_step
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
         online_targets, online_probabilities = [], []
         loss_settings = epoch_loss_settings(config, epoch)
         optimizer.zero_grad(set_to_none=True)
+        valid_microbatches = 0
         data_wait_seconds = 0.
         batch_done = time.perf_counter()
         for batch_index, batch in enumerate(loaders[0]):
@@ -568,6 +618,8 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
             del teacher_logits
             if not torch.isfinite(loss):
                 raise FloatingPointError("Nonfinite research loss")
+            backward_enabled = not (pb and model.stage == "B" and not output["observed"].any())
+            valid_microbatches += int(backward_enabled)
             group_size = min(accumulation, len(loaders[0])-(batch_index//accumulation)*accumulation)
             if reconstruction_gradient != "sum":
                 from .gradient_balance import backward_reconstruction
@@ -582,10 +634,14 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
                 gradient_records.append(backward_reconstruction(scaler.scale(main/group_size),
                     scaler.scale(auxiliary/group_size), model.parameters(), gradient_ratio,
                     project_conflicts=reconstruction_gradient=="project"))
-            else:
+            elif backward_enabled:
                 scaler.scale(loss/group_size).backward()
             boundary = (batch_index+1)%accumulation==0 or batch_index+1==len(loaders[0])
-            if boundary:
+            if boundary and valid_microbatches:
+                if pb and model.stage == "B":
+                    for parameter in model.parameters():
+                        if parameter.grad is not None:
+                            parameter.grad.mul_(group_size/valid_microbatches)
                 scaler.unscale_(optimizer)
                 norm = torch.nn.utils.clip_grad_norm_(model.parameters(), settings.get("gradient_clip", 5), error_if_nonfinite=precision!="fp16")
                 old_scale = scaler.get_scale()
@@ -596,6 +652,8 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
                 update_ema(ema, model, epoch, ema_start, step_skipped)
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
+            if boundary:
+                valid_microbatches = 0
             n = len(batch["y"])
             online_targets.append(batch["y"].detach().cpu().numpy())
             online_probabilities.append(output["logits"].detach().float().sigmoid().cpu().numpy())
@@ -673,6 +731,8 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
                    "early_stopping_count": stale, "peak_cuda_memory_bytes": epoch_peak}
         if getattr(model, "esm_tail", None) is not None:
             history["esm_lr"] = optimizer.param_groups[1]["lr"]
+        if pb and model.stage == "C":
+            history["bridge_lr"] = optimizer.param_groups[-1]["lr"]
         if "metric_suite" in settings:
             history.update(metric_suite=suite, selection_key=list(key), best_selection_key=list(best_key),
                            selection_threshold=selection_threshold, selection_metrics=selection_report,
@@ -690,7 +750,8 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
             for key in ("cosine", "weighted_aux_main_ratio", "applied_aux_main_ratio"):
                 observed = [r[key] for r in valid if r[key] is not None]
                 history["reconstruction_gradient"]["mean_"+key] = sum(observed)/len(observed) if observed else None
-        scheduler.step()
+        if global_step > epoch_start_step:
+            scheduler.step()
         ema_checkpoint = {}
         if ema is not None:
             history.update(online_validation=online_report, online_validation_loss=online_loss,
@@ -835,12 +896,15 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
                           "scope": "same optimizer trajectory; stopping follows primary Validation, not an independent baseline training"})
         if device.type == "cuda":
             result['peak_cuda_memory_bytes'] = max(peak_memory, torch.cuda.max_memory_allocated(device))
-    if source.data.track in THERAPEP_TRACKS:
+    if source.data.track in (*THERAPEP_TRACKS, "rich48"):
         from .therapep import published_metrics
         result["therapep_validation"] = published_metrics(y, probabilities, threshold)
     result["elapsed_seconds"] = elapsed_before+time.perf_counter()-started
     write_json(run/"results.json.tmp", result)
     (run/"results.json.tmp").replace(run/"results.json")
+    if pb and model.stage == "C":
+        from .models.privilegedbridge import export_deployment
+        export_deployment(torch.load(run/"best.pt", map_location="cpu", weights_only=True), run/"deployment.pt")
     return result
 
 
@@ -858,9 +922,11 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
         if checkpoint["model_name"] != "trirelay" or not hasattr(model, "evidence_partition"):
             raise ValueError("Private evidence ablation requires a shared-private TriRelay checkpoint")
         model.private_evidence_enabled = False
-    source = MultimodalData(data_root, checkpoint["track"], checkpoint["statistics"])
+    sequence_only = checkpoint["model_name"] in ("termiscale", "motifspan")
+    source = MultimodalData(data_root, checkpoint["track"], checkpoint["statistics"], sequence_only=sequence_only)
     dataset = MultimodalPeptides(source, feature_root, split,
-                                  peptide_feature_root=peptide_feature_root or checkpoint["config"]["data"].get("peptide_features"))
+                                  peptide_feature_root=peptide_feature_root or checkpoint["config"]["data"].get("peptide_features"),
+                                  sequence_only=sequence_only or (checkpoint["model_name"] == "privilegedbridge" and model.stage == "A"))
     validate_cache(dataset, checkpoint["config"], checkpoint["encoder"])
     loader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_multimodal)
     y, probabilities = predict_loader(model, loader, device)
@@ -894,7 +960,7 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
             'threshold_refit': False}
     if decision is not None:
         result['decision'] = decision
-    if checkpoint["track"] in THERAPEP_TRACKS:
+    if checkpoint["track"] in (*THERAPEP_TRACKS, "rich48"):
         from .therapep import published_metrics
         result["therapep"] = published_metrics(y, probabilities, threshold)
     settings = checkpoint["config"]["train"]
@@ -934,7 +1000,10 @@ def predict_inputs(checkpoint_path, input_path, device="cpu", batch_size=32, dec
         for start in range(0, len(inputs["aa"]), batch_size):
             batch = {k: v[start:start+batch_size].to(device) for k, v in inputs.items()}
             probabilities.extend(model(batch)["logits"].sigmoid().cpu().tolist())
-    return prediction_records(checkpoint, probabilities, "provided_multimodal_fields", decision_path)
+    scope = "sequence_only" if checkpoint["model_name"] in ("termiscale", "motifspan", "privilegedbridge") else "provided_multimodal_fields"
+    if checkpoint["model_name"] == "privilegedbridge" and model.stage == "B":
+        scope = "provided_multimodal_fields"
+    return prediction_records(checkpoint, probabilities, scope, decision_path)
 
 
 def prediction_records(checkpoint, probabilities, scope, decision_path=None):
@@ -990,7 +1059,8 @@ def predict_sequences(checkpoint_path, sequences, device="cpu", decision_path=No
         inputs = prepare_inputs(raw, checkpoint["statistics"])
         with torch.inference_mode():
             probs = model(to_device(inputs, device))["logits"].sigmoid().cpu().tolist()
-        records = prediction_records(checkpoint, probs, "sequence_and_stereochemistry_only", decision_path)
+        scope = "sequence_only" if checkpoint["model_name"] in ("termiscale", "motifspan", "privilegedbridge") else "sequence_and_stereochemistry_only"
+        records = prediction_records(checkpoint, probs, scope, decision_path)
         for s, record in zip(selected, records):
             record["sequence"] = s
         output.extend(records)

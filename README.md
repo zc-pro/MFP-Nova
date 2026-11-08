@@ -1,10 +1,10 @@
 # MFP-Nova
 
-独立的治疗肽多标签预测科研项目。主数据 **`data/therapeutic_2025/`** 提供 `major15` 和 `fine39`；新增 `therapep49` 使用独立目录 **`data/therapep_ai/`** 中 TheraPep-AI 作者发布的 Train/Val/Test 与49维标签，作为同论文数据口径的补充比较。
+独立的治疗肽多标签预测科研项目。主数据 **[data/therapeutic_2025/](data/therapeutic_2025/README.md)** 提供 `major15` 和 `fine39`；新增 `therapep49` 使用独立目录 **`data/therapep_ai/`** 中 TheraPep-AI 作者发布的 Train/Val/Test 与49维标签，作为同论文数据口径的补充比较。
 
-项目统一维护五个研究模型：**TriRelay、GeoFactor、ProtoRoute、HelixSet、TheraSet**。前三模型已完成两任务各五 Seed 的首轮训练及独立 Test；HelixSet 原版、decay30、精简版、ESM尾部LoRA及早期取证方案均已完成major15/seed42 Train/Val。双表征R-Drop版已完成major15/seed42真实训练，传统最佳Val Acc64.96%/AT54.73%，AP候选Macro-AP58.43%。2026-10-26暂选此架构为汇报候选，准备fine39独立训练及两任务Test；实际Test尚未执行，命令见本文末节。TheraSet 于2026-10-28完成两任务seed42完整Train/Val：major15 Acc65.08%/AT54.51%，fine39 Acc59.58%/AT47.77%；复算与训练记录一致，尚无独立Test或多Seed结论，详见[实验记录](docs/experiment-history.md#2026-10-28theraset-两任务-seed42-正式-trainval-结果)。
+原五个研究模型为：**TriRelay、GeoFactor、ProtoRoute、HelixSet、TheraSet**。前三模型已完成两任务各五 Seed 的首轮训练及独立 Test；HelixSet 原版、decay30、精简版、ESM尾部LoRA及早期取证方案均已完成major15/seed42 Train/Val。双表征R-Drop版已完成major15/seed42真实训练，传统最佳Val Acc64.96%/AT54.73%，AP候选Macro-AP58.43%。2026-10-26暂选此架构为汇报候选，准备fine39独立训练及两任务Test；实际Test尚未执行，命令见本文末节。TheraSet 于2026-10-28完成两任务seed42完整Train/Val：major15 Acc65.08%/AT54.51%，fine39 Acc59.58%/AT47.77%；复算与训练记录一致，尚无独立Test或多Seed结论，详见[实验记录](docs/experiment-history.md#2026-10-28theraset-两任务-seed42-正式-trainval-结果)。
 
-## 五模型入口
+## 模型入口
 
 | 模型 | 源码 | 配置 | 主要机制 |
 |---|---|---|---|
@@ -13,10 +13,13 @@
 | ProtoRoute | [models/protoroute.py](src/mfp_nova/models/protoroute.py) | [protoroute.yaml](configs/protoroute.yaml) | 标签条件专家路由与多原型 |
 | HelixSet | [models/helixset.py](src/mfp_nova/models/helixset.py) | [helixset.yaml](configs/helixset.yaml) | 双冻结序列表征、理化/结构证据与完整残基对/潜变量/集合解码 |
 | TheraSet | [models/theraset.py](src/mfp_nova/models/theraset.py) | [theraset.yaml](configs/theraset.yaml) | TheraPep式两级CNN直接预测、共享多原型尺度/模态/pair读取与标签条件残差修正 |
+| TermiScale | [models/termiscale.py](src/mfp_nova/models/termiscale.py) | [termiscale.yaml](configs/termiscale.yaml) | 动态深度卷积及样本条件端点测度 |
+| MotifSpan | [models/motifspan.py](src/mfp_nova/models/motifspan.py) | [motifspan.yaml](configs/motifspan.yaml) | 单调软分段、有序关系压缩与中心化细节读取 |
+| PrivilegedBridge | [models/privilegedbridge.py](src/mfp_nova/models/privilegedbridge.py) | [privilegedbridge.yaml](configs/privilegedbridge.yaml) | 训练期模态Teacher、观察子集KD、序列Student部署 |
 
-五个模型共用 `research.py` 的训练、恢复、评价和推理流程，使用同一套数据加载与基础神经网络层。`sequence` 仍是独立的轻量对照基线。
+研究模型共用 `research.py` 的训练、恢复、评价和推理流程，使用同一套数据加载与基础神经网络层。`sequence` 仍是独立的轻量对照基线。
 
-- 单次训练：`mfp_nova.cli train --model` 支持上述五个名称，`--task` 选择 `major15/fine39/therapep49/therapep49_positive/therapep48`。
+- 单次训练：`mfp_nova.cli train --model` 支持上述八个名称，`--task` 选择 `major15/fine39/rich48/therapep49/therapep49_positive/therapep48`。
 - 评价与推理：统一使用 `evaluate`、`predict`、`summarize`。
 - 多 Seed：`mfp_nova.experiments` 与 `scripts/run_multiseed.ps1` 已纳入五模型；`all` 仍为五模型 × 原两任务 × 五 Seed，共 50 组候选任务。新基准通过 `--task therapep49` 显式选择。运行脚本才会执行。
 - GPU 诊断：`gpu-check --models` 支持五模型，HelixSet/TheraSet 的关键模块检查点已列入源码；本轮仅做本地 CPU 检查。
@@ -25,7 +28,68 @@
 
 原三模型的历史五 Seed 批量设置仍为 FP32、batch64、无累积；HelixSet 当前为 FP32、batch16 × 累积4、EMA0.999，启用R-Drop后仍为64条不同样本/更新。双表征单路训练实测7.76GiB/263秒每轮，R-Drop双路16×4实测7.78GiB/763秒每轮；fine39仍需检查显存。
 
+数据说明：[目录导航](data/therapeutic_2025/README.md) · [原处理指南](data/therapeutic_2025/docs/processing-guide.md) · [完整处理报告](data/therapeutic_2025/docs/therapeutic_2025_完整处理与前后对照报告.md) · [字段字典](data/therapeutic_2025/metadata/feature_dictionary.csv)。
+
+## 新三模型：实现状态与运行
+
+2026-11-08：三模型主配置已接入训练、恢复、评价和推理。验证包括CPU PyTorch2.4.1模型/梯度检查、短训练、PB阶段衔接/恢复/精简导出，以及真实fine39缓存、rich48样本的前后向；没有新模型的正式GPU性能成绩。主配置单650M+AA34，D/修饰扩展关闭；150M-F单路和双路支持输入维数接口。OT、结构摘要、共享隐桥和49维背景配对共同选模仍属于后续实验。
+
+fine39单650M主规格的下游参数：TermiScale 1,703,808；MotifSpan 1,466,811；PB A基座1,449,383，B可训练Teacher413,314，C可训练Student+桥1,548,201。rich48的PB部署部分为1,551,666。编码器冻结参数与提缓存成本另计。
+
+TermiScale/MotifSpan使用精简序列读取路径，不计算或传输未用的结构/515维字段。PB A仍拟合完整Train输入统计供B/C复用；阶段间用initialize-from，阶段内用resume。B基座固定且eval，C固定Teacher、可训练Student；C结束自动写deployment.pt，预测与选定best.pt一致，包含输入统计而不包含Teacher/参照副本。A/B/C分别按自己的实际输出由Val选模。
+
+以下命令均在对应设备的项目根目录执行，缓存须事先就绪。默认输出目录不覆盖；这段说明不会自动启动训练。更换rich48时，将task改为rich48，所有阶段的任务、名字和初始化路径一起对应修改；数据根目录自动设置，但须提供rich48缓存或显式指定已有作者全队列缓存。默认主配置有效batch64。
+
+RTX5070 / PowerShell（前台，保持终端打开）：
+
+```powershell
+conda activate MFP-Nova
+$env:OMP_NUM_THREADS = '6'
+$env:MKL_NUM_THREADS = '6'
+foreach ($model in @('termiscale', 'motifspan')) {
+    python -m mfp_nova.cli train --model $model --task fine39 --seed 42 --device cuda:0 --precision fp32 --batch-size 64 --accumulation-steps 1 --num-workers 0 --name "${model}_fine39_s42_main"
+    if ($LASTEXITCODE -ne 0) { throw "Training failed: $model" }
+}
+python -m mfp_nova.cli train --model privilegedbridge --stage A --task fine39 --seed 42 --device cuda:0 --precision fp32 --batch-size 64 --accumulation-steps 1 --num-workers 0 --name pb_fine39_s42_A
+if ($LASTEXITCODE -ne 0) { throw 'PB A failed' }
+python -m mfp_nova.cli train --model privilegedbridge --stage B --initialize-from runs/pb_fine39_s42_A/best.pt --task fine39 --seed 42 --device cuda:0 --precision fp32 --batch-size 64 --accumulation-steps 1 --num-workers 0 --name pb_fine39_s42_B
+if ($LASTEXITCODE -ne 0) { throw 'PB B failed' }
+python -m mfp_nova.cli train --model privilegedbridge --stage C --initialize-from runs/pb_fine39_s42_B/best.pt --task fine39 --seed 42 --device cuda:0 --precision fp32 --batch-size 64 --accumulation-steps 1 --num-workers 0 --name pb_fine39_s42_C
+if ($LASTEXITCODE -ne 0) { throw 'PB C failed' }
+```
+
+V100 / Bash（选择已分配GPU及CPU线程，关闭SSH后继续）：
+
+```bash
+conda activate MFP-Nova
+GPU=0
+CPU_THREADS=6
+mkdir -p runs
+nohup env CUDA_VISIBLE_DEVICES="$GPU" OMP_NUM_THREADS="$CPU_THREADS" MKL_NUM_THREADS="$CPU_THREADS" bash -c '
+set -e
+for model in termiscale motifspan; do
+  python -m mfp_nova.cli train --model "$model" --task fine39 --seed 42 --device cuda:0 --precision fp32 --batch-size 64 --accumulation-steps 1 --num-workers 2 --name "${model}_fine39_s42_main"
+done
+python -m mfp_nova.cli train --model privilegedbridge --stage A --task fine39 --seed 42 --device cuda:0 --precision fp32 --batch-size 64 --accumulation-steps 1 --num-workers 2 --name pb_fine39_s42_A
+python -m mfp_nova.cli train --model privilegedbridge --stage B --initialize-from runs/pb_fine39_s42_A/best.pt --task fine39 --seed 42 --device cuda:0 --precision fp32 --batch-size 64 --accumulation-steps 1 --num-workers 2 --name pb_fine39_s42_B
+python -m mfp_nova.cli train --model privilegedbridge --stage C --initialize-from runs/pb_fine39_s42_B/best.pt --task fine39 --seed 42 --device cuda:0 --precision fp32 --batch-size 64 --accumulation-steps 1 --num-workers 2 --name pb_fine39_s42_C
+' > runs/new_models_fine39_s42.log 2>&1 &
+echo "PID=$!; log=runs/new_models_fine39_s42.log"
+```
+
+这些是正式训练命令。短诊断在相同平台命令追加limit-samples、max-steps或epochs，并在只有2–3轮时显式将ema-start-epoch、rdrop-start-epoch、rdrop-ramp-epochs设为1，以覆盖正式双视图路径；诊断结果不用于性能比较。PB阶段内恢复省去initialize-from，保留stage并使用该阶段last.pt；需要原目录续训时同时指定resume-in-place和原name。主配置的fixed/conditional读取、固定分段/空间关系、Teacher类型与KD类型可通过各普通YAML中的明确开关做对照，不需要新模型副本。
+
 ## 项目结构
+
+`rich48` 位于 [data/therapeutic_2025/rich48/](data/therapeutic_2025/rich48/README.md)：保留作者55,655条正肽、48维功能标签及44,524/5,565/5,566的原始划分，通过精确骨架与自然/恢复来源类别对应原始非增强记录，补充可用结构和515维理化字段。原始输入保持只读，未匹配字段保留缺失。记录级对应关系见数据目录的 `records.csv`；它不认证化学实体完全一致，也不改变作者划分的相似簇交集。结构不是全部实验结构。
+
+构建命令（PowerShell与Bash相同，需在项目根目录、已安装项目的Python环境执行）：
+
+```text
+python -m mfp_nova.rich48 --author-root data/therapep_ai --source-root data/therapeutic_2025 --output data/therapeutic_2025/rich48
+```
+
+也可使用 `mfp-nova prepare-rich48`。输出目录已存在时不覆盖。现有训练入口可选择 `--task rich48`，读取真实多模态输入并仅在该任务Train拟合预处理；默认独立缓存目录为 `features/rich48/`。如已有完整作者队列的ESM缓存，可显式指定其路径，按保留的作者row_id/ID/序列读取正肽子集，无须复制大型缓存。根目录的Train/Val/Test CSV供48输出的序列baseline使用。
 
 ```text
 configs/                      # 五模型、序列基线及设备环境配置

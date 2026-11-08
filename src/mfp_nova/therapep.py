@@ -7,7 +7,6 @@ from collections import Counter
 from pathlib import Path
 
 import numpy as np
-import torch
 
 
 TRACK = "therapep49"
@@ -36,6 +35,17 @@ LABELS = [
 def configure_task(config, task):
     """Use separate inputs/caches for the explicit new task; keep custom paths."""
     config["data"]["track"] = task
+    if task == "rich48":
+        data = config["data"]
+        if data["root"] == "data/therapeutic_2025":
+            data["root"] = "data/therapeutic_2025/rich48"
+        for key in ("features", "peptide_features"):
+            if key in data and data[key].startswith("features/esm2_"):
+                data[key] = "features/rich48/" + Path(data[key]).name
+        data["augment"] = False
+        if "model_name" in config:
+            config.setdefault("train", {})["metric_suite"] = "micro_f1"
+        return
     if task not in TRACKS:
         return
     data = config["data"]
@@ -209,6 +219,7 @@ def init_multimodal(source, statistics, min_support, max_factors):
 
 
 def sequence_sample(data, i, esm):
+    import torch
     length = len(data.sequences[i])
     aa = torch.tensor(["ACDEFGHIKLMNPQRSTVWY".index(c)+1 for c in data.sequences[i]])
     quality = torch.zeros(3, 6)

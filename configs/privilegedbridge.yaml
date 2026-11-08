@@ -1,0 +1,47 @@
+# Main configuration; frozen single 650M and AA34.
+model_name: privilegedbridge
+data:
+  root: data/therapeutic_2025
+  track: fine39
+  features: features/esm2_650m
+  augment: false
+encoder:
+  name: facebook/esm2_t33_650M_UR50D
+  revision: 08e4846e537177426273712802403f7ba8261b6c
+  max_length: 80
+  batch_size: 8
+model:
+  dim: 192
+  dropout: 0.2
+  stage: A
+  teacher_mode: zero_reference
+  kd_mode: prediction
+  fixed_student: false
+loss:
+  unlabeled_weight: 0.3
+  rdrop: 0.1
+  kd: 0.2
+  branch: 0.2
+  residual_penalty: 0.001
+train:
+  device: cpu
+  seed: 42
+  epochs: 100
+  batch_size: 64
+  accumulation_steps: 1
+  precision: fp32
+  learning_rate: 0.0002
+  weight_decay: 0.01
+  patience: 15
+  warmup_epochs: 5
+  rdrop_start_epoch: 6
+  rdrop_ramp_epochs: 5
+  gradient_clip: 5
+  num_workers: 0
+  ema_decay: 0.999
+  ema_start_epoch: 6
+  metric_suite: traditional5
+  threshold_strategy: global
+  save_selection_candidates: true
+  export_validation_predictions: true
+  output: runs

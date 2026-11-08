@@ -74,7 +74,7 @@ def label_statistics(y, clusters, labels, min_support=20, max_factors=32):
 
 def function_projection(labels, track):
     """Independent-function groups. Antimicrobial is generic evidence, not another function."""
-    if track in THERAPEP_TRACKS:
+    if track in (*THERAPEP_TRACKS, "rich48"):
         # Published aliases and the global therapeutic flag do not define 15
         # independent functions; do not fabricate the major15 MFP projection.
         return None
@@ -110,12 +110,34 @@ def independent_functions(y, projection):
 
 
 class MultimodalData:
-    def __init__(self, root, track, statistics=None, min_support=20, max_factors=32):
+    def __init__(self, root, track, statistics=None, min_support=20, max_factors=32, sequence_only=False):
         self.data = PeptideData(root, track)
         self.root = Path(root)
+        self.sequence_only = sequence_only
         if track in THERAPEP_TRACKS:
             from .therapep import init_multimodal
             init_multimodal(self, statistics, min_support, max_factors)
+            return
+        if sequence_only:
+            with np.load(self.root/"arrays/sequences.npz", allow_pickle=False) as z:
+                self.seq = {"canonical_tokens": z["canonical_tokens"]}
+            # Row-level availability supports fair Val grouping without loading
+            # coordinates, node descriptors or per-sample geometry calculations.
+            with np.load(self.root/"arrays/structure_primary.npz", allow_pickle=False) as z:
+                self.struct = {"structure_available": z["structure_available"]}
+            train = self.data.indices("train")
+            if statistics is None:
+                labels = label_statistics(self.data.y[train], self.data.clusters[train], self.data.labels, min_support, max_factors)
+                labels.update(geometry_positive_clusters=[0]*len(self.data.labels), geometry_prototype_counts=[0]*len(self.data.labels))
+                statistics = {"phys": fit_numeric(np.empty((0, 515))), "nodes": fit_numeric(np.empty((0, 2))),
+                              "structure_global": fit_numeric(np.empty((0, 25))), "chemical_vocab": {}, "labels": labels,
+                              "function_projection": function_projection(self.data.labels, track),
+                              "dataset": json.loads((self.root/"manifest.json").read_text(encoding="utf-8"))["version_date"],
+                              "cohort": "sequence_only_original", "train_rows": len(train)}
+                statistics["phys"]["zero_missing"] = True
+            if statistics["labels"]["labels"] != self.data.labels:
+                raise ValueError("Checkpoint label order differs from data")
+            self.statistics = statistics
             return
         def read(path):
             with np.load(self.root/path, allow_pickle=False) as z:
@@ -163,7 +185,8 @@ class MultimodalData:
                           "labels": label_statistics(self.data.y[train], self.data.clusters[train], self.data.labels, min_support, max_factors),
                           "function_projection": function_projection(self.data.labels, track),
                           "dataset": json.loads((self.root/"manifest.json").read_text(encoding="utf-8"))["version_date"],
-                          "cohort": "original_resolved_backbone", "train_rows": len(train)}
+                          "cohort": ("rich48_author_positive_multimodal" if track == "rich48" else
+                                     "original_resolved_backbone"), "train_rows": len(train)}
             statistics["phys"]["zero_missing"] = True
             geometry_clusters = [len(set(self.data.clusters[train][(self.data.y[train, j]>0)&self.struct["structure_available"][train]]))
                                  for j in range(len(self.data.labels))]
@@ -192,6 +215,8 @@ class MultimodalData:
             raise ValueError("Auxiliary checkpoint label order differs from data")
 
     def sample(self, i, esm):
+        if self.sequence_only:
+            return sequence_inputs(self.data, i, esm)
         if self.data.track in THERAPEP_TRACKS:
             from .therapep import sequence_sample
             return sequence_sample(self.data, i, esm)
@@ -245,28 +270,50 @@ class MultimodalData:
         if self.data.track in THERAPEP_TRACKS:
             from .therapep import groups
             return groups(self.data, indices)
+        if self.sequence_only:
+            lengths = np.asarray([len(self.data.sequences[i]) for i in indices])
+            result = {"length_2_8": lengths <= 8, "length_9_16": (lengths > 8) & (lengths <= 16),
+                      "length_17_32": (lengths > 16) & (lengths <= 32), "length_33_plus": lengths > 32,
+                      "structure_present": self.struct["structure_available"][indices],
+                      "structure_missing": ~self.struct["structure_available"][indices]}
+            if self.statistics["function_projection"] is not None:
+                functions = independent_functions(targets, self.statistics["function_projection"])
+                result.update(single_function=functions.sum(1) == 1, multifunction=functions.sum(1) >= 2)
+            return result
         lengths = np.array([len(self.data.sequences[i]) for i in indices])
         stereo = self.data.d_mask[indices].copy()
         stereo &= self.seq["canonical_tokens"][indices] != 6  # G is achiral.
         q = self.struct["confidence_verified"][indices]
         finite = np.isfinite(q)
         means = np.nansum(q, 1)/np.maximum(finite.sum(1), 1)
-        functions = independent_functions(targets, self.statistics["function_projection"])
+        projection = self.statistics["function_projection"]
+        function_groups = {}
+        if projection is not None:
+            functions = independent_functions(targets, projection)
+            function_groups = {"single_function": functions.sum(1)==1, "multifunction": functions.sum(1)>=2}
         return {"structure_present": self.struct["structure_available"][indices],
                 "structure_missing": ~self.struct["structure_available"][indices],
                 "D_annotation": stereo.any(1), "L_only": ~stereo.any(1),
                 "length_2_8": lengths<=8, "length_9_16": (lengths>8)&(lengths<=16),
                 "length_17_32": (lengths>16)&(lengths<=32), "length_33_plus": lengths>32,
-                "single_function": functions.sum(1)==1, "multifunction": functions.sum(1)>=2,
+                **function_groups,
                 "confidence_unknown": ~finite.any(1), "confidence_known_lt70": finite.any(1)&(means<70),
                 "confidence_known_ge70": finite.any(1)&(means>=70),
                 **{f"source_{name}": np.array([self.source[i]==name for i in indices])
                    for name in sorted(set(self.source))}}
 
 
+def sequence_inputs(data, i, esm):
+    sequence = data.sequences[i]
+    return {"esm": torch.as_tensor(esm), "aa": torch.tensor(["ACDEFGHIKLMNPQRSTVWY".index(c.upper())+1 for c in sequence]),
+            "mask": torch.ones(len(sequence), dtype=torch.bool),
+            "y": torch.from_numpy(data.y[i].astype(np.float32)), "row_id": torch.tensor(int(data.rows[i]))}
+
+
 class MultimodalPeptides(Dataset):
-    def __init__(self, source, feature_root, split, limit=None, peptide_feature_root=None):
+    def __init__(self, source, feature_root, split, limit=None, peptide_feature_root=None, sequence_only=False):
         self.source = source
+        self.sequence_only = sequence_only
         self.cache = CachedPeptides(source.data, feature_root, split)
         self.indices = diagnostic_indices(source, self.cache.indices, limit, split=="train") if limit else self.cache.indices
         lookup = {int(i): j for j, i in enumerate(self.cache.indices)}
@@ -285,7 +332,7 @@ class MultimodalPeptides(Dataset):
     def __getitem__(self, index):
         esm, _ = self.cache[self.cache_indices[index]]
         i = int(self.indices[index])
-        sample = self.source.sample(i, esm)
+        sample = sequence_inputs(self.source.data, i, esm) if self.sequence_only else self.source.sample(i, esm)
         if self.peptide_cache is not None:
             peptide, _ = self.peptide_cache[self.cache_indices[index]]
             if peptide.shape[0] != esm.shape[0]:

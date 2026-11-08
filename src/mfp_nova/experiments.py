@@ -11,11 +11,12 @@ from pathlib import Path
 
 import yaml
 
-from .models import RESEARCH_MODELS
+from .models import RESEARCH_MODELS, LEGACY_MODELS
 from .data import TRACKS
 from .therapep import configure_task
 
-MODELS = RESEARCH_MODELS
+MODELS = LEGACY_MODELS  # Preserve the original default/all five-model sweep.
+SUPPORTED_MODELS = RESEARCH_MODELS
 TASKS = ("major15", "fine39")  # Keep the existing default/all comparison cohort.
 SEEDS = (42, 101, 202, 303, 404)
 PROJECT = Path(__file__).resolve().parents[2]
@@ -30,7 +31,7 @@ def training_settings(model, config=None, task=None):
         config = copy.deepcopy(config)
         configure_task(config, task)
     settings = config["train"]
-    return {"batch_size": settings["batch_size"] if model in ("helixset", "theraset") else 64,
+    return {"batch_size": settings["batch_size"] if model not in ("trirelay", "geofactor", "protoroute") else 64,
             "precision": settings.get("precision", "fp32"),
             "accumulation_steps": settings.get("accumulation_steps", 1),
             "metric_suite": settings.get("metric_suite", "task_specific"),
@@ -139,13 +140,17 @@ def compatibility_issues(metadata, result, directory, identity=None):
             issues.append("train.reconstruction_gradient differs from the fixed protocol")
         for key, value in {**fixed, **{k: expected["train"][k] for k in (
                            "epochs", "learning_rate", "weight_decay", "patience", "warmup_epochs",
-                           "aux_warmup_epochs", "gradient_clip")}}.items():
+                           "aux_warmup_epochs", "gradient_clip") if k in expected["train"]}}.items():
             actual = settings.get(key, defaults.get(key, value))
             if actual != value:
                 issues.append(f"train.{key} differs from {value}")
         if settings.get("limit_samples") or settings.get("max_steps") or config["data"].get("augment", False):
             issues.append("diagnostic/augmented training is not the original-row formal protocol")
-        cohort = "therapep_author_published_all49" if identity['task'] == 'therapep49' else "original_resolved_backbone"
+        task = identity["task"]
+        cohort = ("therapep_author_published_all49" if task == "therapep49" else
+                  task if task in ("therapep48", "therapep49_positive") else
+                  "sequence_only_original" if identity["model"] in ("termiscale", "motifspan") else
+                  "rich48_author_positive_multimodal" if task == "rich48" else "original_resolved_backbone")
         if metadata.get("cohort") not in (None, cohort):
             issues.append("training cohort differs")
     elif identity["model"] in ("helixset", "theraset"):
@@ -170,7 +175,7 @@ def discover_runs(root):
             if not match:
                 continue
             identity = {"model": match[1], "task": match[2], "seed": int(match[3])}
-        if identity.get("model") not in MODELS or identity.get("task") not in TRACKS:
+        if identity.get("model") not in SUPPORTED_MODELS or identity.get("task") not in TRACKS:
             continue
         if identity.get("diagnostic_subset"):
             continue
@@ -188,7 +193,7 @@ def discover_runs(root):
     return records
 
 
-def make_plan(root="runs", models=MODELS, tasks=TASKS, seeds=SEEDS, running=None):
+def make_plan(root="runs", models=LEGACY_MODELS, tasks=TASKS, seeds=SEEDS, running=None):
     records = discover_runs(root)
     running = live_training_runs() if running is None else running
     jobs = []
@@ -238,7 +243,7 @@ def make_plan(root="runs", models=MODELS, tasks=TASKS, seeds=SEEDS, running=None
 
 def summarize(plan, label=None, group=None):
     comparisons = []
-    for model in MODELS:
+    for model in SUPPORTED_MODELS:
         for task in TRACKS:
             jobs = [j for j in plan["jobs"] if j["model"]==model and j["task"]==task]
             if not jobs:
@@ -326,7 +331,7 @@ def print_summary(report):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("plan", "summary"))
-    parser.add_argument("--model", choices=("all", *MODELS), default="all")
+    parser.add_argument("--model", choices=("all", *SUPPORTED_MODELS), default="all")
     parser.add_argument("--task", choices=("all", *TRACKS), default="all")
     parser.add_argument("--seeds", default=",".join(map(str, SEEDS)))
     parser.add_argument("--runs-root", default="runs")
@@ -336,7 +341,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.label and args.group:
         parser.error("Choose --label or --group; group summaries do not duplicate per-label arrays")
-    plan = make_plan(args.runs_root, MODELS if args.model=="all" else (args.model,),
+    plan = make_plan(args.runs_root, LEGACY_MODELS if args.model=="all" else (args.model,),
                      TASKS if args.task=="all" else (args.task,), seed_list(args.seeds))
     result = plan if args.command=="plan" else summarize(plan, args.label, args.group)
     if args.json:
