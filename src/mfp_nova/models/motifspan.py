@@ -53,7 +53,7 @@ class MotifSpan(nn.Module):
     def __init__(self, input_dim, num_labels, vocab_size, statistics, dim=256, dropout=.2,
                  peptide_input_dim=0, cnn_channels=64, relation_dim=32, max_spans=8,
                  span_size=6, learned_spans=True, relation_mode="conserved", spatial=True,
-                 detail_mode="conditional"):
+                 detail_mode="conditional", global_only=False):
         super().__init__()
         if relation_mode not in ("conserved", "mean_product") or detail_mode not in ("conditional", "ordinary", "none"):
             raise ValueError("Unknown MotifSpan relation/detail mode")
@@ -61,6 +61,7 @@ class MotifSpan(nn.Module):
         self.max_spans, self.span_size = max_spans, span_size
         self.learned_spans, self.relation_mode = learned_spans, relation_mode
         self.spatial, self.detail_mode = spatial, detail_mode
+        self.global_only = global_only
         self.cnn = ResidueCNN(dropout, cnn_channels)
         self.features = FrozenFeatures(input_dim, dim, peptide_input_dim)
         self.cnn_projection = nn.Linear(4*cnn_channels, dim)
@@ -69,6 +70,8 @@ class MotifSpan(nn.Module):
         self.global_head = nn.Linear(dim, num_labels)
         with torch.no_grad():
             self.global_head.bias.copy_(prior_bias(statistics))
+        if self.global_only:
+            return
         self.velocity_conv = nn.Conv1d(dim, dim, 3, padding=1, groups=dim, bias=False)
         self.velocity_out = nn.Linear(dim, 1)
         nn.init.zeros_(self.velocity_out.weight)
@@ -163,6 +166,8 @@ class MotifSpan(nn.Module):
             h, u = h.float(), u.float()
             pooled = u.masked_fill(~mask[..., None], -torch.inf).amax(1)
             global_logits = self.global_head(self.global_projection(torch.cat([masked_mean(h, mask), pooled], -1)))
+            if self.global_only:
+                return {"logits": global_logits, "direct": global_logits} if return_evidence else {"logits": global_logits}
             regions, a, active, count, shape, mean_weights = self.regions(h, mask)
             score = torch.einsum("bkd,cd->bck", self.span_key(regions), self.query)/math.sqrt(self.dim)
             score = (score-count.float().log()[:, None, None]).masked_fill(~active[:, None], -torch.inf)

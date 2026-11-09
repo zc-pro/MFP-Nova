@@ -10,6 +10,18 @@ def small(**kwargs):
                      relation_dim=4, dropout=0., **kwargs)
 
 
+def test_global_control_matches_the_full_models_direct_readout_at_initialization():
+    batch = synthetic_batch(length=13)
+    torch.manual_seed(42)
+    full = small().eval()
+    torch.manual_seed(42)
+    control = small(global_only=True).eval()
+    torch.testing.assert_close(control(batch)["logits"], full(batch, return_evidence=True)["direct"],
+                               atol=0, rtol=0)
+    assert not hasattr(control, "velocity_conv") and not hasattr(control, "left")
+    assert not hasattr(control, "detail_query")
+
+
 def test_prefix_matches_explicit_values_and_gradients():
     torch.manual_seed(8)
     a = torch.randn(2, 5, 3, dtype=torch.double).softmax(-1).requires_grad_()

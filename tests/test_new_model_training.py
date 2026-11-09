@@ -24,11 +24,14 @@ def config(tmp_path, name, root, features):
     return c
 
 
-@pytest.mark.parametrize("name", ["termiscale", "motifspan"])
-def test_training_resume_and_evaluate(tmp_path, name):
+@pytest.mark.parametrize("name,model_options", [
+    ("termiscale", {}), ("motifspan", {}), ("motifspan", {"global_only": True}),
+], ids=["termiscale", "motifspan", "motifspan-global"])
+def test_training_resume_and_evaluate(tmp_path, name, model_options):
     torch.set_num_threads(1)
     root, features = multimodal_fixture(tmp_path)
     c = config(tmp_path, name, root, features)
+    c["model"].update(model_options)
     result = research.train(c, "first")
     assert result["epochs_completed"] == 1
     report = research.evaluate(tmp_path/"first/best.pt", root, features, "val", "cpu", tmp_path/"evaluation.json")
@@ -45,6 +48,11 @@ def test_training_resume_and_evaluate(tmp_path, name):
         different = copy.deepcopy(c)
         different["model"]["pooling"] = "uniform"
         with pytest.raises(ValueError, match="pooling differs"):
+            research.train(different, "wrong_control", resume=tmp_path/"first/last.pt")
+    if model_options.get("global_only"):
+        different = copy.deepcopy(c)
+        different["model"].pop("global_only")
+        with pytest.raises(ValueError, match="global-only mode differs"):
             research.train(different, "wrong_control", resume=tmp_path/"first/last.pt")
     c["train"]["epochs"] = 2
     continued = research.train(c, "continued", resume=tmp_path/"first/last.pt")

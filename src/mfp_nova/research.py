@@ -299,6 +299,9 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
             for key, default in (("routing", "content"), ("pooling", "conditional")):
                 if config["model"].get(key, default) != original["model"].get(key, default):
                     raise ValueError(f"TermiScale {key} differs from the resumed experiment; use its original switch")
+        if (config["model_name"] == "motifspan" and
+                config["model"].get("global_only", False) != original["model"].get("global_only", False)):
+            raise ValueError("MotifSpan global-only mode differs from the checkpoint; use its original switch")
         if pb and config["model"].get("stage", "A") != original["model"].get("stage", "A"):
             raise ValueError("PB phase changes require initialize_from, not resume")
         if ("lr_decay_epochs" in settings and settings["lr_decay_epochs"] !=

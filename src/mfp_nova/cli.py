@@ -52,6 +52,8 @@ def main(argv=None):
                              help="TermiScale: content+position, position-only, or equal scale weights")
             sub.add_argument("--termiscale-pooling", choices=("conditional", "fixed", "uniform"),
                              help="TermiScale: conditional endpoints, learned label-only endpoints, or uniform LME")
+            sub.add_argument("--motifspan-global-only", action="store_true",
+                             help="Train the MotifSpan backbone with its global head only")
             sub.add_argument("--resume-in-place", action="store_true", help="Research models: append to the same interrupted run")
             sub.add_argument("--stop-file", help="Research models: pause after a complete epoch when this file exists")
             sub.add_argument("--ablate", nargs="*", help="Model switches to disable, e.g. feedback high_order")
@@ -160,6 +162,10 @@ def main(argv=None):
                     value = getattr(args, "termiscale_"+key)
                     if value is not None:
                         config["model"][key] = value
+            if args.motifspan_global_only:
+                if args.model != "motifspan":
+                    raise ValueError("--motifspan-global-only requires --model motifspan")
+                config["model"]["global_only"] = True
             if args.stage is not None or args.initialize_from is not None:
                 if args.model != "privilegedbridge":
                     raise ValueError("stage/initialize-from are PrivilegedBridge options")

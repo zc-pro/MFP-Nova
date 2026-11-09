@@ -116,6 +116,36 @@ echo "PID=$!; log=runs/candidate_followup_fine39_$stamp.log"
 
 父日志显示执行进度，逐epoch日志见 `runs/motifspan_fine39_seed42_motifspan_followup.log` 及 `runs/termiscale_fine39_seed42_{uniform_pool,no_condition,uniform_scales}_followup.log`。只运行第一组可追加 `--jobs motifspan`。相同命令再次执行会跳过本脚本命名目录中已有results.json的实验，从中断实验的last.pt原地续训；不要同时启动两份相同任务/seed的队列。手动续训TermiScale对照时也须保留对应routing/pooling开关，防止恢复成另一实验。
 
+### MotifSpan 同输入全局读出对照
+
+`--motifspan-global-only` 复用主实验的 AA34 CNN、650M 残基缓存及融合层，只用 CNN 最大池化与融合序列均值的全局分类头。此配置从 seed 42 独立训练，保留主实验的输入、损失、优化和 Val 选模协议。与 `motifspan_fine39_seed42_motifspan_followup` 比较同一主候选的 Jaccard、AT、Macro-AP、多功能检测 F1 和运行开销，可检验分段、关系与细节分支的整体增益。
+
+RTX5070 / PowerShell（项目根目录，前台）
+
+```powershell
+conda activate MFP-Nova
+$env:OMP_NUM_THREADS = '6'
+$env:MKL_NUM_THREADS = '6'
+python -u -m mfp_nova.cli train --model motifspan --motifspan-global-only --task fine39 --seed 42 --device cuda:0 --num-workers 0 --name motifspan_fine39_seed42_global_only
+```
+
+V100 / Bash（项目根目录，后台）
+
+```bash
+conda activate MFP-Nova
+GPU=1
+CPU_THREADS=6
+run=motifspan_fine39_seed42_global_only
+mkdir -p runs
+nohup env CUDA_VISIBLE_DEVICES="$GPU" OMP_NUM_THREADS="$CPU_THREADS" MKL_NUM_THREADS="$CPU_THREADS" \
+  python -u -m mfp_nova.cli train --model motifspan --motifspan-global-only \
+  --task fine39 --seed 42 --device cuda:0 --num-workers 2 --name "$run" \
+  > "runs/$run.log" 2>&1 < /dev/null &
+echo "PID=$! 日志：runs/$run.log"
+```
+
+续训时保留 `--motifspan-global-only`，追加 `--resume runs/motifspan_fine39_seed42_global_only/last.pt --resume-in-place`。与 V100 上已完成的主实验比较训练开销时，在同一台 V100 上运行对照。
+
 ## 项目结构
 
 `rich48` 位于 [data/therapeutic_2025/rich48/](data/therapeutic_2025/rich48/README.md)：保留作者55,655条正肽、48维功能标签及44,524/5,565/5,566的原始划分，通过精确骨架与自然/恢复来源类别对应原始非增强记录，补充可用结构和515维理化字段。原始输入保持只读，未匹配字段保留缺失。记录级对应关系见数据目录的 `records.csv`；它不认证化学实体完全一致，也不改变作者划分的相似簇交集。结构不是全部实验结构。
