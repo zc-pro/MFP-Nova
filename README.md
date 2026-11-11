@@ -20,6 +20,8 @@
 
 如有独立审核数据，传 `--annotations path/to/observations.npz`。用 `row_id [N]` 和任务顺序的 `label_names [C]` 对齐，`observed [N,C]` 标记可靠位，`Y [N,C]` 可提供修订后的标签值。`audited [N,C]` 标记可核实的观测状态，其中 `audited=1, observed=0` 表示有记录支持的未测，`source_id [N]` 提供来源。H3 可接收 `partial_ignorable [N]` 以标记有证据支持可忽略缺失的样本。`ID [N]` 可用于核对身份。`group_id [N]` 可提供覆盖全部样本的审核同源组，原始划分成员仍按发布版读取。
 
+`fine39` 双菌株训练标注通过 Git LFS 同步。拉取代码后运行 `git lfs pull --include=runs/analysis/gram_mic_panel/fine39_two_strain_train_annotations.npz`。H1、H2、H5 的面板实验使用该文件作为 `--annotations` 并设 `--unlabeled-weight 0`。其中 `anti_gram+` 和 `anti_gram_` 对应金黄色葡萄球菌 ATCC 25923 和大肠杆菌 ATCC 25922 的 35 条 Train 配对 MIC 记录。面板适用于探索性训练，原 Validation 和 Test 仍需补齐同口径测定。
+
 以下命令在项目根目录运行 B0 和 H6 的首轮弱监督实验。更换任务时同步更改两个运行名称及初始化路径。H1–H5 也可通过 `--initialize-from` 复用对应 B0。H2、H5、H7、H8 可通过 `--fold-dir` 复用相同任务、种子和训练设置的折内 B0。配置中可指定 `prototype_mode`、`gate_mode`、`pair_mode`、`joint_mode`、`evidence_selection`、`distillation_mode`、`observation_mode` 运行机制对照。
 
 RTX 5070 / PowerShell：
