@@ -76,11 +76,16 @@ class FunctionalQuery(nn.Module):
 
 
 class SequenceBackbone(nn.Module):
-    def __init__(self, num_labels, dim=192, heads=6, depth=4, dropout=.1, relative_clip=64):
+    def __init__(self, num_labels, dim=192, heads=6, depth=4, dropout=.1, relative_clip=64,
+                 residue_features=None):
         super().__init__()
         self.num_labels = num_labels
         self.dim = dim
-        self.embedding = nn.Embedding(22, dim, padding_idx=0)
+        if residue_features is None:
+            self.embedding = nn.Embedding(22, dim, padding_idx=0)
+        else:
+            self.embedding = nn.Sequential(nn.Embedding.from_pretrained(residue_features, padding_idx=0),
+                                           nn.Linear(residue_features.shape[1], dim))
         self.local_norm = nn.LayerNorm(dim)
         self.local_paths = nn.ModuleList(nn.Conv1d(dim, dim, kernel, padding=kernel // 2, groups=dim)
                                          for kernel in (3, 7))

@@ -61,6 +61,8 @@ def main(argv=None):
                              help="TermiScale: conditional endpoints, learned label-only endpoints, or uniform LME")
             sub.add_argument("--motifspan-global-only", action="store_true",
                              help="Train the MotifSpan backbone with its global head only")
+            sub.add_argument("--theraset-b0-backbone", action="store_true",
+                             help="Compare the B0 backbone under the pure AA34 TheraSet training protocol")
             sub.add_argument("--resume-in-place", action="store_true", help="Research models: append to the same interrupted run")
             sub.add_argument("--stop-file", help="Research models: pause after a complete epoch when this file exists")
             sub.add_argument("--ablate", nargs="*", help="Model switches to disable, e.g. feedback high_order")
@@ -160,6 +162,8 @@ def main(argv=None):
         write_json(args.output, result)
         print(json.dumps({"original_rows": result["original_rows"], "tracks": result["tracks"]}, ensure_ascii=False, indent=2))
     elif args.command == "train" and args.model in HYPOTHESIS_MODELS:
+        if args.theraset_b0_backbone:
+            parser.error("--theraset-b0-backbone requires --model theraset")
         from .hypothesis import train_from_cli
         config = yaml.safe_load(Path(args.config or "configs/b0.yaml").read_text(encoding="utf-8"))
         train_from_cli(args, config)
@@ -168,6 +172,10 @@ def main(argv=None):
         config_path = args.config or f"configs/{model_name}.yaml"
         config = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
         if args.command == "train":
+            if args.theraset_b0_backbone:
+                if args.model != "theraset":
+                    parser.error("--theraset-b0-backbone requires --model theraset")
+                config["model"].update(b0_backbone=True, evidence_decoder=False, chemical_evidence=False)
             if args.termiscale_routing is not None or args.termiscale_pooling is not None:
                 if args.model != "termiscale":
                     raise ValueError("TermiScale routing/pooling options require --model termiscale")

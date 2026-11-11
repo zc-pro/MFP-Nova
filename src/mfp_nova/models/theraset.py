@@ -173,17 +173,26 @@ class TheraSet(nn.Module):
                  prototype_bank=32, peptide_input_dim=0, evidence_decoder=True,
                  contextual_evidence=True, property_evidence=True, structure_evidence=True,
                  chemical_evidence=True, pair_readout=True, prototype_readout=True,
-                 label_context=True):
+                 label_context=True, b0_backbone=False):
         super().__init__()
         self.statistics = statistics
         self.evidence_decoder = evidence_decoder
         self.contextual_evidence, self.property_evidence = contextual_evidence, property_evidence
         self.structure_evidence, self.chemical_evidence = structure_evidence, chemical_evidence
         self.pair_readout, self.prototype_readout, self.label_context = pair_readout, prototype_readout, label_context
+        prior = torch.tensor(statistics["observed_prior"]).clamp(1e-4, 1-1e-4).logit()
+        self.b0_backbone = None
+        if b0_backbone:
+            if evidence_decoder or chemical_evidence:
+                raise ValueError("The B0 backbone comparison requires the pure AA34 ablation")
+            from .hypothesis_backbone import SequenceBackbone
+            self.b0_backbone = SequenceBackbone(num_labels, dropout=dropout, residue_features=residue_encoding())
+            with torch.no_grad():
+                self.b0_backbone.label_bias.copy_(prior)
+            return
         self.cnn = MotifCNN(vocab_size, cnn_channels, dropout, chemical_evidence)
         self.direct = nn.Sequential(nn.Linear(4*cnn_channels, 1024), nn.GELU(), nn.Dropout(dropout),
                                     nn.Linear(1024, 512), nn.GELU(), nn.Dropout(dropout), nn.Linear(512, num_labels))
-        prior = torch.tensor(statistics["observed_prior"]).clamp(1e-4, 1-1e-4).logit()
         with torch.no_grad():
             self.direct[-1].bias.copy_(prior)
         if not evidence_decoder:
@@ -216,6 +225,9 @@ class TheraSet(nn.Module):
         nn.init.constant_(self.correction_gate.bias, -2.)
 
     def forward(self, batch, return_evidence=False):
+        if self.b0_backbone is not None:
+            logits = self.b0_backbone(batch["aa"], batch["mask"]).logits
+            return {"logits": logits, "direct": logits}
         maps, pooled = self.cnn(batch)
         direct = self.direct(pooled)
         if not self.evidence_decoder:
