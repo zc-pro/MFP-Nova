@@ -77,7 +77,7 @@ class FunctionalQuery(nn.Module):
 
 class SequenceBackbone(nn.Module):
     def __init__(self, num_labels, dim=192, heads=6, depth=4, dropout=.1, relative_clip=64,
-                 residue_features=None):
+                 residue_features=None, local_max_pool=False):
         super().__init__()
         self.num_labels = num_labels
         self.dim = dim
@@ -93,7 +93,7 @@ class SequenceBackbone(nn.Module):
         self.local_gate = nn.Linear(dim, dim)
         self.encoder = nn.ModuleList(RelativeEncoderLayer(dim, heads, dropout, relative_clip) for _ in range(depth))
         self.context_norm = nn.LayerNorm(dim)
-        self.local_query = FunctionalQuery(num_labels, dim, heads)
+        self.local_query = None if local_max_pool else FunctionalQuery(num_labels, dim, heads)
         self.global_query = FunctionalQuery(num_labels, dim, heads)
         self.evidence = nn.Sequential(nn.Linear(2 * dim, dim), nn.GELU(), nn.LayerNorm(dim))
         self.label_weight = nn.Parameter(torch.empty(num_labels, dim))
@@ -114,12 +114,17 @@ class SequenceBackbone(nn.Module):
         for layer in self.encoder:
             contextual = layer(contextual, mask, distance)
         contextual = self.context_norm(contextual).masked_fill(~mask3, 0.)
-        left, local_attention = self.local_query(local, mask, return_attention)
+        if self.local_query is None:
+            pooled = local.masked_fill(~mask3, -torch.inf).amax(1)
+            left = pooled[:, None, :].expand(-1, self.num_labels, -1)
+            local_attention = None
+        else:
+            left, local_attention = self.local_query(local, mask, return_attention)
         right, global_attention = self.global_query(contextual, mask, return_attention)
         evidence = self.evidence(torch.cat([left, right], dim=-1))
         logits = (evidence * self.label_weight).sum(dim=-1) + self.label_bias
         mean = contextual.sum(1) / mask.sum(1, keepdim=True)
         maximum = contextual.masked_fill(~mask3, -torch.inf).amax(1)
         summary = F.layer_norm((mean + maximum) * .5, (self.dim,))
-        attention = (local_attention, global_attention) if return_attention else None
+        attention = (local_attention, global_attention) if local_attention is not None else None
         return BackboneOutput(local, contextual, evidence, summary, logits, attention)

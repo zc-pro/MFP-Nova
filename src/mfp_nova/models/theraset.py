@@ -173,7 +173,7 @@ class TheraSet(nn.Module):
                  prototype_bank=32, peptide_input_dim=0, evidence_decoder=True,
                  contextual_evidence=True, property_evidence=True, structure_evidence=True,
                  chemical_evidence=True, pair_readout=True, prototype_readout=True,
-                 label_context=True, b0_backbone=False):
+                 label_context=True, b0_backbone=False, b0_local_max=False):
         super().__init__()
         self.statistics = statistics
         self.evidence_decoder = evidence_decoder
@@ -186,7 +186,8 @@ class TheraSet(nn.Module):
             if evidence_decoder or chemical_evidence:
                 raise ValueError("The B0 backbone comparison requires the pure AA34 ablation")
             from .hypothesis_backbone import SequenceBackbone
-            self.b0_backbone = SequenceBackbone(num_labels, dropout=dropout, residue_features=residue_encoding())
+            self.b0_backbone = SequenceBackbone(num_labels, dropout=dropout, residue_features=residue_encoding(),
+                                                local_max_pool=b0_local_max)
             with torch.no_grad():
                 self.b0_backbone.label_bias.copy_(prior)
             return

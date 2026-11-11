@@ -54,6 +54,8 @@ python -u -m mfp_nova.cli train --model h6 --task major15 --seed 42 --device cud
 
 比较 B0 与旧纯 CNN 时，先用 `scripts/compare_b0_threshold.py` 对已有 B0 运行目录按 `traditional5` 全局阈值重算 Validation Jaccard。骨干对照使用同一 `--model theraset` 训练入口和原划分，CNN 用 `--ablate evidence_decoder chemical_evidence`，B0 用 `--theraset-b0-backbone`。两者只消费 AA34，复用 TheraSet 数据加载和 ASL、R-Drop、EMA、Validation 选模。训练记录中的 `model.b0_backbone` 区分 B0 对照。
 
+检验局部读出时，用 `--theraset-b0-local-max` 替换 `--theraset-b0-backbone`。它对有效残基的局部卷积特征逐通道取最大值，并把同一个局部向量与各标签的全局查询结果融合。
+
 ## 历史研究
 
 独立的治疗肽多标签预测科研项目。主数据 **[data/therapeutic_2025/](data/therapeutic_2025/README.md)** 提供 `major15` 和 `fine39`；新增 `therapep49` 使用独立目录 **`data/therapep_ai/`** 中 TheraPep-AI 作者发布的 Train/Val/Test 与49维标签，作为同论文数据口径的补充比较。
