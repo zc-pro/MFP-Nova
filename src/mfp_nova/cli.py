@@ -5,6 +5,7 @@ from pathlib import Path
 import yaml
 
 from .models import RESEARCH_MODELS, LEGACY_MODELS
+from .models.hypotheses import MODELS as HYPOTHESIS_MODELS
 from .data import TRACKS
 from .therapep import TRACKS as THERAPEP_TRACKS
 
@@ -41,13 +42,19 @@ def main(argv=None):
             sub.add_argument("--resume-from", type=int, default=0,
                              help="Completed rows in the first split, from the interrupted extraction log")
         else:
-            sub.add_argument("--model", choices=("sequence", *RESEARCH_MODELS), default="sequence")
+            sub.add_argument("--model", choices=("sequence", *HYPOTHESIS_MODELS, *RESEARCH_MODELS), default="sequence")
             sub.add_argument("--metric-suite", choices=("traditional5", "task_specific", "micro_f1"),
                              help="Research models: primary report and checkpoint selection protocol")
             sub.add_argument("--task", choices=TRACKS, help="Alias for --track")
             sub.add_argument("--resume", help="last.pt with optimizer and RNG state; creates a new run")
             sub.add_argument("--stage", choices=("A", "B", "C"), help="PrivilegedBridge training phase")
-            sub.add_argument("--initialize-from", help="Selected preceding PrivilegedBridge phase checkpoint")
+            sub.add_argument("--initialize-from", help="B0 checkpoint for H1–H6, or preceding PrivilegedBridge phase")
+            sub.add_argument("--annotations", help="B0/H1–H8: aligned NPZ of confirmed label and observation states")
+            sub.add_argument("--unlabeled-weight", type=float, help="Sequence study: optional weak BCE weight for unannotated zero bits")
+            sub.add_argument("--fold-dir", help="Sequence study: share training-only B0 fold checkpoints")
+            sub.add_argument("--head-epochs", type=int, help="Sequence study: frozen head training epochs")
+            sub.add_argument("--finetune-epochs", type=int, help="Sequence study: H4/H6 backbone fine-tuning epochs")
+            sub.add_argument("--evidence-selection", choices=("attention", "random", "none"), help="H6 residue mask control")
             sub.add_argument("--termiscale-routing", choices=("content", "position", "uniform"),
                              help="TermiScale: content+position, position-only, or equal scale weights")
             sub.add_argument("--termiscale-pooling", choices=("conditional", "fixed", "uniform"),
@@ -104,6 +111,8 @@ def main(argv=None):
     evaluate.add_argument("--output", required=True)
     evaluate.add_argument("--batch-size", type=int)
     evaluate.add_argument("--predictions", help="Optional aligned sample probabilities in NPZ format")
+    evaluate.add_argument("--annotations", help="Sequence study: aligned annotation NPZ for evaluation")
+    evaluate.add_argument("--evidence-diagnostics", action="store_true", help="H6: run keep/delete and matched random controls")
     evaluate.add_argument("--decision", help="Validation-fitted research-model decision.json; raw ranking scores stay unchanged")
     evaluate.add_argument("--without-private-evidence", action="store_true",
                           help="Shared-private TriRelay: use shared evidence alone in both reads, retaining weights and saved threshold")
@@ -150,6 +159,10 @@ def main(argv=None):
         Path(args.output).parent.mkdir(parents=True, exist_ok=True)
         write_json(args.output, result)
         print(json.dumps({"original_rows": result["original_rows"], "tracks": result["tracks"]}, ensure_ascii=False, indent=2))
+    elif args.command == "train" and args.model in HYPOTHESIS_MODELS:
+        from .hypothesis import train_from_cli
+        config = yaml.safe_load(Path(args.config or "configs/b0.yaml").read_text(encoding="utf-8"))
+        train_from_cli(args, config)
     elif args.command in ("features", "train"):
         model_name = args.model if args.command == "train" else "sequence"
         config_path = args.config or f"configs/{model_name}.yaml"
@@ -313,6 +326,16 @@ def main(argv=None):
     elif args.command == "evaluate":
         import torch
         checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
+        if checkpoint.get("model_name") in HYPOTHESIS_MODELS:
+            from .hypothesis import evaluate
+            if args.decision or args.feature_root or args.peptide_feature_root or args.without_private_evidence:
+                parser.error("B0/H1–H8 evaluate raw sequences with the checkpoint's saved decision rule")
+            if args.evidence_diagnostics and checkpoint["model_name"] != "h6":
+                parser.error("--evidence-diagnostics requires an H6 checkpoint")
+            evaluate(checkpoint, args.device, args.split, args.output, data_root=args.data_root,
+                     annotations=args.annotations, batch_size=args.batch_size, predictions=args.predictions,
+                     diagnostics=args.evidence_diagnostics)
+            return
         if args.without_private_evidence and "model_name" not in checkpoint:
             raise ValueError("Private evidence ablation requires a shared-private TriRelay checkpoint")
         if "model_name" in checkpoint:
@@ -362,15 +385,21 @@ def main(argv=None):
         else:
             import torch
             checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
-            if "model_name" in checkpoint:
-                from .research import predict_sequences
-            else:
-                if args.decision:
-                    raise ValueError("Function decisions are supported for research models")
-                from .inference import predict_sequences
             sequences = [line.strip() for line in Path(args.sequences).read_text(encoding="utf-8").splitlines() if line.strip()]
-            extra = {'decision_path': args.decision} if args.decision else {}
-            result = predict_sequences(args.checkpoint, sequences, args.device, **extra)
+            if checkpoint.get("model_name") in HYPOTHESIS_MODELS:
+                from .hypothesis import predict
+                if args.decision:
+                    parser.error("B0/H1–H8 predict with the checkpoint's saved decision rule")
+                result = predict(checkpoint, sequences, args.device)
+            else:
+                if "model_name" in checkpoint:
+                    from .research import predict_sequences
+                else:
+                    if args.decision:
+                        raise ValueError("Function decisions are supported for research models")
+                    from .inference import predict_sequences
+                extra = {'decision_path': args.decision} if args.decision else {}
+                result = predict_sequences(args.checkpoint, sequences, args.device, **extra)
         destination = Path(args.output)
         destination.parent.mkdir(parents=True, exist_ok=True)
         with destination.open("x", encoding="utf-8") as f:

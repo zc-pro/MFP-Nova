@@ -1,5 +1,57 @@
 # MFP-Nova
 
+## 当前研究 · B0 与 H1–H8
+
+新一轮研究依据本地调研包中的《H1–H8 序列多标签模型架构设计书》。九个模型共用从头训练的原始序列骨干，支持 `major15`、`fine39`、`rich48` 三套现有标签表和原始 Train／Validation／Test 成员，默认保留全长、只用原样本。Train 内优先复用已有同源折，`rich48` 默认按原有精确序列组分折。整套 Validation 用来校准并报告结果，Test 独立评估。历史研究命令和实验记录见后文。
+
+| `--model` | 机制 |
+|---|---|
+| `b0` | 双尺度残基卷积、相对位置 Transformer、局部和全局逐标签查询 |
+| `h1` | 排除本样本同源折的跨背景原型 |
+| `h2` | 由折外单边收益监督的有向标签消息 |
+| `h3` | 标签数量分布、条件集合似然和 GFM 解码 |
+| `h4` | 背景匹配排序与独立的判定残差头 |
+| `h5` | 基于折外错例选择的四状态功能对 |
+| `h6` | 原坐标保留、删除和重编码，含同区间随机遮蔽对照 |
+| `h7` | 带拒绝选项的两教师逐标签折外蒸馏 |
+| `h8` | 按来源与标签拟合折外观测概率，做逆概率加权 |
+
+共享配置为 [`configs/b0.yaml`](configs/b0.yaml)。默认仅对可靠位计算 BCE。当前数据里的 `0` 是未标注位，三个任务的迁移文件均缺少逐标签确证阴性和完整测定记录。缺少支持的机制会在 `results.json` 标明原因。现有数据上可以用 `--unlabeled-weight 0.3` 做弱监督基线或 H6 实验，该权重仅用于优化中的代理负例，原始未标注位仍为未知，也不会生成数量、原型、功能对或观测训练资产。`rich48` 保留作者划分，其精确序列组无法保证相似肽同源隔离。
+
+如有独立审核数据，传 `--annotations path/to/observations.npz`。用 `row_id [N]` 和任务顺序的 `label_names [C]` 对齐，`observed [N,C]` 标记可靠位，`Y [N,C]` 可提供修订后的标签值。`audited [N,C]` 标记可核实的观测状态，其中 `audited=1, observed=0` 表示有记录支持的未测，`source_id [N]` 提供来源。H3 可接收 `partial_ignorable [N]` 以标记有证据支持可忽略缺失的样本。`ID [N]` 可用于核对身份。`group_id [N]` 可提供覆盖全部样本的审核同源组，原始划分成员仍按发布版读取。
+
+以下命令在项目根目录运行 B0 和 H6 的首轮弱监督实验。更换任务时同步更改两个运行名称及初始化路径。H1–H5 也可通过 `--initialize-from` 复用对应 B0。H2、H5、H7、H8 可通过 `--fold-dir` 复用相同任务、种子和训练设置的折内 B0。配置中可指定 `prototype_mode`、`gate_mode`、`pair_mode`、`joint_mode`、`evidence_selection`、`distillation_mode`、`observation_mode` 运行机制对照。
+
+RTX 5070 / PowerShell：
+
+```powershell
+conda activate MFP-Nova
+$env:OMP_NUM_THREADS = '6'
+$env:MKL_NUM_THREADS = '6'
+python -u -m mfp_nova.cli train --model b0 --task major15 --seed 42 --device cuda:0 --precision fp16 --unlabeled-weight 0.3 --name b0_major15_s42_weak
+if ($LASTEXITCODE -eq 0) {
+    python -u -m mfp_nova.cli train --model h6 --task major15 --seed 42 --device cuda:0 --precision fp16 --unlabeled-weight 0.3 --name h6_major15_s42_weak --initialize-from runs/b0_major15_s42_weak/final.pt
+}
+```
+
+V100 / Bash（GPU 编号按实际分配填写，关闭 SSH 后继续）：
+
+```bash
+conda activate MFP-Nova
+GPU=0
+CPU_THREADS=6
+mkdir -p runs
+nohup env CUDA_VISIBLE_DEVICES="$GPU" OMP_NUM_THREADS="$CPU_THREADS" MKL_NUM_THREADS="$CPU_THREADS" bash -c '
+set -e
+python -u -m mfp_nova.cli train --model b0 --task major15 --seed 42 --device cuda:0 --precision fp16 --unlabeled-weight 0.3 --name b0_major15_s42_weak
+python -u -m mfp_nova.cli train --model h6 --task major15 --seed 42 --device cuda:0 --precision fp16 --unlabeled-weight 0.3 --name h6_major15_s42_weak --initialize-from runs/b0_major15_s42_weak/final.pt
+' > runs/b0_h6_major15_s42.log 2>&1 < /dev/null &
+```
+
+每次运行保存 `final.pt`、`results.json` 和带 `row_id` 的 `validation_predictions.npz`。`evaluate --checkpoint ... --split test --output ...` 复用已保存的判定规则。`predict --checkpoint ... --sequences ... --output ...` 读取每行一条序列并输出排序分数、判定分数和标签集合，允许空集。H6 可在评估时追加 `--evidence-diagnostics`。
+
+## 历史研究
+
 独立的治疗肽多标签预测科研项目。主数据 **[data/therapeutic_2025/](data/therapeutic_2025/README.md)** 提供 `major15` 和 `fine39`；新增 `therapep49` 使用独立目录 **`data/therapep_ai/`** 中 TheraPep-AI 作者发布的 Train/Val/Test 与49维标签，作为同论文数据口径的补充比较。
 
 原五个研究模型为：**TriRelay、GeoFactor、ProtoRoute、HelixSet、TheraSet**。前三模型已完成两任务各五 Seed 的首轮训练及独立 Test；HelixSet 原版、decay30、精简版、ESM尾部LoRA及早期取证方案均已完成major15/seed42 Train/Val。双表征R-Drop版已完成major15/seed42真实训练，传统最佳Val Acc64.96%/AT54.73%，AP候选Macro-AP58.43%。2026-10-26暂选此架构为汇报候选，准备fine39独立训练及两任务Test；实际Test尚未执行，命令见本文末节。TheraSet 于2026-10-28完成两任务seed42完整Train/Val：major15 Acc65.08%/AT54.51%，fine39 Acc59.58%/AT47.77%；复算与训练记录一致，尚无独立Test或多Seed结论，详见[实验记录](docs/experiment-history.md#2026-10-28theraset-两任务-seed42-正式-trainval-结果)。
