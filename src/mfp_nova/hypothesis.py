@@ -93,6 +93,7 @@ def train(config, name, initialize_from=None):
     session = SequenceTraining(config, data, train_rows, run=run)
     started = time.perf_counter()
     if session.device.type == "cuda":
+        torch.cuda.init()
         torch.cuda.reset_peak_memory_stats(session.device)
     negative = data.observed[train_rows] & ~data.targets[train_rows].astype(bool)
     print(f"{model_name.upper()} {data.track} | Train={len(train_rows)} Validation={len(validation_rows)} "
