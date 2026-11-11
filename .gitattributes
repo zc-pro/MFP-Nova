@@ -1,2 +1,2 @@
 *.sh text eol=lf
-/runs/analysis/gram_mic_panel/fine39_two_strain_train_annotations.npz filter=lfs diff=lfs merge=lfs -text
+/annotations/fine39_two_strain_train_annotations.npz filter=lfs diff=lfs merge=lfs -text
