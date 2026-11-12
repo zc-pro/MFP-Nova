@@ -110,10 +110,12 @@ def independent_functions(y, projection):
 
 
 class MultimodalData:
-    def __init__(self, root, track, statistics=None, min_support=20, max_factors=32, sequence_only=False):
+    def __init__(self, root, track, statistics=None, min_support=20, max_factors=32, sequence_only=False,
+                 sequence_chemistry=False):
         self.data = PeptideData(root, track)
         self.root = Path(root)
         self.sequence_only = sequence_only
+        self.sequence_chemistry = sequence_chemistry
         if track in THERAPEP_TRACKS:
             from .therapep import init_multimodal
             init_multimodal(self, statistics, min_support, max_factors)
@@ -126,6 +128,8 @@ class MultimodalData:
             with np.load(self.root/"arrays/structure_primary.npz", allow_pickle=False) as z:
                 self.struct = {"structure_available": z["structure_available"]}
             train = self.data.indices("train")
+            if sequence_chemistry:
+                self.read_chemistry()
             if statistics is None:
                 labels = label_statistics(self.data.y[train], self.data.clusters[train], self.data.labels, min_support, max_factors)
                 labels.update(geometry_positive_clusters=[0]*len(self.data.labels), geometry_prototype_counts=[0]*len(self.data.labels))
@@ -135,6 +139,8 @@ class MultimodalData:
                               "dataset": json.loads((self.root/"manifest.json").read_text(encoding="utf-8"))["version_date"],
                               "cohort": "sequence_only_original", "train_rows": len(train)}
                 statistics["phys"]["zero_missing"] = True
+                if sequence_chemistry:
+                    statistics["chemical_vocab"] = self.chemical_vocabulary(train)
             if statistics["labels"]["labels"] != self.data.labels:
                 raise ValueError("Checkpoint label order differs from data")
             self.statistics = statistics
@@ -148,40 +154,15 @@ class MultimodalData:
         for source in (self.phys, self.struct):
             if not np.array_equal(source["row_id"], self.data.rows):
                 raise ValueError("Multimodal row_id order differs from targets")
-        self.symbols = {}
-        with (self.root/"symbolic_sequences.jsonl").open(encoding="utf-8") as f:
-            for line in f:
-                item = json.loads(line)
-                self.symbols[int(item["row_id"])] = item["HELM_tokens"] if item["parsed"] else []
-        with (self.root/"records.csv").open(encoding="utf-8-sig", newline="") as f:
-            records = list(csv.DictReader(f))
-        if [int(r["row_id"]) for r in records] != self.data.rows.tolist():
-            raise ValueError("Chemical records differ from array row_id order")
-        self.chemical, self.residue_chemical = [], []
-        self.source = []
-        for i, record in enumerate(records):
-            tokens = self.symbols[int(self.data.rows[i])]
-            core = [t for t in tokens if t not in ("[ac]", "[am]")]
-            self.residue_chemical.append(core if len(core) == len(self.data.sequences[i]) else [])
-            global_tokens = [t for t in tokens if t in ("[ac]", "[am]") or len(t) != 1]
-            for key in ("N-terminal modification", "C-terminal modification", "Post translation modifications"):
-                value = record[key].strip()
-                if value.lower() not in ("", "nan", "nd", "none"):
-                    global_tokens.append(f"{key}:{value}")
-            parts = record["HELM notation"].split("$")
-            if len(parts)>1 and parts[1]:
-                global_tokens.append("connection:"+parts[1])
-            self.chemical.append(global_tokens)
-            self.source.append(record["source_evidence"])
+        self.read_chemistry()
         train = self.data.indices("train")
         if statistics is None:
-            vocabulary = sorted({t for i in train for t in self.chemical[i]+self.residue_chemical[i]})
             node_values = np.stack([np.log1p(self.struct["ASA_A2"]), self.struct["RSA_unclipped"]], -1)
             selected_nodes = node_values[train][self.struct["residue_mask"][train]]
             statistics = {"phys": fit_numeric(self.phys["X"][train]),
                           "structure_global": fit_numeric(self.struct["scalar_X"][train]),
                           "nodes": fit_numeric(selected_nodes),
-                          "chemical_vocab": {t: i+2 for i, t in enumerate(vocabulary)},
+                          "chemical_vocab": self.chemical_vocabulary(train),
                           "labels": label_statistics(self.data.y[train], self.data.clusters[train], self.data.labels, min_support, max_factors),
                           "function_projection": function_projection(self.data.labels, track),
                           "dataset": json.loads((self.root/"manifest.json").read_text(encoding="utf-8"))["version_date"],
@@ -195,6 +176,42 @@ class MultimodalData:
         if statistics["labels"]["labels"] != self.data.labels:
             raise ValueError("Checkpoint label order differs from data")
         self.statistics = statistics
+
+    def read_chemistry(self):
+        symbols = {}
+        with (self.root/"symbolic_sequences.jsonl").open(encoding="utf-8") as f:
+            for line in f:
+                item = json.loads(line)
+                symbols[int(item["row_id"])] = item["HELM_tokens"] if item["parsed"] else []
+        with (self.root/"records.csv").open(encoding="utf-8-sig", newline="") as f:
+            records = list(csv.DictReader(f))
+        if [int(r["row_id"]) for r in records] != self.data.rows.tolist():
+            raise ValueError("Chemical records differ from array row_id order")
+        self.chemical, self.residue_chemical = [], []
+        self.source = []
+        for i, record in enumerate(records):
+            tokens = symbols[int(self.data.rows[i])]
+            core = [t for t in tokens if t not in ("[ac]", "[am]")]
+            self.residue_chemical.append(core if len(core) == len(self.data.sequences[i]) else [])
+            global_tokens = [t for t in tokens if t in ("[ac]", "[am]") or len(t) != 1]
+            for key in ("N-terminal modification", "C-terminal modification", "Post translation modifications"):
+                value = record[key].strip()
+                if value.lower() not in ("", "nan", "nd", "none"):
+                    global_tokens.append(f"{key}:{value}")
+            parts = record["HELM notation"].split("$")
+            if len(parts)>1 and parts[1]:
+                global_tokens.append("connection:"+parts[1])
+            self.chemical.append(global_tokens)
+            self.source.append(record["source_evidence"])
+
+    def chemical_vocabulary(self, train):
+        vocabulary = sorted({token for i in train for token in self.chemical[i] + self.residue_chemical[i]})
+        return {token: index + 2 for index, token in enumerate(vocabulary)}
+
+    def chemical_inputs(self, i, length):
+        vocab = self.statistics["chemical_vocab"]
+        return {"chemical": torch.tensor([vocab.get(t, 1) for t in self.chemical[i]] or [0]),
+                "residue_chem": torch.tensor([vocab.get(t, 1) for t in self.residue_chemical[i]] or [0]*length)}
 
     def enable_function_auxiliary(self):
         """Pair actual Train labels only; out-of-scope rows have no auxiliary supervision."""
@@ -216,7 +233,12 @@ class MultimodalData:
 
     def sample(self, i, esm):
         if self.sequence_only:
-            return sequence_inputs(self.data, i, esm)
+            sample = sequence_inputs(self.data, i, esm)
+            if self.sequence_chemistry:
+                length = len(sample["aa"])
+                sample.update(self.chemical_inputs(i, length))
+                sample["d"] = torch.from_numpy((self.data.d_mask[i, :length] & (sample["aa"].numpy() != 6)).astype(np.int64))
+            return sample
         if self.data.track in THERAPEP_TRACKS:
             from .therapep import sequence_sample
             return sequence_sample(self.data, i, esm)
@@ -247,16 +269,13 @@ class MultimodalData:
         edge_type[u, v] = edge_type[v, u] = s["edge_type"][start:end]
         phys, phys_mask = transform_numeric(self.phys["X"][i], self.statistics["phys"])
         struct_global, struct_global_mask = transform_numeric(s["scalar_X"][i], self.statistics["structure_global"])
-        vocab = self.statistics["chemical_vocab"]
-        chemical = np.array([vocab.get(t, 1) for t in self.chemical[i]] or [0], np.int64)
-        residue_chemical = np.array([vocab.get(t, 1) for t in self.residue_chemical[i]] or [0]*length, np.int64)
         quality = np.array([[1, 1, 1, 1, 1, 1],
                             [mask.any(), known.any(), float(np.nanmean(confidence[known])/100) if known.any() else 0,
                              float(np.nanmin(confidence[known])/100) if known.any() else 0, mask.mean(), self.source[i] != "unknown"],
                             [phys_mask.any(), phys_mask.mean(), phys_mask[502:].mean(), phys_mask[437:477].mean(), 0, 1]], np.float32)
         return {"esm": torch.as_tensor(esm), "aa": torch.from_numpy(self.seq["canonical_tokens"][i, :length].astype(np.int64)),
                 "d": torch.from_numpy((self.data.d_mask[i, :length] & (self.seq["canonical_tokens"][i, :length]!=6)).astype(np.int64)),
-                "residue_chem": torch.from_numpy(residue_chemical), "chemical": torch.from_numpy(chemical),
+                **self.chemical_inputs(i, length),
                 "mask": torch.ones(length, dtype=torch.bool), "coords": torch.from_numpy(coordinates),
                 "geometry": torch.from_numpy(geometry), "struct_mask": torch.from_numpy(mask),
                 "dssp": torch.from_numpy(np.where(s["dssp"][i, :length]>=0, s["dssp"][i, :length], 9).astype(np.int64)),
@@ -332,7 +351,8 @@ class MultimodalPeptides(Dataset):
     def __getitem__(self, index):
         esm, _ = self.cache[self.cache_indices[index]]
         i = int(self.indices[index])
-        sample = sequence_inputs(self.source.data, i, esm) if self.sequence_only else self.source.sample(i, esm)
+        sample = (sequence_inputs(self.source.data, i, esm) if self.sequence_only and not self.source.sequence_chemistry
+                  else self.source.sample(i, esm))
         if self.peptide_cache is not None:
             peptide, _ = self.peptide_cache[self.cache_indices[index]]
             if peptide.shape[0] != esm.shape[0]:
@@ -388,6 +408,25 @@ def collate_multimodal(samples):
     return result
 
 
+def prepare_sequence_inputs(raw, statistics):
+    b, length = raw["aa"].shape
+    vocabulary = statistics["chemical_vocab"]
+
+    def chemical_ids(values):
+        return np.array([[0 if not str(t) else vocabulary.get(str(t), 1) for t in row] for row in values], np.int64)
+
+    arrays = {
+        "esm": raw["esm"].astype(np.float32), "aa": raw["aa"].astype(np.int64),
+        "d": (raw["d"] * (raw["aa"] != 6)).astype(np.int64), "mask": raw["mask"].astype(bool),
+        "chemical": chemical_ids(raw.get("chemical_tokens", np.full((b, 1), ""))),
+        "residue_chem": chemical_ids(raw.get("residue_chem_tokens", np.full((b, length), ""))),
+    }
+    for key in ("esm_cls", "esm_eos", "esm_peptide"):
+        if key in raw:
+            arrays[key] = raw[key].astype(np.float32)
+    return {key: torch.from_numpy(value) for key, value in arrays.items()}
+
+
 def prepare_inputs(raw, statistics):
     """External raw tensors -> checkpoint-normalized inputs, without labels.
 
@@ -428,11 +467,6 @@ def prepare_inputs(raw, statistics):
     edge_type[(delta[None]==1)&pair_mask] = 1
     phys, phys_mask = transform_numeric(raw["phys_raw"], statistics["phys"])
     global_values, global_observed = transform_numeric(raw.get("struct_global_raw", np.full((b, 25), np.nan)), statistics["structure_global"])
-    vocabulary = statistics["chemical_vocab"]
-    def chemical_ids(values):
-        return np.array([[0 if not str(t) else vocabulary.get(str(t), 1) for t in row] for row in values], np.int64)
-    chemical = chemical_ids(raw.get("chemical_tokens", np.full((b, 1), "")))
-    residue_chemical = chemical_ids(raw.get("residue_chem_tokens", np.full((b, length), "")))
     quality = np.ones((b, 3, 6), np.float32)
     quality[:, 1] = 0
     quality[:, 1, 0] = smask.any(1); quality[:, 1, 1] = known.any(1)
@@ -443,13 +477,9 @@ def prepare_inputs(raw, statistics):
     quality[:, 1, 5] = raw.get("structure_source_known", np.zeros(b))
     quality[:, 2] = np.stack([phys_mask.any(1), phys_mask.mean(1), phys_mask[:, 502:].mean(1),
                               phys_mask[:, 437:477].mean(1), np.zeros(b), np.ones(b)], -1)
-    arrays = {"esm": raw["esm"].astype(np.float32), "aa": raw["aa"].astype(np.int64), "d": (raw["d"]*(raw["aa"]!=6)).astype(np.int64),
-              "mask": mask, "struct_mask": smask, "coords": coordinates, "geometry": geometry,
+    arrays = {"struct_mask": smask, "coords": coordinates, "geometry": geometry,
               "dssp": np.where(smask & (raw.get("dssp", np.full((b, length), 9))>=0), raw.get("dssp", np.full((b, length), 9)), 9).astype(np.int64),
               "edge_type": edge_type, "confidence_known": known, "phys": phys, "phys_mask": phys_mask,
-              "chemical": chemical, "residue_chem": residue_chemical, "quality": quality,
+              "quality": quality,
               "struct_global": global_values, "struct_global_mask": global_observed}
-    for key in ("esm_cls", "esm_eos", "esm_peptide"):
-        if key in raw:
-            arrays[key] = raw[key].astype(np.float32)
-    return {key: torch.from_numpy(value) for key, value in arrays.items()}
+    return {**prepare_sequence_inputs(raw, statistics), **{key: torch.from_numpy(value) for key, value in arrays.items()}}

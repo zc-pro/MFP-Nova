@@ -61,6 +61,8 @@ def main(argv=None):
                              help="TermiScale: conditional endpoints, learned label-only endpoints, or uniform LME")
             sub.add_argument("--motifspan-global-only", action="store_true",
                              help="Train the MotifSpan backbone with its global head only")
+            sub.add_argument("--setreread-interval", action="store_true",
+                             help="SetReread: use a short CNN with conditional contiguous-interval readout")
             sub.add_argument("--theraset-b0-backbone", action="store_true",
                              help="Compare the B0 backbone under the pure AA34 TheraSet training protocol")
             sub.add_argument("--theraset-b0-local-max", action="store_true",
@@ -149,6 +151,8 @@ def main(argv=None):
     gpu_check.add_argument("--output")
     gpu_check.add_argument("--inspect-only", action="store_true", help="Read GPU occupancy/cache metadata without training")
     args = parser.parse_args(argv)
+    if args.command == "train" and args.setreread_interval and args.model != "setreread":
+        parser.error("--setreread-interval requires --model setreread")
     if args.command == "prepare-rich48":
         from .rich48 import build_rich48
         print(json.dumps(build_rich48(args.author_root, args.source_root, args.output), ensure_ascii=False, indent=2))
@@ -195,6 +199,8 @@ def main(argv=None):
                 if args.model != "motifspan":
                     raise ValueError("--motifspan-global-only requires --model motifspan")
                 config["model"]["global_only"] = True
+            if args.setreread_interval:
+                config["model"]["interval_evidence"] = True
             if args.stage is not None or args.initialize_from is not None:
                 if args.model != "privilegedbridge":
                     raise ValueError("stage/initialize-from are PrivilegedBridge options")
@@ -376,7 +382,8 @@ def main(argv=None):
                  predictions=args.predictions, batch_size=batch_size, **extra)
     elif args.command == "gpu-check":
         from .runtime_check import inspect, run
-        feature_root = args.feature_root or f"features/esm2_{args.esm}"
+        feature_root = args.feature_root or ("features/esm2_peptide_150m" if args.models == ["setreread"]
+                                            else f"features/esm2_{args.esm}")
         if args.inspect_only:
             print(json.dumps(inspect(feature_root, args.device), ensure_ascii=False, indent=2))
         else:

@@ -11,7 +11,42 @@
 
 后续目标是在同一批原始 `fine39` Validation 上，将样本 Jaccard 提升到 **61.0463% 以上**。正式对照使用相同的选模和阈值协议，并报告 Macro-AP、Micro-F1 和独立多功能检测 F1。当前 B0 的 AA34 多尺度 CNN 在 `traditional5` 下达到 57.321%，比同协议的 TheraSet 低 3.591 个百分点。Test 用于选定模型后的独立评价。两组基线数据来自 `runs/incoming/theraset_full-no_label_context-no_label_context_single_prototype_seed42_v100_fine39-b64_traditional5-microf1_6of6_20261108_205431.zip` 的 Validation 预测和训练记录。
 
-## 当前研究 · B0 与 H1–H8
+## 当前研究
+
+### SetReread · 功能集合条件化的残基证据重读
+
+`--model setreread` 支持原始 `fine39` 和 `major15` 簇划分。默认使用两级 AA34 CNN 和一路冻结短肽 ESM-150M 缓存。训练前 5 轮学习两个基础读出，从第 6 轮联合训练加删换收益和留一阳性恢复，并开始正式 checkpoint 比较。两任务都用 `micro_f1` 选模及固定阈值 0.50。运行保存 `best.pt`、`last.pt`、`results.json` 和对齐的 `best_validation.npz`。完整机制和本地数据依据见 [SetReread 设计](docs/TheraSet-Set-Correction-Design.md)。
+
+训练读取 `features/esm2_peptide_150m/{train,val}`。如果需提取，可用 `features --config configs/setreread.yaml --track major15 --splits train val --device cuda:0`，这套缓存覆盖两任务。基于同骨干的对照使用 `--ablate correction`（双读出均值）、`--ablate conditional_evidence`（静态纠错）或 `--ablate positive_recovery`。可变长度区间骨干使用 `--setreread-interval`。
+
+**RTX 5070 / PowerShell**
+
+```powershell
+conda activate MFP-Nova
+$env:PYTHONPATH = "$PWD/src"
+$env:OMP_NUM_THREADS = '6'
+$env:MKL_NUM_THREADS = '6'
+$MfpTask = 'fine39' # 或 major15
+$MfpRun = "setreread_${MfpTask}_s42_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+python -u -m mfp_nova.cli train --model setreread --task $MfpTask --seed 42 --device cuda:0 --precision fp32 --batch-size 64 --name $MfpRun
+```
+
+**V100 / Bash**
+
+```bash
+conda activate MFP-Nova
+GPU=0
+CPU_THREADS=6
+MFP_TASK=fine39 # 或 major15
+MFP_RUN="setreread_${MFP_TASK}_s42_$(date +%Y%m%d_%H%M%S)"
+mkdir -p runs
+nohup env CUDA_VISIBLE_DEVICES="$GPU" OMP_NUM_THREADS="$CPU_THREADS" MKL_NUM_THREADS="$CPU_THREADS" \
+  PYTHONPATH="$PWD/src" "$(command -v python)" -u -m mfp_nova.cli train \
+  --model setreread --task "$MFP_TASK" --seed 42 --device cuda:0 --precision fp32 --batch-size 64 \
+  --name "$MFP_RUN" > "runs/$MFP_RUN.log" 2>&1 < /dev/null &
+```
+
+### B0 与 H1–H8
 
 新一轮研究依据本地调研包中的《H1–H8 序列多标签模型架构设计书》。九个模型共用从头训练的原始序列骨干，支持 `major15`、`fine39`、`rich48` 三套现有标签表和原始 Train／Validation／Test 成员，默认保留全长、只用原样本。Train 内优先复用已有同源折，`rich48` 默认按原有精确序列组分折。整套 Validation 用来校准并报告结果，Test 独立评估。历史研究命令和实验记录见后文。
 
@@ -84,13 +119,14 @@ python -u -m mfp_nova.cli train --model h6 --task major15 --seed 42 --device cud
 | ProtoRoute | [models/protoroute.py](src/mfp_nova/models/protoroute.py) | [protoroute.yaml](configs/protoroute.yaml) | 标签条件专家路由与多原型 |
 | HelixSet | [models/helixset.py](src/mfp_nova/models/helixset.py) | [helixset.yaml](configs/helixset.yaml) | 双冻结序列表征、理化/结构证据与完整残基对/潜变量/集合解码 |
 | TheraSet | [models/theraset.py](src/mfp_nova/models/theraset.py) | [theraset.yaml](configs/theraset.yaml) | TheraPep式两级CNN直接预测、共享多原型尺度/模态/pair读取与标签条件残差修正 |
+| SetReread | [models/setreread.py](src/mfp_nova/models/setreread.py) | [setreread.yaml](configs/setreread.yaml) | 共享和剩余残基证据、条件增删换与留一阳性恢复 |
 | TermiScale | [models/termiscale.py](src/mfp_nova/models/termiscale.py) | [termiscale.yaml](configs/termiscale.yaml) | 动态深度卷积及样本条件端点测度 |
 | MotifSpan | [models/motifspan.py](src/mfp_nova/models/motifspan.py) | [motifspan.yaml](configs/motifspan.yaml) | 单调软分段、有序关系压缩与中心化细节读取 |
 | PrivilegedBridge | [models/privilegedbridge.py](src/mfp_nova/models/privilegedbridge.py) | [privilegedbridge.yaml](configs/privilegedbridge.yaml) | 训练期模态Teacher、观察子集KD、序列Student部署 |
 
 研究模型共用 `research.py` 的训练、恢复、评价和推理流程，使用同一套数据加载与基础神经网络层。`sequence` 仍是独立的轻量对照基线。
 
-- 单次训练：`mfp_nova.cli train --model` 支持上述八个名称，`--task` 选择 `major15/fine39/rich48/therapep49/therapep49_positive/therapep48`。
+- 单次训练：`mfp_nova.cli train --model` 支持上述模型，`--task` 选择相应标签空间。SetReread 使用 `major15` 或 `fine39`。
 - 评价与推理：统一使用 `evaluate`、`predict`、`summarize`。
 - 多 Seed：`mfp_nova.experiments` 与 `scripts/run_multiseed.ps1` 已纳入五模型；`all` 仍为五模型 × 原两任务 × 五 Seed，共 50 组候选任务。新基准通过 `--task therapep49` 显式选择。运行脚本才会执行。
 - GPU 诊断：`gpu-check --models` 支持五模型，HelixSet/TheraSet 的关键模块检查点已列入源码；本轮仅做本地 CPU 检查。

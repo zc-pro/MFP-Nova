@@ -46,6 +46,7 @@ def inspect(feature_root, device):
 
 
 PROBES = {
+    "setreread": ["features.projection.weight", "cnn.convs1.0.weight", "add_head.2.weight"],
     "termiscale": ["features.projection.weight", "blocks.0.router.weight", "label.weight", "condition_weights"],
     "motifspan": ["features.projection.weight", "velocity_out.weight", "left.weight", "detail_query.weight"],
     "privilegedbridge": ["sequence.features.projection.weight", "sequence.label_weight"],
@@ -100,6 +101,8 @@ def profile(config, source, dataset, device, batches, precisions, measured_steps
     seed_everything(config["train"]["seed"])
     arguments = {"input_dim": dataset.meta["input_dim"], "num_labels": len(source.data.labels),
                  "vocab_size": len(source.statistics["chemical_vocab"])+2, "statistics": source.statistics["labels"], **config["model"]}
+    if config["model_name"] == "setreread":
+        arguments["function_projection"] = source.statistics["function_projection"]
     if "peptide_encoder" in dataset.meta:
         arguments["peptide_input_dim"] = dataset.meta["peptide_encoder"]["input_dim"]
     samples = [dataset[i] for i in range(len(dataset))]
@@ -241,9 +244,15 @@ def run(models, tasks, feature_root, device, output, esm="650m", batches=(2, 4, 
                 config["data"]["features"] = str(feature_root)
             if peptide_feature_root is not None and name in ("helixset", "theraset", "termiscale", "motifspan", "privilegedbridge"):
                 config["data"]["peptide_features"] = str(peptide_feature_root)
-            config["encoder"]["name"] = "facebook/esm2_t33_650M_UR50D" if esm=="650m" else "facebook/esm2_t12_35M_UR50D"
-            sequence_only = name in ("termiscale", "motifspan")
-            source = MultimodalData(config["data"]["root"], task, sequence_only=sequence_only)
+            if name == "setreread":
+                config["train"]["correction_start_epoch"] = 1
+                if str(feature_root) == f"features/esm2_{esm}":
+                    config["data"]["features"] = "features/esm2_peptide_150m"
+            else:
+                config["encoder"]["name"] = "facebook/esm2_t33_650M_UR50D" if esm=="650m" else "facebook/esm2_t12_35M_UR50D"
+            sequence_only = name in ("termiscale", "motifspan", "setreread")
+            source = MultimodalData(config["data"]["root"], task, sequence_only=sequence_only,
+                                   sequence_chemistry=name == "setreread")
             task_features = config["data"]["features"]
             data = MultimodalPeptides(source, task_features, "train", samples, config["data"].get("peptide_features"),
                                      sequence_only=sequence_only or (name == "privilegedbridge" and config["model"].get("stage", "A") == "A"))
@@ -275,7 +284,8 @@ def run(models, tasks, feature_root, device, output, esm="650m", batches=(2, 4, 
             continued["train"].update(max_steps=steps+2, epochs=result["epochs_completed"]+2)
             restored = train(continued, f"{name}_{task}_resume", resume=root/f"{name}_{task}"/"last.pt")
             model, checkpoint = load_model(root/f"{name}_{task}_resume"/"best.pt", device)
-            source = MultimodalData(config["data"]["root"], task, checkpoint["statistics"])
+            source = MultimodalData(config["data"]["root"], task, checkpoint["statistics"],
+                                   sequence_only=name == "setreread", sequence_chemistry=name == "setreread")
             val = MultimodalPeptides(source, task_features, "val", min(samples, 64), config["data"].get("peptide_features"))
             loader = torch.utils.data.DataLoader(val, batch_size=chosen["batch_size"], collate_fn=collate_multimodal)
             y, p = predict_loader(model, loader, device, chosen["precision"])

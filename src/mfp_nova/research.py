@@ -24,6 +24,9 @@ from .metric_protocol import protocol_description, primary_metrics, selection, f
 
 
 def make_model(name, arguments):
+    if name == "setreread":
+        from .models.setreread import SetReread
+        return SetReread(**arguments)
     if name == "termiscale":
         from .models.termiscale import TermiScale
         return TermiScale(**arguments)
@@ -187,6 +190,8 @@ def epoch_loss_settings(config, epoch):
         start = settings.get("rdrop_start_epoch", 6)
         duration = settings.get("rdrop_ramp_epochs", 5)
         loss["rdrop"] *= min(1., max(0., (epoch-start+1)/duration))
+    if config.get("model_name") == "setreread" and epoch < settings.get("correction_start_epoch", 6):
+        loss.update(edit_gain=0., recovery=0.)
     if config.get("model_name") == "privilegedbridge" and config["model"].get("stage") == "C":
         loss["kd"] = loss.get("kd", .2)*min(1., epoch/5)
     decay = settings.get('reconstruction_decay')
@@ -343,6 +348,9 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
             if key not in ("device", "output", "epochs", "num_workers", "max_steps"):
                 settings[key] = value
     suite = settings.get("metric_suite", "task_specific")
+    setreread = config["model_name"] == "setreread"
+    if setreread and (config["data"]["track"] not in ("major15", "fine39") or suite != "micro_f1"):
+        raise ValueError("SetReread uses major15 or fine39 with the fixed-0.50 micro_f1 protocol")
     rdrop = config["loss"].get("rdrop", 0)
     if pb and config["model"].get("stage", "A") == "B" and (rdrop or settings.get("ema_decay") is not None):
         raise ValueError("PB teacher phase B uses deterministic training without R-Drop/EMA")
@@ -354,6 +362,9 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         if settings.get("rdrop_start_epoch", 6) < 1 or settings.get("rdrop_ramp_epochs", 5) < 1:
             raise ValueError("R-Drop start epoch and ramp length must be positive")
     protocol = protocol_description(suite, settings.get("threshold_strategy", "global"))
+    setreread_start = settings.get("correction_start_epoch", 6) if setreread else 1
+    if setreread:
+        protocol["selection_start_epoch"] = setreread_start if settings["epochs"] >= setreread_start else 1
     branch_supervision = settings.get("branch_supervision", "mixed_private")
     if branch_supervision not in ("mixed_private", "shared_private"):
         raise ValueError("branch_supervision must be mixed_private or shared_private")
@@ -398,11 +409,11 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     if reconstruction_gradient != "sum" and config["model_name"] != "trirelay":
         raise ValueError("Reconstruction gradient balancing currently supports TriRelay")
     reference_checkpoint = checkpoint or initial
-    sequence_only = config["model_name"] in ("termiscale", "motifspan")
+    sequence_only = setreread or config["model_name"] in ("termiscale", "motifspan")
     source = MultimodalData(config["data"]["root"], config["data"]["track"],
                            reference_checkpoint["statistics"] if reference_checkpoint else None,
                            config.get("min_factor_support", 20), config.get("max_factors", 32),
-                           sequence_only=sequence_only)
+                           sequence_only=sequence_only, sequence_chemistry=setreread)
     if pb and config["model"].get("stage", "A") != "A" and source.data.track in THERAPEP_TRACKS:
         raise ValueError("PB B/C need observed auxiliary inputs; use rich48 or stage A for author sequence tasks")
     if function_aux:
@@ -428,6 +439,8 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     args = {"input_dim": datasets[0].meta["input_dim"], "num_labels": len(source.data.labels),
             "vocab_size": len(source.statistics["chemical_vocab"])+2,
             "statistics": source.statistics["labels"], **config["model"]}
+    if setreread:
+        args["function_projection"] = source.statistics["function_projection"]
     if "peptide_encoder" in datasets[0].meta:
         args["peptide_input_dim"] = datasets[0].meta["peptide_encoder"]["input_dim"]
     if function_aux:
@@ -591,6 +604,10 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     terminal_resume = checkpoint is not None and (start>settings["epochs"] or
                         (settings["patience"] and stale>=settings["patience"]))
     for epoch in (() if terminal_resume else range(start, settings["epochs"]+1)):
+        if setreread and epoch == setreread_start:
+            # Keep warmup metrics, then compare all SetReread variants over the same trained phase.
+            best_key = online_best_key = (-float("inf"), -float("inf"))
+            stale = 0
         model.train()
         totals, count, skipped = {}, 0, 0
         gradient_records = []
@@ -708,7 +725,7 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
             best_state = checkpoint_state(selected_model, cpu=True)
             best_weights = validation_weights
             torch.save({**static, "model_state": best_state, "best_epoch": best_epoch, "weight_source": best_weights}, run/"best.pt")
-        else:
+        elif epoch >= setreread_start:
             stale += 1
         if save_candidates:
             alternate_key, alternate_threshold, _ = selection(
@@ -862,6 +879,8 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
               "checkpoint": str(run/"best.pt")}
     result.update(metric_protocol=protocol, primary_metrics=primary_metrics(result["validation"], suite),
                   best_selection_key=list(best_key))
+    if setreread:
+        result["correction_active"] = bool(model.correction_active)
     export_predictions = settings.get("export_validation_predictions", False)
     if export_predictions:
         result["validation_predictions"] = export_validation(
@@ -929,8 +948,10 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
         if checkpoint["model_name"] != "trirelay" or not hasattr(model, "evidence_partition"):
             raise ValueError("Private evidence ablation requires a shared-private TriRelay checkpoint")
         model.private_evidence_enabled = False
-    sequence_only = checkpoint["model_name"] in ("termiscale", "motifspan")
-    source = MultimodalData(data_root, checkpoint["track"], checkpoint["statistics"], sequence_only=sequence_only)
+    setreread = checkpoint["model_name"] == "setreread"
+    sequence_only = setreread or checkpoint["model_name"] in ("termiscale", "motifspan")
+    source = MultimodalData(data_root, checkpoint["track"], checkpoint["statistics"],
+                           sequence_only=sequence_only, sequence_chemistry=setreread)
     dataset = MultimodalPeptides(source, feature_root, split,
                                   peptide_feature_root=peptide_feature_root or checkpoint["config"]["data"].get("peptide_features"),
                                   sequence_only=sequence_only or (checkpoint["model_name"] == "privilegedbridge" and model.stage == "A"))
@@ -997,7 +1018,10 @@ def predict_inputs(checkpoint_path, input_path, device="cpu", batch_size=32, dec
     model, checkpoint = load_model(checkpoint_path, device)
     with np.load(input_path, allow_pickle=False) as z:
         raw = {k: z[k] for k in z.files if k not in ("y", "row_id", "ID")}
-    if "phys_raw" in raw:
+    if checkpoint["model_name"] == "setreread" and "chemical" not in raw:
+        from .multimodal import prepare_sequence_inputs
+        inputs = prepare_sequence_inputs(raw, checkpoint["statistics"])
+    elif "phys_raw" in raw:
         from .multimodal import prepare_inputs
         inputs = prepare_inputs(raw, checkpoint["statistics"])
     else:
@@ -1027,7 +1051,7 @@ def prediction_records(checkpoint, probabilities, scope, decision_path=None):
 def predict_sequences(checkpoint_path, sequences, device="cpu", decision_path=None):
     """Missing-modality inference; never fabricates structure or chemical descriptors."""
     from .encoder import FrozenEncoder
-    from .multimodal import prepare_inputs
+    from .multimodal import prepare_inputs, prepare_sequence_inputs
     model, checkpoint = load_model(checkpoint_path, device)
     info = checkpoint["encoder"]
     prefix = info.get("representation_layer")
@@ -1063,7 +1087,8 @@ def predict_sequences(checkpoint_path, sequences, device="cpu", decision_path=No
         if prefix is not None:
             raw["esm_cls"] = states[:, 0].half().float().cpu().numpy()
             raw["esm_eos"] = torch.stack([states[i, len(s) + 1] for i, s in enumerate(selected)]).half().float().cpu().numpy()
-        inputs = prepare_inputs(raw, checkpoint["statistics"])
+        prepare = prepare_sequence_inputs if checkpoint["model_name"] == "setreread" else prepare_inputs
+        inputs = prepare(raw, checkpoint["statistics"])
         with torch.inference_mode():
             probs = model(to_device(inputs, device))["logits"].sigmoid().cpu().tolist()
         scope = "sequence_only" if checkpoint["model_name"] in ("termiscale", "motifspan", "privilegedbridge") else "sequence_and_stereochemistry_only"

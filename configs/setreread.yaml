@@ -1,0 +1,47 @@
+model_name: setreread
+data:
+  root: data/therapeutic_2025
+  track: fine39
+  features: features/esm2_peptide_150m
+  augment: false
+encoder:
+  name: jiahuizhang/esm-150m-peptide-fine-tune
+  revision: 6d8cebf74c53b1032b6f5917e75e3253cb70f575
+  max_length: 80
+  batch_size: 32
+model:
+  dim: 128
+  cnn_channels: 64
+  dropout: 0.2
+  correction: true
+  conditional_evidence: true
+  positive_recovery: true
+  interval_evidence: false
+  base_add_candidates: 2
+  gain_add_candidates: 2
+  drop_candidates: 2
+loss:
+  unlabeled_weight: 0.3
+  branch: 0.2
+  edit_gain: 0.5
+  recovery: 0.2
+train:
+  device: cpu
+  seed: 42
+  epochs: 100
+  batch_size: 64
+  accumulation_steps: 1
+  precision: fp32
+  learning_rate: 0.0002
+  weight_decay: 0.01
+  patience: 15
+  warmup_epochs: 5
+  correction_start_epoch: 6
+  gradient_clip: 5
+  num_workers: 0
+  ema_decay: 0.999
+  ema_start_epoch: 6
+  metric_suite: micro_f1
+  threshold_strategy: global
+  export_validation_predictions: true
+  output: runs

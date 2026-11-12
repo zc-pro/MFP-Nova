@@ -45,7 +45,8 @@ def run_family(model, task, seed):
     tag = f"{settings['precision']}_b{settings['batch_size']}"
     if model in ("helixset", "theraset"):
         tag += f"_a{settings['accumulation_steps']}_ema_{settings['metric_suite']}"
-    return f"{model}_{task}_esm650m_seed{seed}_rtx5070_{tag}"
+    encoder = "esm150m" if model == "setreread" else "esm650m"
+    return f"{model}_{task}_{encoder}_seed{seed}_rtx5070_{tag}"
 
 
 def metric_aliases(score):
@@ -117,13 +118,14 @@ def compatibility_issues(metadata, result, directory, identity=None):
     defaults = {"precision": "fp32", "accumulation_steps": 1, "threshold_strategy": "global",
                 "metric_suite": "task_specific", "ema_decay": None}
     if result:
+        defaults["metric_suite"] = result.get("metric_protocol", {}).get("metric_suite", defaults["metric_suite"])
         for key in ("precision", "accumulation_steps", "threshold_strategy", "metric_suite"):
             if result.get(key, defaults[key]) != fixed[key]:
                 issues.append(f"{key} differs from {fixed[key]}")
     if metadata:
         config = metadata["config"]
-        if metadata["encoder"]["name"]!="facebook/esm2_t33_650M_UR50D":
-            issues.append("encoder is not ESM-650M")
+        if metadata["encoder"]["name"] != expected["encoder"]["name"]:
+            issues.append(f"encoder differs from {expected['encoder']['name']}")
         if config.get("peptide_encoder") != expected.get("peptide_encoder"):
             issues.append("peptide encoder configuration differs from the fixed protocol")
         for key in ("model", "loss"):
@@ -149,11 +151,11 @@ def compatibility_issues(metadata, result, directory, identity=None):
         task = identity["task"]
         cohort = ("therapep_author_published_all49" if task == "therapep49" else
                   task if task in ("therapep48", "therapep49_positive") else
-                  "sequence_only_original" if identity["model"] in ("termiscale", "motifspan") else
+                  "sequence_only_original" if identity["model"] in ("termiscale", "motifspan", "setreread") else
                   "rich48_author_positive_multimodal" if task == "rich48" else "original_resolved_backbone")
         if metadata.get("cohort") not in (None, cohort):
             issues.append("training cohort differs")
-    elif identity["model"] in ("helixset", "theraset"):
+    elif identity["model"] in ("helixset", "theraset", "setreread"):
         if not directory.name.startswith(run_family(identity["model"], identity["task"], identity["seed"])):
             issues.append("results-only directory does not identify the model's training settings")
     elif "esm650m" not in directory.name or "fp32_b64" not in directory.name:
@@ -185,8 +187,11 @@ def discover_runs(root):
             # Other encoders and intentional ablations are separate experiments,
             # not corrupt attempts at this fixed five-seed job.
             continue
-        if result and (result.get("threshold_fit_split")!="val" or not result.get("validation")):
-            issues.append("result lacks completed Validation threshold fitting")
+        if result:
+            suite = result.get("metric_suite", result.get("metric_protocol", {}).get("metric_suite"))
+            threshold_ok = result.get("threshold") == .5 if suite == "micro_f1" else result.get("threshold_fit_split") == "val"
+            if not threshold_ok or not result.get("validation"):
+                issues.append("result lacks completed Validation under its threshold protocol")
         records.append({"directory": directory, "metadata": metadata, "result": result,
                         "model": identity["model"], "task": identity["task"], "seed": int(identity["seed"]),
                         "issues": issues, "evidence": "metadata" if metadata else "result_and_run_name_only"})

@@ -46,30 +46,37 @@ def residue_encoding():
 class MotifCNN(nn.Module):
     """Two parallel 3/5/7/9 CNN stages; retain stage-two maps before max pooling."""
 
-    def __init__(self, vocab_size, channels, dropout, chemical_evidence):
+    def __init__(self, vocab_size, channels, dropout, chemical_evidence, short_only=False):
         super().__init__()
         self.chemical_evidence = chemical_evidence
-        self.output_channels = 4 * channels
+        kernels = (3,) if short_only else (3, 5, 7, 9)
+        self.output_channels = len(kernels) * channels
         self.register_buffer("encoding", residue_encoding())
         self.input = nn.Linear(34, 64)
         self.d = nn.Embedding(2, 64)
         self.chem = nn.Embedding(vocab_size, 64, padding_idx=0)
-        self.convs1 = nn.ModuleList([nn.Conv1d(64, channels, k, padding=k//2) for k in (3, 5, 7, 9)])
-        self.convs2 = nn.ModuleList([nn.Conv1d(4*channels, channels, k, padding=k//2) for k in (3, 5, 7, 9)])
+        self.convs1 = nn.ModuleList([nn.Conv1d(64, channels, k, padding=k//2) for k in kernels])
+        self.convs2 = nn.ModuleList([] if short_only else
+                                    [nn.Conv1d(self.output_channels, channels, k, padding=k//2) for k in kernels])
         # Per-position normalization avoids dependence on padded batch lengths.
-        self.norms1 = nn.ModuleList([nn.LayerNorm(channels) for _ in range(4)])
-        self.norms2 = nn.ModuleList([nn.LayerNorm(channels) for _ in range(4)])
+        self.norms1 = nn.ModuleList([nn.LayerNorm(channels) for _ in self.convs1])
+        self.norms2 = nn.ModuleList([nn.LayerNorm(channels) for _ in self.convs2])
         self.dropout = nn.Dropout(dropout)
 
-    def residue_maps(self, batch):
-        mask = batch["mask"]
+    def residue_inputs(self, batch):
         x = self.input(self.encoding[batch["aa"]])
         if self.chemical_evidence:
             global_chem = masked_mean(self.chem(batch["chemical"]), batch["chemical"] != 0)
             x = x + self.d(batch["d"]) + self.chem(batch["residue_chem"]) + global_chem[:, None]
-        x = x.masked_fill(~mask[..., None], 0).transpose(1, 2)
+        return x.masked_fill(~batch["mask"][..., None], 0)
+
+    def residue_maps(self, batch, inputs=None):
+        mask = batch["mask"]
+        x = (self.residue_inputs(batch) if inputs is None else inputs).transpose(1, 2)
         first = [F.gelu(norm(conv(x).transpose(1, 2))).masked_fill(~mask[..., None], 0)
                  for conv, norm in zip(self.convs1, self.norms1)]
+        if not self.convs2:
+            return [self.dropout(first[0])]
         x = self.dropout(torch.cat(first, -1)).transpose(1, 2)
         return [self.dropout(F.gelu(norm(conv(x).transpose(1, 2)))).masked_fill(~mask[..., None], 0)
                 for conv, norm in zip(self.convs2, self.norms2)]
