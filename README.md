@@ -56,6 +56,8 @@ python -u -m mfp_nova.cli train --model h6 --task major15 --seed 42 --device cud
 
 检验局部读出时，用 `--theraset-b0-local-max` 替换 `--theraset-b0-backbone`。它对有效残基的局部卷积特征逐通道取最大值，并把同一个局部向量与各标签的全局查询结果融合。
 
+用 `scripts/compare_validation_predictions.py <基线目录> <对照目录>` 对已有 `best_validation.npz` 按原 Validation 样本配对比较。进一步检查局部编码时用 `--theraset-b0-local-cnn`，复用纯 CNN 的两级 `3/5/7/9` 卷积，投影到 192 维后沿用局部最大池化和 B0 的全局分支。
+
 ## 历史研究
 
 独立的治疗肽多标签预测科研项目。主数据 **[data/therapeutic_2025/](data/therapeutic_2025/README.md)** 提供 `major15` 和 `fine39`；新增 `therapep49` 使用独立目录 **`data/therapep_ai/`** 中 TheraPep-AI 作者发布的 Train/Val/Test 与49维标签，作为同论文数据口径的补充比较。

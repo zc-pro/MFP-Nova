@@ -49,6 +49,7 @@ class MotifCNN(nn.Module):
     def __init__(self, vocab_size, channels, dropout, chemical_evidence):
         super().__init__()
         self.chemical_evidence = chemical_evidence
+        self.output_channels = 4 * channels
         self.register_buffer("encoding", residue_encoding())
         self.input = nn.Linear(34, 64)
         self.d = nn.Embedding(2, 64)
@@ -60,7 +61,7 @@ class MotifCNN(nn.Module):
         self.norms2 = nn.ModuleList([nn.LayerNorm(channels) for _ in range(4)])
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, batch):
+    def residue_maps(self, batch):
         mask = batch["mask"]
         x = self.input(self.encoding[batch["aa"]])
         if self.chemical_evidence:
@@ -70,8 +71,12 @@ class MotifCNN(nn.Module):
         first = [F.gelu(norm(conv(x).transpose(1, 2))).masked_fill(~mask[..., None], 0)
                  for conv, norm in zip(self.convs1, self.norms1)]
         x = self.dropout(torch.cat(first, -1)).transpose(1, 2)
-        maps = [self.dropout(F.gelu(norm(conv(x).transpose(1, 2)))).masked_fill(~mask[..., None], 0)
+        return [self.dropout(F.gelu(norm(conv(x).transpose(1, 2)))).masked_fill(~mask[..., None], 0)
                 for conv, norm in zip(self.convs2, self.norms2)]
+
+    def forward(self, batch):
+        maps = self.residue_maps(batch)
+        mask = batch["mask"]
         pooled = torch.cat([h.masked_fill(~mask[..., None], torch.finfo(h.dtype).min).amax(1) for h in maps], -1)
         return maps, pooled
 
@@ -173,7 +178,7 @@ class TheraSet(nn.Module):
                  prototype_bank=32, peptide_input_dim=0, evidence_decoder=True,
                  contextual_evidence=True, property_evidence=True, structure_evidence=True,
                  chemical_evidence=True, pair_readout=True, prototype_readout=True,
-                 label_context=True, b0_backbone=False, b0_local_max=False):
+                 label_context=True, b0_backbone=False, b0_local_max=False, b0_local_cnn=False):
         super().__init__()
         self.statistics = statistics
         self.evidence_decoder = evidence_decoder
@@ -186,8 +191,10 @@ class TheraSet(nn.Module):
             if evidence_decoder or chemical_evidence:
                 raise ValueError("The B0 backbone comparison requires the pure AA34 ablation")
             from .hypothesis_backbone import SequenceBackbone
-            self.b0_backbone = SequenceBackbone(num_labels, dropout=dropout, residue_features=residue_encoding(),
-                                                local_max_pool=b0_local_max)
+            cnn = MotifCNN(1, cnn_channels, dropout, chemical_evidence=False) if b0_local_cnn else None
+            self.b0_backbone = SequenceBackbone(num_labels, dropout=dropout,
+                                                residue_features=residue_encoding() if cnn is None else None,
+                                                local_max_pool=b0_local_max or b0_local_cnn, motif_cnn=cnn)
             with torch.no_grad():
                 self.b0_backbone.label_bias.copy_(prior)
             return

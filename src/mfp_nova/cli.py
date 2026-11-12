@@ -65,6 +65,8 @@ def main(argv=None):
                              help="Compare the B0 backbone under the pure AA34 TheraSet training protocol")
             sub.add_argument("--theraset-b0-local-max", action="store_true",
                              help="Use the AA34 B0 backbone with local max pooling and the global label query")
+            sub.add_argument("--theraset-b0-local-cnn", action="store_true",
+                             help="Use the TheraSet multiscale CNN before B0 local max pooling and the Transformer")
             sub.add_argument("--resume-in-place", action="store_true", help="Research models: append to the same interrupted run")
             sub.add_argument("--stop-file", help="Research models: pause after a complete epoch when this file exists")
             sub.add_argument("--ablate", nargs="*", help="Model switches to disable, e.g. feedback high_order")
@@ -164,7 +166,7 @@ def main(argv=None):
         write_json(args.output, result)
         print(json.dumps({"original_rows": result["original_rows"], "tracks": result["tracks"]}, ensure_ascii=False, indent=2))
     elif args.command == "train" and args.model in HYPOTHESIS_MODELS:
-        if args.theraset_b0_backbone or args.theraset_b0_local_max:
+        if args.theraset_b0_backbone or args.theraset_b0_local_max or args.theraset_b0_local_cnn:
             parser.error("TheraSet B0 comparisons require --model theraset")
         from .hypothesis import train_from_cli
         config = yaml.safe_load(Path(args.config or "configs/b0.yaml").read_text(encoding="utf-8"))
@@ -174,12 +176,14 @@ def main(argv=None):
         config_path = args.config or f"configs/{model_name}.yaml"
         config = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
         if args.command == "train":
-            if args.theraset_b0_backbone or args.theraset_b0_local_max:
+            if args.theraset_b0_backbone or args.theraset_b0_local_max or args.theraset_b0_local_cnn:
                 if args.model != "theraset":
                     parser.error("TheraSet B0 comparisons require --model theraset")
                 config["model"].update(b0_backbone=True, evidence_decoder=False, chemical_evidence=False)
                 if args.theraset_b0_local_max:
                     config["model"]["b0_local_max"] = True
+                if args.theraset_b0_local_cnn:
+                    config["model"]["b0_local_cnn"] = True
             if args.termiscale_routing is not None or args.termiscale_pooling is not None:
                 if args.model != "termiscale":
                     raise ValueError("TermiScale routing/pooling options require --model termiscale")

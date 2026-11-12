@@ -77,20 +77,24 @@ class FunctionalQuery(nn.Module):
 
 class SequenceBackbone(nn.Module):
     def __init__(self, num_labels, dim=192, heads=6, depth=4, dropout=.1, relative_clip=64,
-                 residue_features=None, local_max_pool=False):
+                 residue_features=None, local_max_pool=False, motif_cnn=None):
         super().__init__()
         self.num_labels = num_labels
         self.dim = dim
-        if residue_features is None:
-            self.embedding = nn.Embedding(22, dim, padding_idx=0)
+        self.motif_cnn = motif_cnn
+        if motif_cnn is not None:
+            self.local_mix = nn.Linear(motif_cnn.output_channels, dim)
         else:
-            self.embedding = nn.Sequential(nn.Embedding.from_pretrained(residue_features, padding_idx=0),
-                                           nn.Linear(residue_features.shape[1], dim))
-        self.local_norm = nn.LayerNorm(dim)
-        self.local_paths = nn.ModuleList(nn.Conv1d(dim, dim, kernel, padding=kernel // 2, groups=dim)
-                                         for kernel in (3, 7))
-        self.local_mix = nn.Linear(2 * dim, dim)
-        self.local_gate = nn.Linear(dim, dim)
+            if residue_features is None:
+                self.embedding = nn.Embedding(22, dim, padding_idx=0)
+            else:
+                self.embedding = nn.Sequential(nn.Embedding.from_pretrained(residue_features, padding_idx=0),
+                                               nn.Linear(residue_features.shape[1], dim))
+            self.local_norm = nn.LayerNorm(dim)
+            self.local_paths = nn.ModuleList(nn.Conv1d(dim, dim, kernel, padding=kernel // 2, groups=dim)
+                                             for kernel in (3, 7))
+            self.local_mix = nn.Linear(2 * dim, dim)
+            self.local_gate = nn.Linear(dim, dim)
         self.encoder = nn.ModuleList(RelativeEncoderLayer(dim, heads, dropout, relative_clip) for _ in range(depth))
         self.context_norm = nn.LayerNorm(dim)
         self.local_query = None if local_max_pool else FunctionalQuery(num_labels, dim, heads)
@@ -103,10 +107,14 @@ class SequenceBackbone(nn.Module):
     def forward(self, tokens, mask, return_attention=False):
         # Masked positions keep their coordinates for H6 but cannot inject token content.
         mask3 = mask[..., None]
-        embeddings = self.embedding(tokens).masked_fill(~mask3, 0.)
-        normalized = self.local_norm(embeddings).masked_fill(~mask3, 0.)
-        branches = [F.gelu(path(normalized.transpose(1, 2)).transpose(1, 2)) for path in self.local_paths]
-        local = embeddings + self.local_gate(normalized).sigmoid() * self.local_mix(torch.cat(branches, dim=-1))
+        if self.motif_cnn is not None:
+            maps = self.motif_cnn.residue_maps({"aa": tokens, "mask": mask})
+            local = self.local_mix(torch.cat(maps, dim=-1))
+        else:
+            embeddings = self.embedding(tokens).masked_fill(~mask3, 0.)
+            normalized = self.local_norm(embeddings).masked_fill(~mask3, 0.)
+            branches = [F.gelu(path(normalized.transpose(1, 2)).transpose(1, 2)) for path in self.local_paths]
+            local = embeddings + self.local_gate(normalized).sigmoid() * self.local_mix(torch.cat(branches, dim=-1))
         local = local.masked_fill(~mask3, 0.)
         positions = torch.arange(tokens.shape[1], device=tokens.device)
         distance = positions[None, :] - positions[:, None]
