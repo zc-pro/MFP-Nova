@@ -18,7 +18,7 @@ KIT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT / "src"))
 
 from mfp_nova.metrics import evaluate_metrics
-from mfp_nova.therapep import ROOTS, TRACKS, read_data
+from mfp_nova.paper_benchmark import CLUSTERED, ROOTS, TRACKS, positive_scope, read_data, traditional5_report
 
 
 def prepare(task, root, output):
@@ -63,23 +63,34 @@ def extract(repo, output, esm2, prott5, batch_size):
     path.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def train(repo, output, seed):
-    # This incremental patch requires the existing Val-threshold patch beneath it.
-    subprocess.run(["git", "apply", "--ignore-space-change", "--reverse", "--check",
-                    str(KIT / "metfan_therapep.patch")], cwd=repo, check=True)
+def train(repo, output, seed, epochs=None):
     info = json.loads((output / "task.json").read_text(encoding="utf-8"))
+    clustered = info["task"] in CLUSTERED
+    check = ["git", "apply", "--ignore-space-change", "--reverse", "--check"]
+    latest = str(KIT / "metfan_traditional5.patch")
+    if clustered:
+        subprocess.run([*check, latest], cwd=repo, check=True)
+    elif subprocess.run([*check, latest], cwd=repo, capture_output=True).returncode:
+        subprocess.run([*check, str(KIT / "metfan_therapep.patch")], cwd=repo, check=True)
     training = output / "training" / f"seed{seed}"
     training.mkdir(parents=True, exist_ok=False)
+    entry = "from main import main; from config import get_args; args = get_args(); "
+    env = os.environ.copy()
+    if clustered:
+        env["PYTHONPATH"] = str(PROJECT / "src") + os.pathsep + env.get("PYTHONPATH", "")
+        entry += f"args.metric_suite = 'traditional5'; args.paper_epochs = {epochs or 999}; "
+    entry += "main(args)"
     subprocess.run(
-        [sys.executable, "-c", "from main import main; from config import get_args; main(get_args())",
+        [sys.executable, "-c", entry,
          "--data_dir", str(output / "data"), "--features_dir", str(output / "features"),
          "--result_dir", str(training), "--num_classes", str(len(info["labels"])),
          "--seed", str(seed), "--features", "textcnn", "esm2_mean", "prot_t5_mean",
          "--optimize_features"],
-        cwd=repo, check=True,
+        cwd=repo, env=env, check=True,
     )
     result = training / "0" / "textcnn_esm2_mean_prot_t5_mean_optimized"
     native = json.loads((result / "results.json").read_text(encoding="utf-8"))
+    data = read_data(Path(info["data_root"]), info["task"]) if clustered else None
     for split in ("val", "test"):
         path = result / f"{split}_predictions.npz"
         with np.load(path) as archive:
@@ -88,15 +99,19 @@ def train(repo, output, seed):
             rows = list(csv.DictReader(stream))
         if len(rows) != len(arrays["targets"]):
             raise ValueError(f"Prediction rows differ from prepared {split} rows")
+        if clustered and not np.array_equal(arrays["targets"], data["y"][data["splits"] == split]):
+            raise ValueError(f"Prediction labels differ from prepared {split} order")
+        if clustered:
+            arrays["predicted"] = arrays["probabilities"] >= float(arrays["thresholds"][0])
         np.savez_compressed(
             path, **arrays, row_ids=np.array([int(row["row_id"]) for row in rows]),
             ids=np.array([row["ID"] for row in rows]), label_names=np.array(info["labels"]),
         )
     with np.load(result / "test_predictions.npz") as archive:
         y, p, threshold = archive["targets"], archive["probabilities"], archive["thresholds"]
-    positive = y[:, :48].any(1)
     history = json.loads((result / "training_history.json").read_text(encoding="utf-8"))
-    best_epoch = int(np.argmax([metrics["macro_f1"] for metrics in history["val_metrics"]])) + 1
+    key = "selection_key" if clustered else "macro_f1"
+    best_epoch = max(enumerate(history["val_metrics"], start=1), key=lambda item: item[1][key])[0]
     summary = {
         "model": "METFAN", "task": info["task"], "seed": seed, "best_epoch": best_epoch,
         "label_names": info["labels"], "features": info.get("features"),
@@ -106,12 +121,15 @@ def train(repo, output, seed):
         "upstream_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip(),
         "project_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=PROJECT, text=True).strip(),
         "native_test": native["test_metrics"],
-        "full_test": evaluate_metrics(y, p, threshold=threshold),
-        "positive_function48": evaluate_metrics(y[positive, :48], p[positive, :48], threshold=threshold[:48]),
-        "test_rows": len(y), "positive_test_rows": int(positive.sum()),
-        "background_any_function_fpr": float((p[~positive, :48] >= threshold[:48]).any(1).mean()) if (~positive).any() else None,
+        "test_rows": len(y),
         "ap_definition": "average precision; macro averages classes with positive support",
     }
+    if clustered:
+        summary.update(traditional5_report(y, p, float(threshold[0]), best_epoch, info["task"], info["labels"],
+                                           data["y"][data["splits"] == "train"].sum(0)))
+    else:
+        summary.update(full_test=evaluate_metrics(y, p, threshold=threshold),
+                       **positive_scope(info["task"], y, p, p >= threshold))
     (result / "comparison.json").write_text(json.dumps(summary, indent=2, allow_nan=False), encoding="utf-8")
     print(json.dumps(summary, indent=2), flush=True)
     print(f"Completed. Results: {result}", flush=True)
@@ -169,7 +187,7 @@ def diagnose(output, seed):
                 "all_positive_labels": [labels[c] for c in np.flatnonzero(predicted.all(0))],
                 "mean_predicted_labels": float(predicted.sum(1).mean()),
             }
-            if split == "test":
+            if split == "test" and report["task"] not in CLUSTERED:
                 positive = y[:, :48].any(1)
                 entry["positive_function48"] = evaluate_metrics(
                     y[positive, :48], p[positive, :48], predicted=predicted[positive, :48])
@@ -194,10 +212,13 @@ def main():
     parser.add_argument("--repo", type=Path, default=Path.home() / "paper-repro/METFAN")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--epochs", type=int, help="Optional maximum epochs for major15/fine39")
     parser.add_argument("--feature-batch-size", type=int, default=8)
     parser.add_argument("--esm2", default=os.environ.get("METFAN_ESM2"))
     parser.add_argument("--prott5", default=os.environ.get("METFAN_PROTT5"))
     args = parser.parse_args()
+    if args.epochs is not None and args.epochs < 1:
+        parser.error("--epochs must be positive")
     output, repo = args.output.resolve(), args.repo.resolve()
     if args.action == "prepare":
         root = (args.data_root or PROJECT / ROOTS[args.task]).resolve()
@@ -207,7 +228,7 @@ def main():
     elif args.action == "diagnose":
         diagnose(output, args.seed)
     else:
-        train(repo, output, args.seed)
+        train(repo, output, args.seed, args.epochs)
 
 
 if __name__ == "__main__":

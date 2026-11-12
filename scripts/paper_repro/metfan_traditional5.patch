@@ -1,0 +1,64 @@
+--- a/train.py
++++ b/train.py
+@@ -221,6 +221,11 @@
+     # 训练变量
+     best_val_score = 0
+     best_epoch = 0
++    clustered = getattr(args, "metric_suite", None) == "traditional5"
++    best_key = None
++    if clustered:
++        from mfp_nova.paper_benchmark import traditional5_selection
++        from mfp_nova.metric_protocol import format_primary
+     patience = 50
+     counter = 0
+     steps = 0
+@@ -234,7 +239,7 @@
+     
+     # 训练循环
+     print("开始训练模型...")
+-    for epoch in range(1, 1000):  # 最多1000轮
++    for epoch in range(1, getattr(args, 'paper_epochs', 999) + 1):
+         # 训练
+         model.train()
+         train_loss = 0
+@@ -344,7 +349,16 @@
+                     raise
+             
+             # 评估验证集性能
+-            val_metrics = evaluate(np.array(val_preds), np.array(val_labels))
++            val_preds, val_labels = np.asarray(val_preds), np.asarray(val_labels)
++            if clustered:
++                key, threshold, fitted = traditional5_selection(val_labels, val_preds)
++                val_thresholds = [float(threshold)] * val_labels.shape[1]
++                val_metrics = evaluate(val_preds, val_labels, thresholds=val_thresholds)
++                val_metrics["selection_key"] = key
++                print(f"Val epoch={epoch} threshold={threshold:.2f} "
++                      f"{format_primary('traditional5', fitted)}", flush=True)
++            else:
++                val_metrics = evaluate(val_preds, val_labels)
+             history['val_metrics'].append(val_metrics)
+             
+             # 打印当前轮次的性能
+@@ -352,7 +366,11 @@
+             
+             # 检查是否有提升
+             current_val_score = val_metrics['macro_f1']
+-            if current_val_score > best_val_score:
++            improved = ((best_key is None or key > best_key) if clustered
++                        else current_val_score > best_val_score)
++            if improved:
++                if clustered:
++                    best_key = key
+                 best_val_score = current_val_score
+                 best_epoch = epoch
+                 counter = 0
+@@ -363,7 +381,8 @@
+                     'optimizer_state_dict': optimizer.state_dict(),
+                     'epoch': epoch,
+                     'best_val_score': float(best_val_score),
+-                    'val_thresholds': [float(v) for v in find_best_thresholds(np.array(val_labels), np.array(val_preds))],
++                    'val_thresholds': (val_thresholds if clustered else
++                                       [float(v) for v in find_best_thresholds(val_labels, val_preds)]),
+                     'args': vars(args),
+                     'feature_types': model.feature_types,
+                     'optimize_features': getattr(model, 'optimize_features', False),

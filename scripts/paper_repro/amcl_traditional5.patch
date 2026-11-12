@@ -1,0 +1,20 @@
+--- a/train.py
++++ b/train.py
+@@ -40,7 +40,7 @@
+         self.contrastive_label_count = contrastive_label_count
+         self.contrastive_criterion = MultiLabelContrastiveLoss().to(device)
+ 
+-    def train_step(self, train_iter, test_iter=None, epochs=None, model_name='', va=True):
++    def train_step(self, train_iter, test_iter=None, epochs=None, model_name='', va=True, epoch_callback=None):
+         steps = 1
+         for epoch in range(1, epochs + 1):
+             start_time = time.time()
+@@ -78,6 +78,8 @@
+             epoch_time = end_time - start_time
+             print(f'{model_name}|Epoch:{epoch:003}/{epochs}|Run time:{epoch_time:.2f}s')
+             print(f'Train loss:{np.mean(train_loss):.4f}')
++            if epoch_callback is not None:
++                epoch_callback(epoch)
+ 
+ 
+ def custom_sigmoid_multi_threshold(x, thresholds, k=10):    #k=1

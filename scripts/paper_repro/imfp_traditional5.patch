@@ -1,0 +1,76 @@
+--- a/Task/TaskForMultiPeptide_MFTP.py
++++ b/Task/TaskForMultiPeptide_MFTP.py
+@@ -6,7 +6,12 @@
+ from utils.log_helper import logger_init
+ from utils.evaluation import evaluate
+ from transformers import BertTokenizer
+-from transformers import AdamW
++try:
++    from transformers import AdamW
++except ImportError:
++    from functools import partial
++    from torch.optim import AdamW as TorchAdamW
++    AdamW = partial(TorchAdamW, eps=1e-6, weight_decay=0.0)
+ from models.FGM import FGM
+ import numpy as np
+ import logging
+@@ -102,6 +102,7 @@
+     adj_matrix = torch.from_numpy(graph_info).float().to(config.device)
+     print(adj_matrix.shape)
+ 
++    epoch_callback = getattr(config, 'epoch_callback', None)
+     for epoch in range(config.epochs):
+         model.train()
+         losses = 0
+@@ -146,14 +147,19 @@
+         end_time = time.time()
+         train_loss = losses / len(train_iter)
+ 
+-        if (epoch+1) % 5 == 0:
++        if epoch_callback is None and (epoch+1) % 5 == 0:
+             aiming, _, _, _, _ = TestModel(train_iter, adj_matrix, model, config.device, data_loader.PAD_IDX, config.res_path, config.model_num)
+             logging.info(f"Epoch: {epoch+1}, Train loss: {train_loss:.3f}, Train precision: {aiming:.3f}, Epoch time = {(end_time - start_time):.3f}s")
+         else:
+             logging.info(f"Epoch: {epoch+1}, Train loss: {train_loss:.3f}, Epoch time = {(end_time - start_time):.3f}s")
+ 
+-        # save the final model
+-        torch.save(model.state_dict(), config.model_save_path)
++        if epoch_callback is None:
++            torch.save(model.state_dict(), config.model_save_path)
++        else:
++            epoch_callback(epoch + 1, model, adj_matrix, data_loader, test_iter)
++
++    if epoch_callback is not None:
++        return model, adj_matrix, data_loader
+ 
+     
+     # test model
+@@ -167,7 +173,7 @@
+     return model, adj_matrix, data_loader
+         
+ 
+-def TestModel(data_iter, adj_matrix, model, device, PAD_IDX, res_path, model_num, save_predictions=False):
++def TestModel(data_iter, adj_matrix, model, device, PAD_IDX, res_path, model_num, save_predictions=False, return_predictions=False):
+     import numpy as np
+     model.eval()
+     with torch.no_grad():
+@@ -186,12 +192,13 @@
+             y_pred = logits.sigmoid()   
+             y_pred = y_pred.detach().cpu().numpy()
+             label_ids = y.to('cpu').numpy()
+-            if id == 0:
+-                pred_res = y_pred
+-                real_res = label_ids
+-            else:
+-                pred_res = np.vstack((pred_res, y_pred))
+-                real_res = np.vstack((real_res, label_ids))
++            pred_res.append(y_pred)
++            real_res.append(label_ids)
++        pred_res = np.concatenate(pred_res)
++        real_res = np.concatenate(real_res)
++        if return_predictions:
++            model.train()
++            return real_res, pred_res
+         if save_predictions:
+             np.savez_compressed(res_path + ".npz", probabilities=pred_res, targets=real_res)
+         aiming, coverage, accuracy, absolute_true, absolute_false = evaluate(pred_res>0.5, real_res)

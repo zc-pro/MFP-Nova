@@ -61,7 +61,9 @@ PY
                 python main.py -act t e -seed 50 -task original_mtp15 -pth "$run/sa_mtp.pth" -result_folder "$run"
                 ;;
             METFAN)
-                git apply --ignore-space-change --reverse --check "$kit/metfan_val_thresholds.patch"
+                git apply --ignore-space-change --reverse --check "$kit/metfan_traditional5.patch" 2>/dev/null ||
+                    git apply --ignore-space-change --reverse --check "$kit/metfan_therapep.patch" 2>/dev/null ||
+                    git apply --ignore-space-change --reverse --check "$kit/metfan_val_thresholds.patch"
                 # The public text files are at repo root; load_dataset expects split subdirectories.
                 for split in train val test; do
                     mkdir -p "$run/data/$split"

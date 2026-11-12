@@ -2,6 +2,90 @@
 
 **2026-11-04，五模型原数据首轮复现已完成，当前研究目标转为 TheraPep 三任务重训练。** 首节给出最新数据核对和适配方案。后面的 V100 章节保留首轮结果与命令，11月2日 TheraPep 分析和编号1–7节为历史判断，涉及可用资产、风险和实施顺序时以最新研究为准。
 
+V100 的复现目录已迁到 `/home/ubuntu/wuzhencheng/projects/reproduction/`。`PAPER_ROOT` 指向此处，五个作者仓库、`results/`、`therapep_runs/`、`pretrained/` 都在目录内。旧工作树里的 Python 入口仍有原目录默认值，复用时按下文显式传入 `--repo`，SA-MTP 的 `features` 动作同时传入 `--esm2`。本轮已完成的四份 TheraPep48 正式结果见[重训练对比](同类论文-原数据复现与TheraPep重训练对比.md)。已有仓库和结果可直接使用，下面的 clone、补丁应用和训练命令用于复跑对应流程。
+
+## major15 和 fine39 的同类研究对照
+
+使用 `data/therapeutic_2025` 的原样本掩码、可用的规范化序列和既有簇划分。各作者模型的输入沿用其序列字母表，小写 D 残基转为对应的大写氨基酸。保持数据行、ID、标签顺序和集合归属。METFAN 保留原长度规则，每个任务只少用 1 条超过 50 残基的 Train 样本，Val 和 Test 完整保留。AMCL 仅增强 Train，去除与 Val 或 Test 序列完全相同的生成样本。
+
+| 任务 | Train | Val | Test |
+|---|---:|---:|---:|
+| major15 | 39,478 | 8,534 | 8,187 |
+| fine39 | 39,455 | 8,529 | 8,180 |
+
+METFAN、iMFP-LG、AMCL、SA-MTP-single 在每个候选 epoch 用 Val 拟合全局阈值，沿用 HelixSet 的 `traditional5` 网格和规则。按 Val Acc 选权重，同分看 AT，再同分保留较早轮次。恢复最佳权重后以该轮阈值评估 Test。`comparison.json` 中的 `traditional5` 提供 Acc、Prec、Cov、AT、AF，`full_test` 提供 F1、AP 和独立功能投影下的多功能肽指标。默认首轮 seed 为 42，保留各方法原训练日程。
+
+HelixSet 与 TheraPep-AI 已有同划分、同协议的 Test 成绩，可以直接纳入结果表。TPpred-LE 仍需本任务的 PSSM，`structure_inputs.py` 已支持导出查询。SA-MTP-single 生成一份 major15 单序列 PSIPRED、ESM2 和构图缓存，fine39 复用其中对应的序列特征。
+
+已有 TheraPep48 的作者仓库只需分别应用下表最后一个新增补丁，SA-MTP 继续使用现有两个补丁。新克隆按表中顺序应用。V100 的作者仓库在 `$PAPER_ROOT`，RTX 5070 也按相同目录结构放置作者仓库和预训练权重。
+
+| 作者仓库 | 原提交 | 所需补丁顺序 |
+|---|---|---|
+| METFAN | `048fdf7` | `metfan_val_thresholds.patch` → `metfan_therapep.patch` → `metfan_traditional5.patch` |
+| iMFP-LG | `911da39` | `imfp_therapep.patch` → `imfp_traditional5.patch` |
+| AMCL | `627c637` | `amcl_therapep.patch` → `amcl_traditional5.patch` |
+| SA-MTP | `3e23883` | `sa_mtp_therapep.patch` → `sa_mtp_js.patch` |
+
+### V100（Ubuntu Bash）
+
+首次从已同步的 `origin/main` 建立独立工作树，读取主项目的数据。已有该工作树时复用。应用本轮尚缺的增量补丁后，选择模型和已分配的 GPU。一个作业依次跑 major15 和 fine39，输出在 `clustered_runs/`。
+
+```bash
+export PAPER_ROOT="$HOME/wuzhencheng/projects/reproduction"
+BASE="$HOME/wuzhencheng/projects/MFP-Nova"
+CODE="$HOME/wuzhencheng/projects/MFP-Nova-clustered"
+git -C "$BASE" fetch origin main
+git -C "$BASE" worktree add --detach "$CODE" origin/main
+KIT="$CODE/scripts/paper_repro"
+
+git -C "$PAPER_ROOT/METFAN" apply --ignore-space-change "$KIT/metfan_traditional5.patch"
+git -C "$PAPER_ROOT/iMFP-LG" apply --ignore-space-change "$KIT/imfp_traditional5.patch"
+git -C "$PAPER_ROOT/AMCL" apply --ignore-space-change "$KIT/amcl_traditional5.patch"
+
+MODEL=METFAN                         # 或 iMFP-LG、AMCL、SA-MTP-single
+GPU_ID=1                            # 改为已分配的卡
+CPU_THREADS=4
+ENV_NAME=repro-modern
+if [ "$MODEL" = iMFP-LG ]; then ENV_NAME=repro-imfp; fi
+PAPER_PYTHON="$HOME/.conda/envs/$ENV_NAME/bin/python"
+out="$PAPER_ROOT/clustered_runs/traditional5_seed42_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$out"
+CUDA_VISIBLE_DEVICES="$GPU_ID" OMP_NUM_THREADS="$CPU_THREADS" MKL_NUM_THREADS="$CPU_THREADS" \
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 MPLBACKEND=Agg \
+nohup "$PAPER_PYTHON" -u "$KIT/run_clustered.py" "$MODEL" --seed 42 \
+  --data-root "$BASE/data/therapeutic_2025" --output "$out" \
+  >"$out/$MODEL.log" 2>&1 < /dev/null &
+echo "PID=$! LOG=$out/$MODEL.log"
+tail -f "$out/$MODEL.log"
+```
+
+### RTX 5070（Windows PowerShell）
+
+在 MFP-Nova 项目根目录激活现有 `MFP-Nova` 环境。按表准备作者仓库，使用 `git -C (Join-Path $env:PAPER_ROOT 'METFAN') apply --ignore-space-change (Join-Path $kit 'metfan_traditional5.patch')` 这一形式应用补丁。缺少复现依赖时在该环境安装 `pandas matplotlib seaborn tqdm six sentencepiece protobuf`。iMFP-LG 优先使用 Transformers AdamW，环境缺少此实现时使用匹配超参数的 PyTorch AdamW。
+
+```powershell
+conda activate MFP-Nova
+$env:PAPER_ROOT = 'D:\Data\reproduction'  # 改为本机作者仓库和 pretrained 所在目录
+$kit = Join-Path (Get-Location).Path 'scripts\paper_repro'
+$model = 'METFAN'                        # 或 iMFP-LG、AMCL、SA-MTP-single
+$env:CUDA_VISIBLE_DEVICES = '0'
+$env:OMP_NUM_THREADS = '4'
+$env:MKL_NUM_THREADS = '4'
+$env:HF_HUB_OFFLINE = '1'
+$env:TRANSFORMERS_OFFLINE = '1'
+$env:MPLBACKEND = 'Agg'
+$out = Join-Path $env:PAPER_ROOT ('clustered_runs\traditional5_seed42_' + (Get-Date -Format 'yyyyMMdd_HHmmss'))
+New-Item -ItemType Directory -Path $out -Force | Out-Null
+$extra = @()
+if ($model -eq 'SA-MTP-single') {
+    $extra = @('--ss2-source', 'D:\Data\reproduction\major15_ss2') # 对应 V100 major15 查询的 .ss2 文件夹
+}
+& python -u (Join-Path $kit 'run_clustered.py') $model --seed 42 --output $out @extra 2>&1 |
+    Tee-Object -FilePath (Join-Path $out "$model.log")
+```
+
+Windows 的 SA-MTP-single 使用对应 major15 查询的 PSIPRED 输出。V100 作业产出的 `$out/SA-MTP-single/major15/ss2/` 可以通过 UU 传至 RTX 5070，随后由 Windows 生成 ESM2 特征和图并训练。两边使用同一版本数据划分，保证 `.ss2` 的查询 ID 对齐。其余预训练路径为 `pretrained/esm2_t33_650M_UR50D`、`pretrained/prot_t5_xl_half_uniref50-enc` 和 `iMFP-LG/pretrain_model/tapebert`。
+
 ## SA-MTP-single：不下载搜索数据库的重训练（2026-11-04）
 
 用户因存储成本取消TPpred-LE后，恢复SA-MTP，按低磁盘方案推进。**本入口明确命名SA-MTP-single，是结构特征来源改变的变体，不作为完整原方法结果。** SS2通过已安装PSIPRED4.0的seq2mtx、psipred、psipass2逐序列生成，不下载NR/UniRef90、不用统一结构或全连接图代替真实预测。官方说明单序列结构预测效果较弱，参见[PSIPRED README](https://github.com/psipred/psipred/blob/master/README)。TPpred-LE继续取消。
@@ -25,10 +109,11 @@ V100当前已完成全部55651条SS2和ESM2，图缓存完成计数44027。构�
 ```bash
 export BASE="$HOME/wuzhencheng/projects/MFP-Nova"
 export SA_PROJECT="$HOME/wuzhencheng/projects/MFP-Nova-sa"
-export SA_REPO="$HOME/paper-repro/SA-MTP"
+export PAPER_ROOT="$HOME/wuzhencheng/projects/reproduction"
+export SA_REPO="$PAPER_ROOT/SA-MTP"
 export SA_SCRIPT="$SA_PROJECT/scripts/paper_repro/sa_mtp_therapep.py"
 export SA_PYTHON="$HOME/.conda/envs/repro-modern/bin/python"
-export sa_out="$HOME/paper-repro/therapep_runs/sa_mtp_single_therapep48_20261104_160627"
+export sa_out="$PAPER_ROOT/therapep_runs/sa_mtp_single_therapep48_20261104_160627"
 
 git -C "$BASE" fetch origin main
 git -C "$SA_PROJECT" checkout --detach origin/main
@@ -59,17 +144,19 @@ tail -f "$sa_out/resume_js.log"
 ```bash
 export BASE="$HOME/wuzhencheng/projects/MFP-Nova"
 export SA_PROJECT="$HOME/wuzhencheng/projects/MFP-Nova-sa"
+export PAPER_ROOT="$HOME/wuzhencheng/projects/reproduction"
 git -C "$BASE" fetch origin main
 git -C "$BASE" worktree add --detach "$SA_PROJECT" origin/main
 export SA_SCRIPT="$SA_PROJECT/scripts/paper_repro/sa_mtp_therapep.py"
-export SA_REPO="$HOME/paper-repro/SA-MTP"
+export SA_REPO="$PAPER_ROOT/SA-MTP"
+export SA_ESM2="$PAPER_ROOT/pretrained/esm2_t33_650M_UR50D"
 export SA_PYTHON="$HOME/.conda/envs/repro-modern/bin/python"
-export SA_INPUT="$HOME/paper-repro/therapep_runs/structure_therapep48_20261104_135404"
-export sa_out="$HOME/paper-repro/therapep_runs/sa_mtp_single_therapep48_$(date +%Y%m%d_%H%M%S)"
+export SA_INPUT="$PAPER_ROOT/therapep_runs/structure_therapep48_20261104_135404"
+export sa_out="$PAPER_ROOT/therapep_runs/sa_mtp_single_therapep48_$(date +%Y%m%d_%H%M%S)"
 
 git -C "$SA_REPO" apply --ignore-space-change "$SA_PROJECT/scripts/paper_repro/sa_mtp_therapep.patch"
 git -C "$SA_REPO" apply --ignore-space-change "$SA_PROJECT/scripts/paper_repro/sa_mtp_js.patch"
-"$SA_PYTHON" "$SA_SCRIPT" prepare --input "$SA_INPUT" --output "$sa_out"
+"$SA_PYTHON" "$SA_SCRIPT" prepare --repo "$SA_REPO" --input "$SA_INPUT" --output "$sa_out"
 
 export GPU_ID=1
 export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 PYTHONUNBUFFERED=1 MPLBACKEND=Agg
@@ -78,7 +165,7 @@ nohup bash -c '
   set -e
   for stage in ss2 features graphs; do
     "$SA_PYTHON" "$SA_SCRIPT" "$stage" --repo "$SA_REPO" \
-      --output "$sa_out" --limit-per-split 8
+      --esm2 "$SA_ESM2" --output "$sa_out" --limit-per-split 8
   done
   "$SA_PYTHON" "$SA_SCRIPT" train --repo "$SA_REPO" --output "$sa_out" \
     --seed 42 --epochs 1 --warmup-epochs 1 --batch-size 8 --limit-per-split 8
@@ -98,7 +185,7 @@ CUDA_VISIBLE_DEVICES="$GPU_ID" HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
 nohup bash -c '
   set -e
   for stage in ss2 features graphs; do
-    "$SA_PYTHON" "$SA_SCRIPT" "$stage" --repo "$SA_REPO" --output "$sa_out"
+    "$SA_PYTHON" "$SA_SCRIPT" "$stage" --repo "$SA_REPO" --esm2 "$SA_ESM2" --output "$sa_out"
   done
   "$SA_PYTHON" "$SA_SCRIPT" train --repo "$SA_REPO" --output "$sa_out" \
     --seed 42 --epochs 30 --warmup-epochs 3 --batch-size 64
@@ -137,7 +224,7 @@ export NEXT_PROJECT="$HOME/wuzhencheng/projects/MFP-Nova-paper-next"
 git -C "$BASE" fetch origin main
 git -C "$BASE" worktree add --detach "$NEXT_PROJECT" origin/main
 export NEXT_KIT="$NEXT_PROJECT/scripts/paper_repro"
-export PAPER_ROOT="$HOME/paper-repro"
+export PAPER_ROOT="$HOME/wuzhencheng/projects/reproduction"
 export MODERN_PYTHON="$HOME/.conda/envs/repro-modern/bin/python"
 export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4
 export metfan_out="$PAPER_ROOT/therapep_runs/metfan_therapep48_20261104_011944"
@@ -161,12 +248,13 @@ nvidia-smi
 ```bash
 export IMFP_KIT="$HOME/wuzhencheng/projects/MFP-Nova-imfp/scripts/paper_repro"
 export IMFP_PYTHON="$HOME/.conda/envs/repro-imfp/bin/python"
-export imfp_out="$HOME/paper-repro/therapep_runs/imfp_therapep48_20261104_015157"
+export PAPER_ROOT="$HOME/wuzhencheng/projects/reproduction"
+export imfp_out="$PAPER_ROOT/therapep_runs/imfp_therapep48_20261104_015157"
 export GPU_ID=0
 export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 PYTHONUNBUFFERED=1
 CUDA_VISIBLE_DEVICES="$GPU_ID" HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
 nohup "$IMFP_PYTHON" "$IMFP_KIT/imfp_therapep.py" train \
-  --output "$imfp_out" --seed 42 --epochs 100 --batch-size 32 \
+  --repo "$PAPER_ROOT/iMFP-LG" --output "$imfp_out" --seed 42 --epochs 100 --batch-size 32 \
   >"$imfp_out/train.log" 2>&1 < /dev/null &
 echo "PID=$! LOG=$imfp_out/train.log"
 tail -f "$imfp_out/train.log"
@@ -275,7 +363,7 @@ cd "$HOME/wuzhencheng/projects/MFP-Nova"
 git pull --ff-only origin main
 conda activate repro-modern
 export KIT="$PWD/scripts/paper_repro"
-export PAPER_ROOT="$HOME/paper-repro"
+export PAPER_ROOT="$HOME/wuzhencheng/projects/reproduction"
 
 # 原始TheraPep CSV或变体尚未放在服务器时，使用项目已有命令准备。
 python -m mfp_nova.cli download-therapep
@@ -301,8 +389,8 @@ export METFAN_PYTHON="$CONDA_PREFIX/bin/python"
 "$METFAN_PYTHON" -c 'import sys, torch; print(sys.executable, torch.__version__)'
 CUDA_VISIBLE_DEVICES=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
 nohup bash -c '
-  "$1" "$2" features --output "$3" &&
-  "$1" "$2" train --output "$3" --seed 42
+  "$1" "$2" features --repo "$PAPER_ROOT/METFAN" --output "$3" &&
+  "$1" "$2" train --repo "$PAPER_ROOT/METFAN" --output "$3" --seed 42
 ' _ "$METFAN_PYTHON" "$KIT/metfan_therapep.py" "$out" >"$out/run.log" 2>&1 < /dev/null &
 echo "PID=$! LOG=$out/run.log"
 tail -f "$out/run.log"
@@ -326,7 +414,7 @@ export IMFP_PROJECT="$HOME/wuzhencheng/projects/MFP-Nova-imfp"
 git -C "$BASE" fetch origin main
 git -C "$BASE" worktree add --detach "$IMFP_PROJECT" origin/main
 export IMFP_KIT="$IMFP_PROJECT/scripts/paper_repro"
-export PAPER_ROOT="$HOME/paper-repro"
+export PAPER_ROOT="$HOME/wuzhencheng/projects/reproduction"
 
 conda activate repro-imfp
 export IMFP_PYTHON="$CONDA_PREFIX/bin/python"
@@ -347,7 +435,7 @@ export imfp_out="$PAPER_ROOT/therapep_runs/imfp_therapep48_$(date +%Y%m%d_%H%M%S
 export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4
 CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
 nohup "$IMFP_PYTHON" "$IMFP_KIT/imfp_therapep.py" train \
-  --output "$imfp_out" --seed 42 --epochs 1 --batch-size 32 \
+  --repo "$PAPER_ROOT/iMFP-LG" --output "$imfp_out" --seed 42 --epochs 1 --batch-size 32 \
   >"$imfp_out/short_train.log" 2>&1 < /dev/null &
 echo "PID=$! LOG=$imfp_out/short_train.log"
 tail -f "$imfp_out/short_train.log"
@@ -373,14 +461,14 @@ export AMCL_PROJECT="$HOME/wuzhencheng/projects/MFP-Nova-amcl"
 git -C "$BASE" fetch origin main
 git -C "$BASE" worktree add --detach "$AMCL_PROJECT" origin/main
 export AMCL_KIT="$AMCL_PROJECT/scripts/paper_repro"
-export PAPER_ROOT="$HOME/paper-repro"
+export PAPER_ROOT="$HOME/wuzhencheng/projects/reproduction"
 conda activate repro-modern
 export AMCL_PYTHON="$HOME/.conda/envs/repro-modern/bin/python"
 
 git -C "$PAPER_ROOT/AMCL" apply --ignore-space-change "$AMCL_KIT/amcl_therapep.patch"
 export amcl_out="$PAPER_ROOT/therapep_runs/amcl_therapep48_$(date +%Y%m%d_%H%M%S)"
 "$AMCL_PYTHON" "$AMCL_KIT/amcl_therapep.py" prepare \
-  --task therapep48 --data-root "$BASE/data/therapep48" --output "$amcl_out" --seed 42
+  --repo "$PAPER_ROOT/AMCL" --task therapep48 --data-root "$BASE/data/therapep48" --output "$amcl_out" --seed 42
 ```
 
 以上仅准备CPU增强，不占用训练GPU。两个现有GPU作业完成或有其他已分配空闲卡后，再选择该卡短训练。下面物理GPU0只作用户已确认可用时的示例。
@@ -389,7 +477,7 @@ export amcl_out="$PAPER_ROOT/therapep_runs/amcl_therapep48_$(date +%Y%m%d_%H%M%S
 export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4
 CUDA_VISIBLE_DEVICES=0 \
 nohup "$AMCL_PYTHON" "$AMCL_KIT/amcl_therapep.py" train \
-  --output "$amcl_out" --seed 42 --epochs 1 --batch-size 256 \
+  --repo "$PAPER_ROOT/AMCL" --output "$amcl_out" --seed 42 --epochs 1 --batch-size 256 \
   >"$amcl_out/short_train.log" 2>&1 < /dev/null &
 echo "PID=$! LOG=$amcl_out/short_train.log"
 tail -f "$amcl_out/short_train.log"
@@ -417,7 +505,7 @@ MTP15 的 Train/Val/Test 为 8,190/1,023/1,024。下表为百分数；横线表�
 | SA-MTP seed50 混合阈值 | — | 58.90 | 43.02 | 38.18 | 8.89 |
 | METFAN seed42 完整融合 | 59.69 | — | 48.60 | 46.73 | 8.60 |
 
-TPpred-LE 结果目录为 `~/paper-repro/results/TPpred-LE.O4kGdp/`。SA-MTP 为 `SA-MTP.kgEohV/`，Epoch 13 的 Val loss 最低为 0.200873，第28轮早停；公开实现的引用保存实际留下第28轮参数，应标为原代码结果。TPpred-LE 同样保留了原引用保存行为。METFAN 为 `METFAN.aa5che/0/textcnn_esm2_mean_prot_t5_mean_optimized/`，第239轮早停，恢复第189轮保存的权重，最佳 Val Macro-F1 为0.5640。METFAN 使用本项目重建的 ESM2/ProtT5 特征和 Val 阈值补丁，精确 checkpoint 和池化设置见后文。
+TPpred-LE 结果目录为 `~/wuzhencheng/projects/reproduction/results/TPpred-LE.O4kGdp/`。SA-MTP 为 `SA-MTP.kgEohV/`，Epoch 13 的 Val loss 最低为 0.200873，第28轮早停；公开实现的引用保存实际留下第28轮参数，应标为原代码结果。TPpred-LE 同样保留了原引用保存行为。METFAN 为 `METFAN.aa5che/0/textcnn_esm2_mean_prot_t5_mean_optimized/`，第239轮早停，恢复第189轮保存的权重，最佳 Val Macro-F1 为0.5640。METFAN 使用本项目重建的 ESM2/ProtT5 特征和 Val 阈值补丁，精确 checkpoint 和池化设置见后文。
 
 MFTP21 结果同样为百分数。iMFP-LG 原 NPY Test 读取1,975条；AMCL 原编码器过滤后为1,969条。保留原生处理时须注明这6条覆盖差异。
 
@@ -427,7 +515,7 @@ MFTP21 结果同样为百分数。iMFP-LG 原 NPY Test 读取1,975条；AMCL 原
 | AMCL 重建训练入口，200轮 | 75.0 | 70.7 | 69.5 | 63.7 | 3.3 |
 | iMFP-LG 编号0 / seed0，100轮 | 70.0 | 71.2 | 65.8 | 57.0 | 3.8 |
 
-AMCL 本次目录为 `~/paper-repro/results/AMCL.2xm3sd/`，权重 `amcl.pth`。iMFP-LG 将最终权重保存为对应 `iMFP-LG.*/model0.bin`，日志在第100轮之后打印的“on val”五项实际调用 `TestModel(test_iter, ...)`，属于独立 Test。原入口未输出 Macro/Micro-F1，不从样本均值 Precision/Recall 推算这两项。原来的 `MFTP_alldata` 全数据任务权重未用于此测试。当前结果支持原数据训练通路已跑通；稳定的重复实验及最佳轮保存修正结果尚待完成。
+AMCL 本次目录为 `~/wuzhencheng/projects/reproduction/results/AMCL.2xm3sd/`，权重 `amcl.pth`。iMFP-LG 将最终权重保存为对应 `iMFP-LG.*/model0.bin`，日志在第100轮之后打印的“on val”五项实际调用 `TestModel(test_iter, ...)`，属于独立 Test。原入口未输出 Macro/Micro-F1，不从样本均值 Precision/Recall 推算这两项。原来的 `MFTP_alldata` 全数据任务权重未用于此测试。当前结果支持原数据训练通路已跑通；稳定的重复实验及最佳轮保存修正结果尚待完成。
 
 **本轮重点复现五个模型，每个先在作者主划分上完成一次训练与测试。** MTP15 选 TPpred-LE、SA-MTP、METFAN，共用 1,024 条原始测试记录；MFTP21 选 AMCL、iMFP-LG，共用 1,975 条原始测试记录。各自保留原生预处理，汇报实际进入评分的样本数，两个数据集分表。新增的 iMFP-LG 优先做 MFTP21 单个模型编号，MFBP5 留到后续；METFAN 排最后，先落实 ESM2/ProtT5 特征，再运行完整融合模型，用验证集确定阈值后单独报告独立测试成绩。
 
@@ -452,7 +540,7 @@ AMCL 本次目录为 `~/paper-repro/results/AMCL.2xm3sd/`，权重 `amcl.pth`。
 
 ```bash
 export KIT="$PWD/scripts/paper_repro"
-export PAPER_ROOT="$HOME/paper-repro"
+export PAPER_ROOT="$HOME/wuzhencheng/projects/reproduction"
 mkdir -p "$PAPER_ROOT"
 cd "$PAPER_ROOT"
 git clone https://github.com/HongWuL/TPpred-LE.git && git -C TPpred-LE checkout 9913cc9
@@ -516,7 +604,7 @@ echo "PID=$!   queue log=$log"
 tail -f "$log"
 ```
 
-队列日志打印每个实验的绝对目录。进入对应目录用 `tail -f run.log` 看逐轮日志。`Ctrl+C` 只结束 tail，SSH 可断开。重登后使用 `ls -td ~/paper-repro/results/* | head` 找本次目录。重试会创建新的结果目录。METFAN 两个特征都成功生成后，如仅重跑训练，可设置 `export METFAN_FEATURES=/原运行目录/features` 复用同一原始划分、相同编码器的六份张量。
+队列日志打印每个实验的绝对目录。进入对应目录用 `tail -f run.log` 看逐轮日志。`Ctrl+C` 只结束 tail，SSH 可断开。重登后使用 `ls -td ~/wuzhencheng/projects/reproduction/results/* | head` 找本次目录。重试会创建新的结果目录。METFAN 两个特征都成功生成后，如仅重跑训练，可设置 `export METFAN_FEATURES=/原运行目录/features` 复用同一原始划分、相同编码器的六份张量。
 
 | 模型 | 脚本实际做什么 | 首次应核对 |
 |---|---|---|

@@ -20,6 +20,8 @@ PROJECT = Path(__file__).resolve().parents[2]
 KIT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT / "src"))
 from mfp_nova.metrics import evaluate_metrics
+from mfp_nova.metric_protocol import format_primary
+from mfp_nova.paper_benchmark import CLUSTERED, traditional5_report, traditional5_selection
 
 
 def fasta(path):
@@ -246,7 +248,7 @@ def repair_graphs(output):
 
 
 class Peptides(Dataset):
-    def __init__(self, output, split, limit=0):
+    def __init__(self, output, split, limit=0, feature_source=None):
         from utils.graph_builder import apply_dropedge
         info = load_info(output)
         inputs = Path(info["input"])
@@ -261,7 +263,7 @@ class Peptides(Dataset):
         if limit:
             self.records, self.y, self.rows = self.records[:limit], self.y[:limit], self.rows[:limit]
         _, self.offsets, self.index = feature_layout(info)
-        folder = output / "features"
+        folder = (feature_source or output) / "features"
         self.embeddings = np.load(folder / "esm2.npy", mmap_mode="r")
         self.graphs = np.load(folder / "graphs.npy", mmap_mode="r")
         ready = set((folder / "graphs_completed.txt").read_text().splitlines())
@@ -291,10 +293,10 @@ class Peptides(Dataset):
                 torch.arange(self.y.shape[1]), torch.tensor(np.asarray(graph), dtype=torch.float32))
 
 
-def loaders(output, batch_size, limit, device):
+def loaders(output, batch_size, limit, device, feature_source=None):
     def collate(batch):
         return tuple(value.to(device) for value in default_collate(batch))
-    datasets = {split: Peptides(output, split, limit) for split in ("train", "val", "test")}
+    datasets = {split: Peptides(output, split, limit, feature_source) for split in ("train", "val", "test")}
     result = {split: DataLoader(dataset, batch_size=batch_size, shuffle=(split == "train"),
                                 num_workers=0, pin_memory=False, collate_fn=collate)
               for split, dataset in datasets.items()}
@@ -308,7 +310,7 @@ def predict(model, loader):
                            for x, _, mask, tokens, graph in loader])
 
 
-def train(output, repo, seed, epochs, warmup, batch_size, limit, run_name=None):
+def train(output, repo, seed, epochs, warmup, batch_size, limit, run_name=None, feature_source=None):
     from models.tppred import TPMLC_single
     from run_network import Model
     from utils.threshold_optimizer import find_optimal_threshold
@@ -322,10 +324,13 @@ def train(output, repo, seed, epochs, warmup, batch_size, limit, run_name=None):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     info = load_info(output)
+    clustered = info["task"] in CLUSTERED
+    if feature_source is not None and queries(info) != queries(load_info(feature_source)):
+        raise ValueError("Shared SA-MTP features require identical query IDs, sequences and order")
     result = output / "training" / (run_name or f"seed{seed}_epochs{epochs}_limit{limit}")
     result.mkdir(parents=True, exist_ok=False)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    datasets, batches = loaders(output, batch_size, limit, device)
+    datasets, batches = loaders(output, batch_size, limit, device, feature_source)
     model = TPMLC_single(1280, len(info["labels"]), 50, 256, device, nhead=4,
                          n_enc_layers=2, n_dec_layers=2, dropout=0.1, use_esm2=True,
                          esm_dim=1280, use_gat=True, use_film=True, film_dropout=0.2,
@@ -345,6 +350,10 @@ def train(output, repo, seed, epochs, warmup, batch_size, limit, run_name=None):
                 "graph_js": "float64 base-2 JS divergence via rel_entr; clamp negative roundoff before exp",
                 "threshold_protocol": "Val-only per-class F1 on 0.05..0.95 grid; single-class Val columns "
                                       "fixed at 0.5; fixed-0.5 results also reported"}
+    if clustered:
+        settings["threshold_protocol"] = "Validation only, global Jaccard"
+    if feature_source is not None:
+        settings["feature_source"] = str(feature_source)
     print(json.dumps(settings, indent=2), flush=True)
     history = []
     if warmup:
@@ -357,17 +366,28 @@ def train(output, repo, seed, epochs, warmup, batch_size, limit, run_name=None):
         Model.unfreeze_all(context, model)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
     best_loss, best_epoch, stale = float("inf"), 0, 0
+    best_key, best_threshold = None, None
     for epoch in range(1, epochs+1):
-        loss, val_loss, _, _ = Model.train_epoch(context, model, optimizer, criterion,
-                                                batches["train"], batches["val"], lambda_film=1e-4)
+        loss, val_loss, val_y, val_scores = Model.train_epoch(context, model, optimizer, criterion,
+                                                              batches["train"], batches["val"], lambda_film=1e-4)
         if not np.isfinite(loss + val_loss):
             raise ValueError(f"Non-finite loss at epoch {epoch}")
         history.append({"epoch": epoch, "train_loss": loss, "val_loss": val_loss})
         print(f"Epoch {epoch}/{epochs}: train={loss:.6f} val={val_loss:.6f}", flush=True)
-        if val_loss <= best_loss:
+        if clustered:
+            key, threshold, metrics = traditional5_selection(np.asarray(val_y), np.asarray(val_scores))
+            history[-1].update(threshold=float(threshold), traditional5=metrics)
+            print(f"Val threshold={threshold:.2f} {format_primary('traditional5', metrics)}", flush=True)
+            improved = best_key is None or key > best_key
+            if improved:
+                best_key, best_threshold = key, threshold
+        else:
+            improved = val_loss <= best_loss
+        if improved:
             best_loss, best_epoch, stale = val_loss, epoch, 0
             torch.save({"model_state_dict": model.state_dict(), "epoch": epoch,
-                        "val_loss": val_loss, "settings": settings}, result / "best_model.pth")
+                        "val_loss": val_loss, "settings": settings,
+                        "threshold": None if best_threshold is None else float(best_threshold)}, result / "best_model.pth")
         else:
             stale += 1
             if stale >= 15:
@@ -375,27 +395,25 @@ def train(output, repo, seed, epochs, warmup, batch_size, limit, run_name=None):
                 break
     model.load_state_dict(torch.load(result / "best_model.pth", map_location=device, weights_only=True)["model_state_dict"])
     val_p = predict(model, batches["val"])
-    thresholds = np.full(len(info["labels"]), 0.5)
-    for c in range(len(thresholds)):
-        y = datasets["val"].y[:, c]
-        if np.unique(y).size == 2:
-            thresholds[c] = find_optimal_threshold(val_p[:, c], y, metric="f1")[0]
+    thresholds = np.full(len(info["labels"]), best_threshold if clustered else 0.5)
+    if not clustered:
+        for c in range(len(thresholds)):
+            y = datasets["val"].y[:, c]
+            if np.unique(y).size == 2:
+                thresholds[c] = find_optimal_threshold(val_p[:, c], y, metric="f1")[0]
     # Test is predicted only after checkpoint and all thresholds have been fixed.
     test_p = predict(model, batches["test"])
     for split, probabilities in (("val", val_p), ("test", test_p)):
         dataset = datasets[split]
         np.savez_compressed(result / f"{split}_predictions.npz", targets=dataset.y,
-                            probabilities=probabilities, predicted=probabilities >= thresholds,
+                            probabilities=probabilities, predicted=probabilities >= (best_threshold if clustered else thresholds),
                             thresholds=thresholds, label_names=np.array(info["labels"]),
                             row_ids=np.array([int(row["row_id"]) for row in dataset.rows]),
                             ids=np.array([row["ID"] for row in dataset.rows]))
     y = datasets["test"].y
-    positive = y[:, :48].any(1)
     summary = {**settings, "best_epoch": best_epoch, "best_val_loss": best_loss,
                "selection": "minimum Validation BCE; restored saved state before threshold fitting",
-               "test_rows": len(y), "positive_test_rows": int(positive.sum()),
-               "full_test": evaluate_metrics(y, test_p, threshold=thresholds),
-               "positive_function48": evaluate_metrics(y[positive, :48], test_p[positive, :48], threshold=thresholds[:48]),
+               "test_rows": len(y),
                "fixed_0.5": evaluate_metrics(y, test_p, threshold=0.5),
                "environment": {"python": platform.python_version(), "torch": torch.__version__,
                                "cuda": torch.version.cuda, "numpy": np.__version__,
@@ -403,6 +421,15 @@ def train(output, repo, seed, epochs, warmup, batch_size, limit, run_name=None):
                                "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES")},
                "upstream_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip(),
                "project_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=PROJECT, text=True).strip()}
+    if clustered:
+        summary.update(traditional5_report(y, test_p, best_threshold, best_epoch, info["task"], info["labels"],
+                                           datasets["train"].y.sum(0)),
+                       selection="validation_traditional5")
+    else:
+        positive = y[:, :48].any(1)
+        summary.update(full_test=evaluate_metrics(y, test_p, threshold=thresholds),
+                       positive_test_rows=int(positive.sum()), positive_function48=evaluate_metrics(
+                           y[positive, :48], test_p[positive, :48], threshold=thresholds[:48]))
     (result / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
     (result / "comparison.json").write_text(json.dumps(summary, indent=2, allow_nan=False), encoding="utf-8")
     (result / "thresholds.json").write_text(json.dumps(thresholds.tolist()), encoding="utf-8")
@@ -422,6 +449,7 @@ def main():
     parser.add_argument("--psipred-prefix", type=Path, default=Path.home() / ".conda/envs/repro-features")
     parser.add_argument("--esm2", type=Path, default=Path.home() / "paper-repro/pretrained/esm2_t33_650M_UR50D")
     parser.add_argument("--feature-batch-size", type=int, default=8)
+    parser.add_argument("--feature-source", type=Path, help="Existing SA-MTP feature output with identical queries")
     parser.add_argument("--limit-per-split", type=int, default=0, help="0=full cohort; positive values are smoke tests")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--epochs", type=int, default=30)
@@ -447,7 +475,7 @@ def main():
         repair_graphs(output)
     else:
         train(output, repo, args.seed, args.epochs, args.warmup_epochs, args.batch_size,
-              args.limit_per_split, args.run_name)
+              args.limit_per_split, args.run_name, args.feature_source.resolve() if args.feature_source else None)
 
 
 if __name__ == "__main__":

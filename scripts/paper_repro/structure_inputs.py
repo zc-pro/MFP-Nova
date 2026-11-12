@@ -1,4 +1,4 @@
-"""Export TheraPep inputs and unique sequence queries for TPpred-LE / SA-MTP."""
+"""Export split inputs and unique sequence queries for TPpred-LE / SA-MTP."""
 import argparse
 import csv
 import json
@@ -9,17 +9,20 @@ import numpy as np
 
 PROJECT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT / "src"))
-from mfp_nova.therapep import ROOTS, TRACKS, read_data
+from mfp_nova.paper_benchmark import ROOTS, TRACKS, read_data
 
 
-def prepare(task, root, output):
+def prepare(task, root, output, query_source=None):
     data = read_data(root, task)
-    output.mkdir(parents=True, exist_ok=False)
     # Only feature queries are deduplicated. Every training/evaluation row remains.
-    sequence_ids = {}
-    for sequence in data["sequences"]:
-        if sequence not in sequence_ids:
-            sequence_ids[sequence] = f"pep{len(sequence_ids):07d}"
+    if query_source is None:
+        sequence_ids = {seq: f"pep{i:07d}" for i, seq in enumerate(dict.fromkeys(data["sequences"]))}
+    else:
+        lines = (query_source / "queries.fasta").read_text(encoding="utf-8").splitlines()
+        sequence_ids = {seq: name[1:] for name, seq in zip(lines[::2], lines[1::2])}
+        if not set(data["sequences"]).issubset(sequence_ids):
+            raise ValueError("Query source does not cover this task's sequences")
+    output.mkdir(parents=True, exist_ok=False)
     with (output / "queries.fasta").open("w", encoding="utf-8") as stream:
         for sequence, query_id in sequence_ids.items():
             stream.write(f">{query_id}\n{sequence}\n")
@@ -52,9 +55,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--task", choices=TRACKS, default="therapep48")
     parser.add_argument("--data-root", type=Path)
+    parser.add_argument("--query-source", type=Path, help="Reuse sequence IDs from an existing structure export")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    prepare(args.task, (args.data_root or PROJECT / ROOTS[args.task]).resolve(), args.output.resolve())
+    prepare(args.task, (args.data_root or PROJECT / ROOTS[args.task]).resolve(), args.output.resolve(), args.query_source)
 
 
 if __name__ == "__main__":

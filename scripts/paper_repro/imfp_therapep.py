@@ -17,7 +17,8 @@ PROJECT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT / "src"))
 
 from mfp_nova.metrics import evaluate_metrics
-from mfp_nova.therapep import ROOTS, TRACKS, read_data
+from mfp_nova.paper_benchmark import (CLUSTERED, ROOTS, TRACKS, BestTraditional5, positive_scope, read_data,
+                                      traditional5_report)
 
 
 def prepare(task, root, output):
@@ -30,6 +31,11 @@ def prepare(task, root, output):
             writer = csv.writer(stream)
             writer.writerow(["row_id", "ID"])
             writer.writerows((int(data["rows"][i]), data["ids"][i]) for i in indices)
+        if task in CLUSTERED:
+            with (output / f"{split}.csv").open("w", newline="", encoding="utf-8") as stream:
+                writer = csv.writer(stream)
+                writer.writerow(["Sequence", "Label encoding"])
+                writer.writerows((data["sequences"][i], json.dumps(data["y"][i].tolist())) for i in indices)
         info["splits"][split] = {"rows": len(indices),
                                 "max_length": max(len(data["sequences"][i]) for i in indices)}
     (output / "task.json").write_text(json.dumps(info, indent=2), encoding="utf-8")
@@ -40,6 +46,7 @@ def train(repo, output, seed, epochs, batch_size):
     info = json.loads((output / "task.json").read_text(encoding="utf-8"))
     root = Path(info["data_root"])
     data = read_data(root, info["task"])
+    clustered = info["task"] in CLUSTERED
     # The author's Task module imports utils/models from the repository root.
     sys.path.insert(0, str(repo))
     sys.path.insert(0, str(repo / "Task"))
@@ -52,9 +59,10 @@ def train(repo, output, seed, epochs, batch_size):
     torch.manual_seed(seed)
     cfg = TrainConfig(seed)
     cfg.data_name = info["task"]
-    cfg.dataset_dir = str(root)
-    cfg.train_file_path = str(root / "train.csv")
-    cfg.test_file_path = str(root / "test.csv")
+    csv_root = output if clustered else root
+    cfg.dataset_dir = str(csv_root)
+    cfg.train_file_path = str(csv_root / "train.csv")
+    cfg.test_file_path = str(csv_root / ("val.csv" if clustered else "test.csv"))
     cfg.num_labels = len(info["labels"])
     cfg.epochs = epochs
     cfg.batch_size = batch_size
@@ -63,14 +71,33 @@ def train(repo, output, seed, epochs, batch_size):
     cfg.save_predictions = True
     cfg.model_save_path = str(result / "model.bin")
     cfg.res_path = str(result / "test_predictions")
+    if clustered:
+        best = BestTraditional5(cfg.model_save_path)
+        expected_val = data["y"][data["splits"] == "val"]
+
+        def on_epoch(epoch, model, adjacency, loader, batches):
+            y, p = TestModel(batches, adjacency, model, cfg.device, loader.PAD_IDX,
+                             cfg.res_path, seed, return_predictions=True)
+            if epoch == 1 and not np.array_equal(y, expected_val):
+                raise ValueError("Validation predictions differ from prepared row order")
+            best.update(epoch, model, y, p)
+
+        cfg.epoch_callback = on_epoch
     print(f"Task={cfg.data_name}, labels={cfg.num_labels}, seed={seed}, epochs={epochs}, "
           f"batch={batch_size}, train_task_heads={cfg.train_task_heads}", flush=True)
     model, adjacency, loader = native_train(cfg)
+    if clustered:
+        best.restore(model)
     validation_loader = loader.load_train_test_data(
-        test_file_path=str(root / "val.csv"), only_test=True
+        test_file_path=str(csv_root / "val.csv"), only_test=True
     )
     TestModel(validation_loader, adjacency, model, cfg.device, loader.PAD_IDX,
               str(result / "val_predictions"), seed, save_predictions=True)
+    if clustered:
+        test_loader = loader.load_train_test_data(test_file_path=str(csv_root / "test.csv"), only_test=True)
+        TestModel(test_loader, adjacency, model, cfg.device, loader.PAD_IDX,
+                  cfg.res_path, seed, save_predictions=True)
+    threshold = best.threshold if clustered else 0.5
     for split in ("val", "test"):
         path = result / f"{split}_predictions.npz"
         with np.load(path) as archive:
@@ -78,12 +105,12 @@ def train(repo, output, seed, epochs, batch_size):
         indices = np.flatnonzero(data["splits"] == split)
         if not np.array_equal(arrays["targets"], data["y"][indices]):
             raise ValueError(f"{split} prediction labels differ from original CSV row order")
+        p = arrays["probabilities"]
         np.savez_compressed(path, **arrays, row_ids=data["rows"][indices], ids=data["ids"][indices],
-                            label_names=np.array(info["labels"]), thresholds=np.full(cfg.num_labels, 0.5))
+                            label_names=np.array(info["labels"]), thresholds=np.full(cfg.num_labels, threshold),
+                            predicted=p >= threshold if clustered else p > threshold)
     with np.load(result / "test_predictions.npz") as archive:
         y, p = archive["targets"], archive["probabilities"]
-    predicted = p > 0.5
-    positive = y[:, :48].any(1)
     summary = {
         "model": "iMFP-LG", "method_variant": "task_heads_trained",
         "task": info["task"], "seed": seed,
@@ -91,17 +118,20 @@ def train(repo, output, seed, epochs, batch_size):
         "batch_size": batch_size, "decision": "probability > 0.5",
         "optimizer_setting": "bert lr=5e-5; GAT and all task heads lr=5e-4; original FGM",
         "label_names": info["labels"], "test_rows": len(y),
-        "positive_test_rows": int(positive.sum()),
         "environment": {"python": platform.python_version(), "torch": torch.__version__,
                         "cuda": torch.version.cuda, "transformers": version("transformers"),
                         "numpy": np.__version__, "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES")},
         "upstream_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip(),
         "project_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=PROJECT, text=True).strip(),
-        "full_test": evaluate_metrics(y, p, predicted=predicted),
-        "positive_function48": evaluate_metrics(y[positive, :48], p[positive, :48],
-                                                 predicted=predicted[positive, :48]),
-        "background_any_function_fpr": float(predicted[~positive, :48].any(1).mean()) if (~positive).any() else None,
     }
+    if clustered:
+        summary.update(traditional5_report(y, p, threshold, best.epoch, info["task"], info["labels"],
+                                           data["y"][data["splits"] == "train"].sum(0)),
+                       selected_epoch=best.epoch, selection="validation_traditional5", decision="probability >= threshold")
+    else:
+        predicted = p > 0.5
+        summary.update(full_test=evaluate_metrics(y, p, predicted=predicted),
+                       **positive_scope(info["task"], y, p, predicted))
     (result / "comparison.json").write_text(json.dumps(summary, indent=2, allow_nan=False), encoding="utf-8")
     print(json.dumps(summary, indent=2), flush=True)
     print(f"Completed. Results: {result}", flush=True)
