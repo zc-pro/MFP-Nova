@@ -1,5 +1,16 @@
 # MFP-Nova
 
+## fine39 性能基线
+
+以 **TheraSet `no_label_context_single_prototype`** 为性能基线。该版本关闭标签上下文，每个标签启用一个原型。基线来自 V100、seed 42、FP32、batch 64、提交 `be9ecae`，使用原始划分（Train 39,455 条，Validation 8,529 条）。`micro_f1` 协议以固定阈值 0.50 的 Validation Micro-F1 选择第 45 轮 EMA 权重。运行记录中的权重路径为 `runs/theraset_followup_seed42_v100/fine39/no_label_context_single_prototype/micro_f1/best.pt`。
+
+| 选模协议 | 样本 Jaccard（Acc） | Macro-AP | Micro-F1 | 独立多功能检测 F1 |
+|---|---:|---:|---:|---:|
+| `micro_f1`，固定阈值 0.50（性能基线） | **61.0463%** | 57.1128% | 65.5723% | 57.4235% |
+| `traditional5`，Validation 拟合全局阈值 0.46（同架构第 44 轮） | 60.9123% | 57.0294% | 65.4500% | 58.8837% |
+
+后续目标是在同一批原始 `fine39` Validation 上，将样本 Jaccard 提升到 **61.0463% 以上**。正式对照使用相同的选模和阈值协议，并报告 Macro-AP、Micro-F1 和独立多功能检测 F1。当前 B0 的 AA34 多尺度 CNN 在 `traditional5` 下达到 57.321%，比同协议的 TheraSet 低 3.591 个百分点。Test 用于选定模型后的独立评价。两组基线数据来自 `runs/incoming/theraset_full-no_label_context-no_label_context_single_prototype_seed42_v100_fine39-b64_traditional5-microf1_6of6_20261108_205431.zip` 的 Validation 预测和训练记录。
+
 ## 当前研究 · B0 与 H1–H8
 
 新一轮研究依据本地调研包中的《H1–H8 序列多标签模型架构设计书》。九个模型共用从头训练的原始序列骨干，支持 `major15`、`fine39`、`rich48` 三套现有标签表和原始 Train／Validation／Test 成员，默认保留全长、只用原样本。Train 内优先复用已有同源折，`rich48` 默认按原有精确序列组分折。整套 Validation 用来校准并报告结果，Test 独立评估。历史研究命令和实验记录见后文。
