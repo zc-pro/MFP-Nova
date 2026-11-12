@@ -150,6 +150,8 @@ def main(argv=None):
     gpu_check.add_argument("--samples", type=int, default=128)
     gpu_check.add_argument("--output")
     gpu_check.add_argument("--inspect-only", action="store_true", help="Read GPU occupancy/cache metadata without training")
+    gpu_check.add_argument("--profile-only", action="store_true",
+                           help="Measure random and longest Train batches without the subsequent short training run")
     args = parser.parse_args(argv)
     if args.command == "train" and args.setreread_interval and args.model != "setreread":
         parser.error("--setreread-interval requires --model setreread")
@@ -391,7 +393,7 @@ def main(argv=None):
                 parser.error("gpu-check requires --output for real measurements")
             run(args.models, args.tasks, feature_root, args.device, args.output, args.esm,
                 args.batch_sizes, args.precisions, args.steps, args.samples, args.data_root,
-                peptide_feature_root=args.peptide_feature_root)
+                peptide_feature_root=args.peptide_feature_root, profile_only=args.profile_only)
     elif args.command == "summarize":
         from .research import summarize_results
         result = summarize_results(args.runs, args.split)

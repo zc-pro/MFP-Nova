@@ -13,10 +13,11 @@ from .therapep import TRACKS as THERAPEP_TRACKS, ROOTS as THERAPEP_ROOTS
 import numpy as np
 import torch
 import yaml
+from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
 from .multimodal import MultimodalData, MultimodalPeptides, collate_multimodal
 from .research import (autocast_context, make_model, to_device, train, validate_cache,
-                       load_model, predict_loader, metrics, make_optimizer)
+                       load_model, predict_loader, metrics, make_optimizer, update_ema)
 from .trainer import seed_everything, write_json
 
 
@@ -96,7 +97,8 @@ def check_inputs(model, samples, device, precision):
     return result
 
 
-def profile(config, source, dataset, device, batches, precisions, measured_steps=3):
+def profile(config, source, dataset, device, batches, precisions, measured_steps=3,
+            batch_scope="diagnostic"):
     torch.cuda.set_device(torch.device(device))
     seed_everything(config["train"]["seed"])
     arguments = {"input_dim": dataset.meta["input_dim"], "num_labels": len(source.data.labels),
@@ -105,15 +107,20 @@ def profile(config, source, dataset, device, batches, precisions, measured_steps
         arguments["function_projection"] = source.statistics["function_projection"]
     if "peptide_encoder" in dataset.meta:
         arguments["peptide_input_dim"] = dataset.meta["peptide_encoder"]["input_dim"]
-    samples = [dataset[i] for i in range(len(dataset))]
+    samples = [dataset[i] for i in range(len(dataset))] if batch_scope == "diagnostic" else None
+    if batch_scope == "longest_train":
+        lengths = [len(source.data.sequences[row]) for row in dataset.indices]
+        longest = np.argsort(-np.asarray(lengths), kind="stable")
+    input_samples = samples if samples is not None else [dataset[i] for i in range(min(len(dataset), 8))]
     records = []
     for precision in precisions:
+        rng = np.random.default_rng(config["train"]["seed"])
         model = make_model(config["model_name"], arguments).to(device).train()
         if config["model_name"] == "privilegedbridge" and model.stage != "A":
             previous, saved = load_model(config["train"]["initialize_from"], device)
             model.initialize_from(previous)
             del previous
-        input_check = check_inputs(model, samples, device, precision)
+        input_check = check_inputs(model, input_samples, device, precision)
         parameters = dict(model.named_parameters())
         probe_keys = list(PROBES[config["model_name"]])
         if config["model_name"] == "privilegedbridge":
@@ -132,15 +139,24 @@ def profile(config, source, dataset, device, batches, precisions, measured_steps
                                "depth_gate.2.weight"])
         optimizer = make_optimizer(model, config["train"])
         scaler = torch.amp.GradScaler("cuda", enabled=precision=="fp16", init_scale=1024.)
+        ema_decay = config["train"].get("ema_decay") if samples is None else None
+        ema = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(ema_decay)).requires_grad_(False) if ema_decay else None
         for size in batches:
+            optimizer.zero_grad(set_to_none=True)
+            torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats(device)
             measurements, module_updates = [], {}
             batch = loss = terms = before = None
             try:
-                for step in range(measured_steps+1):
+                for step in range(measured_steps+2):
                     torch.cuda.synchronize(device)
                     started = time.perf_counter()
-                    selected = [samples[j%len(samples)] for j in range(size)]
+                    if samples is not None:
+                        selected = [samples[j%len(samples)] for j in range(size)]
+                    else:
+                        positions = (longest[:size] if batch_scope == "longest_train" else
+                                     rng.choice(len(dataset), size, replace=False))
+                        selected = [dataset[int(position)] for position in positions]
                     batch = to_device(collate_multimodal(selected), device)
                     events = [torch.cuda.Event(enable_timing=True) for _ in range(4)]
                     optimizer.zero_grad(set_to_none=True)
@@ -163,6 +179,8 @@ def profile(config, source, dataset, device, batches, precisions, measured_steps
                     events[2].record()
                     scale = scaler.get_scale()
                     scaler.step(optimizer); scaler.update()
+                    skipped = scaler.get_scale() < scale
+                    update_ema(ema, model, epoch=1, start_epoch=1, skipped=skipped)
                     events[3].record()
                     torch.cuda.synchronize(device)
                     if step==1:
@@ -179,39 +197,43 @@ def profile(config, source, dataset, device, batches, precisions, measured_steps
                                     "gradient_finite": bool(torch.isfinite(gradient).all()),
                                     "gradient_abs_sum": float(gradient.float().abs().sum()),
                                     "updated": bool((before[key][:, columns] != parameters[key][:, columns]).any())}
-                    if step:
+                    if step >= 2:
                         measurements.append({"loss": float(loss.detach()), "losses": {key: float(value.detach()) for key, value in terms.items()},
                                              "forward_ms": events[0].elapsed_time(events[1]), "backward_ms": events[1].elapsed_time(events[2]),
                                              "optimizer_ms": events[2].elapsed_time(events[3]), "step_seconds": time.perf_counter()-started,
-                                             "gradient_finite": bool(torch.isfinite(norm)), "amp_update_skipped": scaler.get_scale()<scale,
+                                             "gradient_finite": bool(torch.isfinite(norm)), "amp_update_skipped": skipped,
                                              "padded_length": batch["aa"].shape[1]})
                 successful = all(m["gradient_finite"] and not m["amp_update_skipped"] for m in measurements)
                 mean_step = float(np.mean([m["step_seconds"] for m in measurements]))
-                records.append({"precision": precision, "batch_size": size, "status": "ok" if successful else "nonfinite_gradient",
+                records.append({"precision": precision, "batch_size": size, "batch_scope": batch_scope,
+                                "status": "ok" if successful else "nonfinite_gradient",
                                 "trainable_parameters": sum(p.numel() for p in model.parameters() if p.requires_grad),
                                 "peak_allocated_mib": torch.cuda.max_memory_allocated(device)/2**20,
                                 "peak_reserved_mib": torch.cuda.max_memory_reserved(device)/2**20,
                                 "mean_forward_ms": float(np.mean([m["forward_ms"] for m in measurements])),
                                 "mean_backward_ms": float(np.mean([m["backward_ms"] for m in measurements])),
                                 "mean_step_seconds": mean_step, "samples_per_second": size/mean_step,
-                                "estimated_train_epoch_seconds": len(source.data.indices("train"))/size*mean_step,
+                                "estimated_train_epoch_seconds": (None if batch_scope == "longest_train" else
+                                                                  len(source.data.indices("train"))/size*mean_step),
+                                "ema_included": ema is not None,
                                 "module_updates": module_updates, "measurements": measurements})
                 records[-1]["input_checks"] = input_check
                 if not successful:
                     break
             except torch.OutOfMemoryError:
-                records.append({"precision": precision, "batch_size": size, "status": "oom"})
+                records.append({"precision": precision, "batch_size": size, "batch_scope": batch_scope, "status": "oom"})
                 optimizer.zero_grad(set_to_none=True)
                 batch = loss = terms = before = None
                 break
             del batch, loss, terms, before
-        del model, optimizer, scaler, parameters
+        del model, optimizer, scaler, parameters, ema
         gc.collect(); torch.cuda.empty_cache()
     return records
 
 
 def run(models, tasks, feature_root, device, output, esm="650m", batches=(2, 4, 8, 16),
-        precisions=("fp32", "fp16"), steps=32, samples=128, data_root="data/therapeutic_2025", peptide_feature_root=None):
+        precisions=("fp32", "fp16"), steps=32, samples=128, data_root="data/therapeutic_2025", peptide_feature_root=None,
+        profile_only=False):
     if len(set(tasks)) == 1 and tasks[0] in (*THERAPEP_TRACKS, "rich48"):
         if str(data_root) == "data/therapeutic_2025":
             data_root = "data/therapeutic_2025/rich48" if tasks[0] == "rich48" else THERAPEP_ROOTS[tasks[0]]
@@ -226,8 +248,9 @@ def run(models, tasks, feature_root, device, output, esm="650m", batches=(2, 4, 
         raise RuntimeError(f"GPU has other compute jobs: {busy}; select a free GPU")
     if not environment["cuda_available"]:
         raise RuntimeError("Current Python has no usable CUDA; activate the server MFP-Nova environment")
-    if any(value is None for value in environment["caches"].values()):
-        raise FileNotFoundError("Real Train/Val ESM cache missing; transfer the existing cache, do not substitute random features")
+    required_splits = ("train",) if profile_only else ("train", "val")
+    if any(environment["caches"][split] is None for split in required_splits):
+        raise FileNotFoundError(f"Real ESM cache required for {', '.join(required_splits)}")
     torch.cuda.set_device(torch.device(device))
     root = Path(output)
     root.mkdir(parents=True, exist_ok=False)
@@ -254,7 +277,8 @@ def run(models, tasks, feature_root, device, output, esm="650m", batches=(2, 4, 
             source = MultimodalData(config["data"]["root"], task, sequence_only=sequence_only,
                                    sequence_chemistry=name == "setreread")
             task_features = config["data"]["features"]
-            data = MultimodalPeptides(source, task_features, "train", samples, config["data"].get("peptide_features"),
+            data = MultimodalPeptides(source, task_features, "train", None if profile_only else samples,
+                                     config["data"].get("peptide_features"),
                                      sequence_only=sequence_only or (name == "privilegedbridge" and config["model"].get("stage", "A") == "A"))
             validate_cache(data, config)
             groups = source.groups(data.indices, source.data.y[data.indices])
@@ -268,6 +292,15 @@ def run(models, tasks, feature_root, device, output, esm="650m", batches=(2, 4, 
                 integration["rdrop_profile_scope"] = "Both dropout graphs retained; configured maximum weight, no warmup"
                 print(f"RDrop profile | weight={config['loss']['rdrop']:.4f} views=2 (maximum, no warmup)", flush=True)
             print(f"Checking {name}/{task}: {len(data)} real rows", flush=True)
+            if profile_only:
+                records = []
+                for scope in ("random_train", "longest_train"):
+                    print(f"Profiling {name}/{task} | {scope} | {steps} measured steps per batch size", flush=True)
+                    records.extend(profile(config, source, data, device, batches, precisions,
+                                           measured_steps=steps, batch_scope=scope))
+                write_json(root/f"{name}_{task}_profile.json", {"integration": integration, "profile": records})
+                summary.append({"model": name, "task": task, "profile": records})
+                continue
             records = profile(config, source, data, device, batches, precisions)
             write_json(root/f"{name}_{task}_profile.json", {"integration": integration, "profile": records})
             valid = [r for r in records if r["status"]=="ok" and all(p["gradient_finite"] and p["gradient_abs_sum"]>0 and p["updated"] for p in r["module_updates"].values())]

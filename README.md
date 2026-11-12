@@ -19,6 +19,8 @@
 
 训练读取 `features/esm2_peptide_150m/{train,val}`。如果需提取，可用 `features --config configs/setreread.yaml --track major15 --splits train val --device cuda:0`，这套缓存覆盖两任务。基于同骨干的对照使用 `--ablate correction`（双读出均值）、`--ablate conditional_evidence`（静态纠错）或 `--ablate positive_recovery`。可变长度区间骨干使用 `--setreread-interval`。
 
+显存探测可用 `gpu-check --models setreread --tasks fine39 --profile-only --batch-sizes 32 64 96 128 192 --precisions fp32 --steps 8 --output runs/setreread_gpu_probe`。它在真实 Train 随机批次和最长肽批次上执行完整训练步，包含纠错、反向、AdamW 与 EMA。使用 `setreread_fine39_profile.json` 中的峰值显存与随机批次吞吐选择 batch。
+
 **RTX 5070 / PowerShell**
 
 ```powershell

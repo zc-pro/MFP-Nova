@@ -60,6 +60,34 @@ def test_busy_gpu_returns_before_cuda_context(tmp_path, monkeypatch):
     assert selected==[] and not (tmp_path/"gpu").exists()
 
 
+def test_profile_only_uses_both_train_batch_scopes(tmp_path, monkeypatch):
+    from mfp_nova import runtime_check
+
+    data_root, features = multimodal_fixture(tmp_path)
+    metadata = features/"train/metadata.json"
+    meta = json.loads(metadata.read_text())
+    meta.update(name="jiahuizhang/esm-150m-peptide-fine-tune",
+                resolved_revision="6d8cebf74c53b1032b6f5917e75e3253cb70f575")
+    metadata.write_text(json.dumps(meta))
+    monkeypatch.setattr(runtime_check, "inspect", lambda *args: {
+        "gpu": {"other_compute_processes": []}, "cuda_available": True, "caches": {"train": meta, "val": None}})
+    monkeypatch.setattr(torch.cuda, "set_device", lambda device: None)
+
+    def profile(config, source, dataset, device, batches, precisions, measured_steps, batch_scope):
+        assert len(dataset) == len(source.data.indices("train")) == 4
+        assert measured_steps == 8
+        assert config["loss"]["edit_gain"] > 0 and config["train"]["ema_decay"] > 0
+        return [{"batch_scope": batch_scope, "status": "ok"}]
+
+    monkeypatch.setattr(runtime_check, "profile", profile)
+    monkeypatch.setattr(runtime_check, "train", lambda *args, **kwargs: pytest.fail("Unexpected short training"))
+    output = tmp_path/"profile"
+    runtime_check.run(["setreread"], ["major15"], features, "cuda:0", output, steps=8, samples=1,
+                      data_root=data_root, profile_only=True)
+    report = json.loads((output/"setreread_major15_profile.json").read_text())
+    assert [row["batch_scope"] for row in report["profile"]] == ["random_train", "longest_train"]
+
+
 def test_micro_f1_selection_keeps_fixed_threshold_through_evaluation(tmp_path):
     from mfp_nova.research import evaluate
     from mfp_nova.metric_protocol import selection
