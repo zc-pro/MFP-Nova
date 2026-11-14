@@ -5,6 +5,7 @@ from pathlib import Path
 import yaml
 
 from .models import RESEARCH_MODELS, LEGACY_MODELS
+from .metric_protocol import SUITES
 from .models.hypotheses import MODELS as HYPOTHESIS_MODELS
 from .data import TRACKS
 from .therapep import TRACKS as THERAPEP_TRACKS
@@ -43,12 +44,14 @@ def main(argv=None):
                              help="Completed rows in the first split, from the interrupted extraction log")
         else:
             sub.add_argument("--model", choices=("sequence", *HYPOTHESIS_MODELS, *RESEARCH_MODELS), default="sequence")
-            sub.add_argument("--metric-suite", choices=("traditional5", "task_specific", "micro_f1"),
+            sub.add_argument("--metric-suite", choices=SUITES,
                              help="Research models: primary report and checkpoint selection protocol")
             sub.add_argument("--task", choices=TRACKS, help="Alias for --track")
             sub.add_argument("--resume", help="last.pt with optimizer and RNG state; creates a new run")
             sub.add_argument("--stage", choices=("A", "B", "C"), help="PrivilegedBridge training phase")
-            sub.add_argument("--initialize-from", help="B0 checkpoint for H1–H6, or preceding PrivilegedBridge phase")
+            sub.add_argument("--initialize-from", help="Starting checkpoint for H1–H6, HH-SetReread, TheraSet continuation or PrivilegedBridge")
+            sub.add_argument("--hh-relation", choices=("off", "shared", "bilinear", "mlp"))
+            sub.add_argument("--hh-ranking", choices=("none", "record", "weak"))
             sub.add_argument("--annotations", help="B0/H1–H8: aligned NPZ of confirmed label and observation states")
             sub.add_argument("--unlabeled-weight", type=float, help="Sequence study: optional weak BCE weight for unannotated zero bits")
             sub.add_argument("--fold-dir", help="Sequence study: share training-only B0 fold checkpoints")
@@ -77,6 +80,7 @@ def main(argv=None):
             sub.add_argument("--precision", choices=("fp32", "fp16", "bf16"))
             sub.add_argument("--accumulation-steps", type=int)
             sub.add_argument("--num-workers", type=int, help="DataLoader worker processes; 0 loads in the main process")
+            sub.add_argument("--learning-rate", type=float, help="Base learning rate, before warmup")
             sub.add_argument("--lr-decay-epochs", type=int,
                              help="Research models: cosine reaches its floor at this epoch; independent of maximum epochs")
             sub.add_argument("--latent-depth", type=int, help="HelixSet latent fusion depth")
@@ -121,6 +125,7 @@ def main(argv=None):
     evaluate.add_argument("--predictions", help="Optional aligned sample probabilities in NPZ format")
     evaluate.add_argument("--annotations", help="Sequence study: aligned annotation NPZ for evaluation")
     evaluate.add_argument("--evidence-diagnostics", action="store_true", help="H6: run keep/delete and matched random controls")
+    evaluate.add_argument("--hh-diagnostics", action="store_true", help="HH-SetReread: compare unary, conditional, local and exact sets on Validation")
     evaluate.add_argument("--decision", help="Validation-fitted research-model decision.json; raw ranking scores stay unchanged")
     evaluate.add_argument("--without-private-evidence", action="store_true",
                           help="Shared-private TriRelay: use shared evidence alone in both reads, retaining weights and saved threshold")
@@ -203,23 +208,33 @@ def main(argv=None):
                 config["model"]["global_only"] = True
             if args.setreread_interval:
                 config["model"]["interval_evidence"] = True
-            if args.stage is not None or args.initialize_from is not None:
-                if args.model != "privilegedbridge":
-                    raise ValueError("stage/initialize-from are PrivilegedBridge options")
+            if args.stage is not None and args.model != "privilegedbridge":
+                raise ValueError("--stage is a PrivilegedBridge option")
+            if args.initialize_from and args.model not in ("privilegedbridge", "hh_setreread", "theraset"):
+                raise ValueError("--initialize-from is unavailable for this research model")
+            if args.hh_relation is not None or args.hh_ranking is not None:
+                if args.model != "hh_setreread" or args.resume:
+                    raise ValueError("HH overrides require a fresh HH-SetReread run")
+                if args.hh_relation is not None:
+                    config["model"]["relation"] = args.hh_relation
+                if args.hh_ranking is not None:
+                    config["loss"]["hh_ranking"] = args.hh_ranking
             if args.resume and args.initialize_from:
                 raise ValueError("Use resume within a phase or initialize-from between phases")
             if args.model == "privilegedbridge":
                 from .models.privilegedbridge import configure_stage
                 configure_stage(config, args.stage or config["model"].get("stage", "A"))
-                if args.initialize_from:
-                    config["train"]["initialize_from"] = args.initialize_from
+            if args.initialize_from:
+                config["train"]["initialize_from"] = args.initialize_from
         from .therapep import configure_task
         configure_task(config, (args.task if args.command == "train" else None)
                        or args.track or config["data"]["track"])
         peptide_view = args.command == "features" and args.encoder_view == "peptide"
         if peptide_view and args.esm:
             raise ValueError("--encoder-view peptide uses peptide_encoder; omit --esm")
-        if args.esm:
+        if args.esm and model_name == "hh_setreread" and args.esm != "650m":
+            parser.error("HH-SetReread V1.1 uses the initializing TheraSet's ESM650M cache")
+        if args.esm and model_name != "hh_setreread":
             if config.get("model", {}).get("esm_tail") and args.esm != "650m":
                 raise ValueError("This HelixSet ESM-tail configuration uses ESM650M")
             config["encoder"]["name"] = "facebook/esm2_t12_35M_UR50D" if args.esm=="35m" else "facebook/esm2_t33_650M_UR50D"
@@ -309,12 +324,12 @@ def main(argv=None):
                 if args.reconstruction_decay is not None or args.reconstruction_floor is not None:
                     raise ValueError("Reconstruction scheduling is a research-model option")
                 from .trainer import train
-            for key in ("seed", "epochs", "num_workers"):
+            for key in ("seed", "epochs", "num_workers", "learning_rate"):
                 value = getattr(args, key)
                 if value is not None:
                     config["train"][key] = value
             if args.rdrop_weight is not None:
-                if model_name not in ("helixset", "theraset", "termiscale", "motifspan", "privilegedbridge"):
+                if model_name not in ("helixset", "theraset", "termiscale", "motifspan", "privilegedbridge", "hh_setreread"):
                     raise ValueError("This model does not support R-Drop")
                 config["loss"]["rdrop"] = args.rdrop_weight
             if args.loss is not None:
@@ -352,7 +367,7 @@ def main(argv=None):
         checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
         if checkpoint.get("model_name") in HYPOTHESIS_MODELS:
             from .hypothesis import evaluate
-            if args.decision or args.feature_root or args.peptide_feature_root or args.without_private_evidence:
+            if args.decision or args.feature_root or args.peptide_feature_root or args.without_private_evidence or args.hh_diagnostics:
                 parser.error("B0/H1–H8 evaluate raw sequences with the checkpoint's saved decision rule")
             if args.evidence_diagnostics and checkpoint["model_name"] != "h6":
                 parser.error("--evidence-diagnostics requires an H6 checkpoint")
@@ -369,6 +384,10 @@ def main(argv=None):
         feature_root = args.feature_root or checkpoint["config"]["data"]["features"]
         batch_size = args.batch_size or checkpoint["config"]["train"].get("batch_size", 128)
         extra = {}
+        if args.hh_diagnostics:
+            if checkpoint.get("model_name") != "hh_setreread" or args.split != "val" or args.decision:
+                parser.error("--hh-diagnostics requires an HH-SetReread checkpoint, --split val and its saved decision")
+            extra["hh_diagnostics"] = True
         if args.peptide_feature_root:
             if "model_name" not in checkpoint:
                 raise ValueError("Peptide cache requires a research model checkpoint")

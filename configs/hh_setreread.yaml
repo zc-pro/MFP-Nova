@@ -1,0 +1,39 @@
+model_name: hh_setreread
+data:
+  root: data/therapeutic_2025
+  track: fine39
+  features: features/esm2_650m
+  peptide_features: features/esm2_peptide_150m
+  augment: false
+model:
+  relation: bilinear
+  lambda_pair: 4.0
+  fixed_overlap: false
+loss:
+  hh_fine: 0.5
+  hh_axis: 0.1
+  hh_set: 0.05
+  hh_relation: 0.0001
+  hh_ranking: record
+train:
+  seed: 157
+  device: cpu
+  epochs: 100
+  hh_frozen_epochs: 20
+  hh_head_learning_rate: 0.0001
+  hh_frozen_learning_rate: 0.0002
+  learning_rate: 0.00001
+  batch_size: 64
+  accumulation_steps: 1
+  precision: fp32
+  weight_decay: 0.01
+  gradient_clip: 5
+  warmup_epochs: 5
+  aux_warmup_epochs: 5
+  patience: 15
+  ema_decay: 0.999
+  num_workers: 0
+  metric_suite: jaccard
+  save_selection_candidates: true
+  export_validation_predictions: true
+  output: runs

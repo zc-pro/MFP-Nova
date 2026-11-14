@@ -36,7 +36,8 @@ def test_pb_phase_defaults_and_execution_overrides(monkeypatch, phase):
 
 def test_default_sweep_not_expanded():
     assert len(experiments.MODELS) == 5
-    assert set(experiments.SUPPORTED_MODELS)-set(experiments.MODELS) == {"termiscale", "motifspan", "privilegedbridge"}
+    assert set(experiments.SUPPORTED_MODELS)-set(experiments.MODELS) == {
+        "termiscale", "motifspan", "privilegedbridge", "setreread"}
 
 
 def test_termiscale_controls_are_explicit_and_model_specific(monkeypatch):

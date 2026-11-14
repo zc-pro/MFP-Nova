@@ -16,7 +16,8 @@ from .data import TRACKS
 from .therapep import configure_task
 
 MODELS = LEGACY_MODELS  # Preserve the original default/all five-model sweep.
-SUPPORTED_MODELS = RESEARCH_MODELS
+# HH starts from an explicit checkpoint and uses its own matched control runs.
+SUPPORTED_MODELS = tuple(model for model in RESEARCH_MODELS if model != "hh_setreread")
 TASKS = ("major15", "fine39")  # Keep the existing default/all comparison cohort.
 SEEDS = (42, 101, 202, 303, 404)
 PROJECT = Path(__file__).resolve().parents[2]

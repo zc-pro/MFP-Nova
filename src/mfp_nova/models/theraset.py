@@ -239,7 +239,7 @@ class TheraSet(nn.Module):
         nn.init.zeros_(self.correction_gate.weight)
         nn.init.constant_(self.correction_gate.bias, -2.)
 
-    def forward(self, batch, return_evidence=False):
+    def forward(self, batch, return_evidence=False, return_residues=False):
         if self.b0_backbone is not None:
             logits = self.b0_backbone(batch["aa"], batch["mask"]).logits
             return {"logits": logits, "direct": logits}
@@ -306,6 +306,8 @@ class TheraSet(nn.Module):
             evidence_state, global_state[:, None].expand_as(evidence_state)], -1)).squeeze(-1).sigmoid()
         output = {"logits": direct + gate*delta, "direct": direct,
                   "evidence_logits": self.prior+delta}
+        if return_residues:
+            output["residues"] = residues
         if return_evidence:
             output.update(correction_gate=gate, correction=gate*delta, prototype_weights=prototype_weights,
                           scale_weights=scales.reshape(b, *self.active.shape, 4),
@@ -315,16 +317,18 @@ class TheraSet(nn.Module):
                  *prototype_weights[..., None, None]).sum(2))
         return output
 
+    def supervised_terms(self, output, targets, unknown_weight):
+        terms = {"classification": observed_label_loss(output["logits"], targets, self.statistics, unknown_weight)}
+        if self.evidence_decoder:
+            for key, logits in (("direct", output["direct"]), ("evidence", output["evidence_logits"])):
+                terms[key] = observed_label_loss(logits, targets, self.statistics, unknown_weight)
+        return terms
+
     def compute_loss(self, batch, settings, return_output=False):
         view = training_views(batch, settings.get("modality_dropout", .1), 0.)[0] if self.training else batch
         output = self(view)
         def supervised(prediction):
-            terms = {"classification": observed_label_loss(prediction["logits"], batch["y"], self.statistics,
-                                                            settings.get("unlabeled_weight", .3))}
-            if self.evidence_decoder:
-                for key, logits in (("direct", prediction["direct"]), ("evidence", prediction["evidence_logits"])):
-                    terms[key] = observed_label_loss(logits, batch["y"], self.statistics, settings.get("unlabeled_weight", .3))
-            return terms
+            return self.supervised_terms(prediction, batch["y"], settings.get("unlabeled_weight", .3))
         terms = supervised(output)
         agreement = output["logits"].sum()*0
         if self.training and settings.get("rdrop", 0)>0:

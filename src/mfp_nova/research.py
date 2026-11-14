@@ -20,10 +20,13 @@ from .multimodal import MultimodalData, MultimodalPeptides, collate_multimodal
 from .research_layers import observed_label_loss
 from .consistency import bernoulli_consistency, consistency_weight
 from .trainer import seed_everything, write_json
-from .metric_protocol import protocol_description, primary_metrics, selection, format_primary, final_threshold
+from .metric_protocol import FIXED_THRESHOLD_SUITES, protocol_description, primary_metrics, selection, format_primary, final_threshold
 
 
 def make_model(name, arguments):
+    if name == "hh_setreread":
+        from .models.hh_setreread import HHSetReread
+        return HHSetReread(**arguments)
     if name == "setreread":
         from .models.setreread import SetReread
         return SetReread(**arguments)
@@ -154,7 +157,7 @@ def validate_cache(dataset, config, reference=None):
     if (peptide is None) != (settings is None):
         raise ValueError("Peptide encoder configuration and cache must be supplied together")
     if peptide is not None:
-        if config["model_name"] not in ("helixset", "theraset", "termiscale", "motifspan", "privilegedbridge"):
+        if config["model_name"] not in ("helixset", "theraset", "termiscale", "motifspan", "privilegedbridge", "hh_setreread"):
             raise ValueError("This architecture does not support dual frozen encoders")
         if peptide["name"] != settings["name"] or peptide["max_length"] != settings["max_length"]:
             raise ValueError("Configured peptide encoder differs from cache")
@@ -239,7 +242,14 @@ def restore_model_state(model, state):
 
 def make_optimizer(model, settings):
     parameters = [(key, value) for key, value in model.named_parameters() if value.requires_grad]
-    if getattr(model, "stage", None) == "C":
+    if hasattr(model, "backbone_frozen"):
+        groups = [
+            {"params": [p for key, p in parameters if key.startswith("backbone.")]},
+            {"params": [p for key, p in parameters if not key.startswith("backbone.")],
+             "lr": settings["hh_frozen_learning_rate"] if model.backbone_frozen else settings["hh_head_learning_rate"]},
+        ]
+        groups = [group for group in groups if group["params"]]
+    elif getattr(model, "stage", None) == "C":
         groups = [{"params": [p for key, p in parameters if key.startswith("sequence.")]},
                   {"params": [p for key, p in parameters if key.startswith("bridges.")],
                    "lr": settings.get("bridge_learning_rate", 2e-4)}]
@@ -287,8 +297,31 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     seed_everything(settings["seed"])
     checkpoint = torch.load(resume, map_location="cpu", weights_only=True) if resume else None
     pb = config["model_name"] == "privilegedbridge"
+    hh = config["model_name"] == "hh_setreread"
     initial = None
     initialize = settings.get("initialize_from")
+    if checkpoint is None and (hh or (config["model_name"] == "theraset" and initialize)):
+        if not initialize:
+            raise ValueError("HH-SetReread requires --initialize-from pointing to the Fine39 TheraSet best.pt")
+        initial = torch.load(initialize, map_location="cpu", weights_only=True)
+        if initial["model_name"] != "theraset" or initial["track"] != config["data"]["track"]:
+            raise ValueError("Initialization requires a TheraSet checkpoint for the same task")
+        backbone = {k: v for k, v in initial["model_args"].items()
+                    if k not in ("input_dim", "num_labels", "vocab_size", "statistics", "peptide_input_dim")}
+        if hh and (backbone.get("label_context", True) or not backbone.get("evidence_decoder", True)
+                   or not initial["model_state"]["active"].sum(1).eq(1).all()):
+            raise ValueError("HH V1.1 requires the no_label_context_single_prototype checkpoint")
+        hh_options = ("relation", "lambda_pair", "fixed_overlap")
+        config["model"] = {**backbone, **{key: config["model"][key] for key in hh_options
+                                        if key in config["model"]}} if hh else backbone
+        original = initial["config"]
+        config["loss"] = {**original["loss"], **config["loss"]} if hh else dict(original["loss"])
+        config["encoder"] = original["encoder"]
+        if "peptide_encoder" in original:
+            config["peptide_encoder"] = original["peptide_encoder"]
+        else:
+            config.pop("peptide_encoder", None)
+            config["data"].pop("peptide_features", None)
     if pb and checkpoint is None and config["model"].get("stage", "A") in ("B", "C"):
         if not initialize:
             raise ValueError("PB B/C require initialize_from pointing to the selected preceding phase")
@@ -348,6 +381,10 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
             if key not in ("device", "output", "epochs", "num_workers", "max_steps"):
                 settings[key] = value
     suite = settings.get("metric_suite", "task_specific")
+    if hh and (config["data"]["track"] != "fine39" or suite != "jaccard"
+               or config["encoder"]["max_length"] != 80):
+        raise ValueError("HH V1.1 requires Fine39, max_length=80 and the fixed-threshold jaccard protocol")
+    frozen_epochs = settings["hh_frozen_epochs"] if hh else 0
     setreread = config["model_name"] == "setreread"
     if setreread and (config["data"]["track"] not in ("major15", "fine39") or suite != "micro_f1"):
         raise ValueError("SetReread uses major15 or fine39 with the fixed-0.50 micro_f1 protocol")
@@ -357,7 +394,7 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     if not math.isfinite(rdrop) or rdrop < 0:
         raise ValueError("R-Drop weight must be finite and nonnegative")
     if rdrop:
-        if config["model_name"] not in ("helixset", "theraset", "termiscale", "motifspan", "privilegedbridge"):
+        if config["model_name"] not in ("helixset", "theraset", "termiscale", "motifspan", "privilegedbridge", "hh_setreread"):
             raise ValueError("This model does not support R-Drop")
         if settings.get("rdrop_start_epoch", 6) < 1 or settings.get("rdrop_ramp_epochs", 5) < 1:
             raise ValueError("R-Drop start epoch and ramp length must be positive")
@@ -441,12 +478,18 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
             "statistics": source.statistics["labels"], **config["model"]}
     if setreread:
         args["function_projection"] = source.statistics["function_projection"]
+    if hh:
+        from .models.hh_setreread import axis_statistics
+        args["axis_statistics"] = checkpoint["model_args"]["axis_statistics"] if checkpoint else axis_statistics(source)
     if "peptide_encoder" in datasets[0].meta:
         args["peptide_input_dim"] = datasets[0].meta["peptide_encoder"]["input_dim"]
     if function_aux:
         args["function_aux_statistics"] = source.statistics["function_auxiliary"]
     model = make_model(config["model_name"], args).to(device)
-    if initial is not None:
+    if initial is not None and not pb:
+        restore_model_state(model.backbone if hh else model, initial["model_state"])
+        del initial
+    elif initial is not None:
         previous = make_model("privilegedbridge", initial["model_args"]).to(device)
         restore_model_state(previous, initial["model_state"])
         model.initialize_from(previous)
@@ -467,6 +510,8 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
             print('Restarting the uncommitted first epoch.', flush=True)
     else:
         run.mkdir(parents=True, exist_ok=False)
+    if hh:
+        model.freeze_backbone(bool(frozen_epochs and (checkpoint is None or checkpoint["epoch"] <= frozen_epochs)))
     optimizer = make_optimizer(model, settings)
     precision = settings.get("precision", "fp32")
     accumulation = settings.get("accumulation_steps", 1)
@@ -477,14 +522,15 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     if "lr_decay_epochs" in settings and decay_epochs <= warmup:
         raise ValueError("lr_decay_epochs must exceed warmup_epochs")
     save_candidates = settings.get("save_selection_candidates", False) and suite != "micro_f1"
-    alternate_suite = "task_specific" if suite == "traditional5" else "traditional5"
-    alternate_stem = "best_ap" if suite == "traditional5" else "best_accuracy"
+    alternate_suite = {"traditional5": "task_specific", "jaccard": "micro_f1"}.get(suite, "traditional5")
+    alternate_stem = {"traditional5": "best_ap", "jaccard": "best_micro_f1"}.get(suite, "best_accuracy")
     alternate_best = checkpoint.get("alternate_best") if checkpoint and save_candidates else None
     candidate_start = (checkpoint.get("selection_tracking_start_epoch", checkpoint["epoch"]+1)
                        if checkpoint else 1)
     ema_decay = settings.get("ema_decay")
     ema_start = settings.get("ema_start_epoch", warmup+1)
-    if ema_decay is not None and (not 0 < ema_decay < 1 or not 1 <= ema_start <= planned_epochs):
+    if ema_decay is not None and (not 0 < ema_decay < 1 or ema_start < 1
+                                 or (suite != "jaccard" and ema_start > planned_epochs)):
         raise ValueError("EMA requires 0 < decay < 1 and a start epoch within the training schedule")
     if ema_decay is None and settings.get("ema_start_epoch") is not None:
         raise ValueError("ema_start_epoch requires ema_decay")
@@ -499,12 +545,25 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         if warmup and epoch<warmup:
             return (epoch+1)/warmup
         return .05+.95*.5*(1+math.cos(math.pi*min(1, max(0, (epoch-warmup)/max(1, decay_epochs-warmup)))))
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, schedule)
+
+    def phase_schedule(optimizer, frozen):
+        if suite != "jaccard":
+            return torch.optim.lr_scheduler.LambdaLR(optimizer, schedule)
+        length = frozen_epochs if frozen else decay_epochs-frozen_epochs
+        def ratio(index):
+            if index < warmup:
+                return (index+1)/warmup
+            progress = min(1., (index-warmup+1)/max(1, length-warmup))
+            return .05+.95*.5*(1+math.cos(math.pi*progress))
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, ratio)
+
+    scheduler = phase_schedule(optimizer, hh and model.backbone_frozen)
     start, best_key, best_epoch, stale = 1, (-float("inf"), -float("inf")), 0, 0
     best_state = None
     best_ranking = (None, None)
     best_selection_threshold = None
     global_step = 0
+    phase_best = -float("inf")
     if checkpoint:
         restore_model_state(model, checkpoint["model_state"])
         optimizer.load_state_dict(checkpoint["optimizer_state"])
@@ -518,6 +577,7 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         best_ranking = tuple(checkpoint.get("best_ranking", best_key))
         best_selection_threshold = checkpoint.get("best_selection_threshold")
         best_weights = checkpoint.get("best_weights", "online")
+        phase_best = checkpoint.get("phase_best", best_key[0])
         if ema is not None:
             restore_model_state(ema, checkpoint["ema_state"])
             online_best_state = checkpoint["online_best_state"]
@@ -532,7 +592,7 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
             torch.cuda.set_rng_state(checkpoint["cuda_rng"], device)
     git = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True)
     status = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True)
-    params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    params = sum(p.numel() for p in model.parameters() if p.requires_grad or hh)
     metadata = {"model": config["model_name"], "task": source.data.track, "seed": settings["seed"], "config": config,
                 "git_commit": git.stdout.strip(), "git_dirty": bool(status.stdout.strip()), "trainable_parameters": params,
                 "frozen_plm_parameters_included": False, "torch": str(torch.__version__), "numpy": str(np.__version__),
@@ -599,11 +659,36 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     peak_memory = (checkpoint.get("peak_cuda_memory_bytes", 0) or 0) if checkpoint else 0
     validation_groups = source.groups(datasets[1].indices, source.data.y[datasets[1].indices])
     epoch = checkpoint["epoch"] if checkpoint else 0
+    if suite == "jaccard" and checkpoint is None:
+        y, probabilities, validation_loss = predict_loader(model, loaders[1], device, precision, config["loss"])
+        report = metrics(y, probabilities, source.statistics)
+        best_key, best_selection_threshold, _ = selection(y, probabilities, report, suite, "fixed_0_5")
+        phase_best = best_key[0]
+        best_ranking = (report["macro_ap"], report["micro_ap"])
+        best_state = checkpoint_state(model, cpu=True)
+        online_best_state, online_best_key = best_state, best_key
+        if save_candidates:
+            alternate_best = {"key": [report["micro_f1"]], "epoch": 0, "threshold": .5,
+                              "weight_source": "online", "validation_loss": validation_loss,
+                              "model_state": best_state, "targets": torch.from_numpy(y),
+                              "probabilities": torch.from_numpy(probabilities)}
+            candidate_start = 0
     # A crash after the final last.pt but before results.json needs finalization,
     # not an extra optimizer epoch or a restarted early-stopping counter.
     terminal_resume = checkpoint is not None and (start>settings["epochs"] or
-                        (settings["patience"] and stale>=settings["patience"]))
+                        (start>frozen_epochs+1 and settings["patience"] and stale>=settings["patience"]))
     for epoch in (() if terminal_resume else range(start, settings["epochs"]+1)):
+        if hh and frozen_epochs and epoch == frozen_epochs+1:
+            model.freeze_backbone(False)
+            optimizer = make_optimizer(model, settings)
+            scheduler = phase_schedule(optimizer, False)
+            scaler = torch.amp.GradScaler("cuda", enabled=precision=="fp16", init_scale=1024.)
+            if ema is not None:
+                ema.n_averaged.zero_()
+            previous = checkpoint["history_record"] if checkpoint and epoch == start else history
+            phase_best = previous["online_validation" if ema is not None else "validation"]["sample_jaccard"]
+            stale = 0
+        phase_epoch = epoch-frozen_epochs if hh and epoch > frozen_epochs else epoch
         if setreread and epoch == setreread_start:
             # Keep warmup metrics, then compare all SetReread variants over the same trained phase.
             best_key = online_best_key = (-float("inf"), -float("inf"))
@@ -616,7 +701,11 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
         online_targets, online_probabilities = [], []
-        loss_settings = epoch_loss_settings(config, epoch)
+        loss_settings = epoch_loss_settings(config, phase_epoch)
+        if hh:
+            loss_settings["hh_ramp"] = min(1., epoch/5)
+            if model.backbone_frozen:
+                loss_settings["rdrop"] = 0.
         optimizer.zero_grad(set_to_none=True)
         valid_microbatches = 0
         data_wait_seconds = 0.
@@ -673,7 +762,7 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
                 scaler.update()
                 step_skipped = scaler.get_scale()<old_scale
                 skipped += int(step_skipped)
-                update_ema(ema, model, epoch, ema_start, step_skipped)
+                update_ema(ema, model, phase_epoch, ema_start, step_skipped)
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
             if boundary:
@@ -719,14 +808,21 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
             online_selection if ema is not None and selected_model is model
             else selection(y, probabilities, report, suite, protocol["threshold_strategy"]))
         if key>best_key:
-            best_key, best_epoch, stale = key, epoch, 0
+            best_key, best_epoch = key, epoch
+            if suite != "jaccard":
+                stale = 0
             best_ranking = (report["macro_ap"], report["micro_ap"])
             best_selection_threshold = selection_threshold
             best_state = checkpoint_state(selected_model, cpu=True)
             best_weights = validation_weights
             torch.save({**static, "model_state": best_state, "best_epoch": best_epoch, "weight_source": best_weights}, run/"best.pt")
-        elif epoch >= setreread_start:
+        elif suite != "jaccard" and epoch >= setreread_start:
             stale += 1
+        if suite == "jaccard":
+            if key[0] > phase_best:
+                phase_best, stale = key[0], 0
+            else:
+                stale += 1
         if save_candidates:
             alternate_key, alternate_threshold, _ = selection(
                 y, probabilities, report, alternate_suite, protocol["threshold_strategy"])
@@ -753,6 +849,10 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
                    "validation_rows": len(y), "validation_groups": groups, "monitor_threshold": .5,
                    "best_macro_ap": best_ranking[0], "best_micro_ap": best_ranking[1], "best_epoch": best_epoch,
                    "early_stopping_count": stale, "peak_cuda_memory_bytes": epoch_peak}
+        if hh:
+            history.update(hh_phase="frozen" if model.backbone_frozen else "joint",
+                           hh_phase_epoch=phase_epoch, hh_head_lr=optimizer.param_groups[-1]["lr"],
+                           phase_trainable_parameters=sum(p.numel() for p in model.parameters() if p.requires_grad))
         if getattr(model, "esm_tail", None) is not None:
             history["esm_lr"] = optimizer.param_groups[1]["lr"]
         if pb and model.stage == "C":
@@ -781,6 +881,8 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
             history.update(online_validation=online_report, online_validation_loss=online_loss,
                            validation_weights=validation_weights, ema_updates=int(ema.n_averaged),
                            online_best_epoch=online_best_epoch)
+            if suite == "jaccard" and phase_epoch == ema_start-1:
+                ema.update_parameters(model)
             ema_checkpoint = {"ema_state": checkpoint_state(ema), "online_best_state": online_best_state,
                               "online_best_key": online_best_key, "online_best_epoch": online_best_epoch}
         numpy_rng = np.random.get_state()
@@ -788,7 +890,8 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
                                 if save_candidates else {})
         history.update(seconds=time.perf_counter()-epoch_start, elapsed_seconds=elapsed_before+time.perf_counter()-started,
                        train_seconds=train_seconds, data_wait_seconds=data_wait_seconds, validation_seconds=validation_seconds)
-        save_last_checkpoint({**static, **ema_checkpoint, **candidate_checkpoint, "history_record": history,
+        phase_checkpoint = {"phase_best": phase_best} if suite == "jaccard" else {}
+        save_last_checkpoint({**static, **ema_checkpoint, **candidate_checkpoint, **phase_checkpoint, "history_record": history,
                     "best_weights": best_weights, "model_state": checkpoint_state(model), "optimizer_state": optimizer.state_dict(),
                     "scheduler_state": scheduler.state_dict(), "best_model_state": best_state,
                     "scaler_state": scaler.state_dict(), "global_step": global_step,
@@ -846,7 +949,7 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
                   f"capped={g['capped_batches']}/{g['finite_batches']} "
                   f"cosine={fmt(g['mean_cosine'])} ratio={fmt(g['mean_weighted_aux_main_ratio'])} "
                   f"applied={fmt(g['mean_applied_aux_main_ratio'])} max={gradient_ratio:g}", flush=True)
-        if settings["patience"] and stale>=settings["patience"]:
+        if epoch>frozen_epochs and settings["patience"] and stale>=settings["patience"]:
             break
         if settings.get("max_steps") and global_step>=settings["max_steps"]:
             break
@@ -873,7 +976,7 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
               "validation_groups": evaluate_groups(y, probabilities, validation_groups, threshold,
                   source.statistics["labels"]["support"], source.statistics["function_projection"]),
               "labels": source.data.labels, "monitor_threshold": .5,
-              "final_metrics_scope": ("best_checkpoint_at_fixed_0_5" if suite == "micro_f1"
+              "final_metrics_scope": ("best_checkpoint_at_fixed_0_5" if suite in FIXED_THRESHOLD_SUITES
                                       else "best_checkpoint_with_validation_fitted_threshold"),
               "annotation_based_metrics": True,
               "checkpoint": str(run/"best.pt")}
@@ -894,7 +997,8 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         alternate_y, alternate_p = candidate["targets"].numpy(), candidate["probabilities"].numpy()
         result["alternate_selection"] = {
             "suite": alternate_suite, "best_epoch": candidate["epoch"], "key": candidate["key"],
-            "threshold": candidate["threshold"], "threshold_fit_split": "val",
+            "threshold": candidate["threshold"], "threshold_fit_split": protocol_description(
+                alternate_suite, protocol["threshold_strategy"])["threshold_fit_split"],
             "weight_source": candidate["weight_source"], "validation_loss": candidate["validation_loss"],
             "validation": metrics(alternate_y, alternate_p, source.statistics, candidate["threshold"]),
             "validation_groups": evaluate_groups(alternate_y, alternate_p, validation_groups, candidate["threshold"],
@@ -941,8 +1045,65 @@ def load_model(path, device="cpu"):
     return model.eval(), checkpoint
 
 
+@torch.inference_mode()
+def hh_validation_outputs(model, loader, device):
+    items = {}
+    for batch in loader:
+        out = model(to_device(batch, device))
+        unary, logits, psi = (out[key] for key in ("unary", "logits", "psi"))
+        local = model.decode(unary, logits, psi)
+        exact = model.decode(unary, logits, psi, exact=True)
+        decisions = torch.stack((unary >= 0, logits >= 0, local, exact), dim=1)
+        sets, unique = model.candidates(unary, logits)
+        targets = batch["y"].to(device).bool()
+        overlap = (sets & targets[:, None]).sum(-1)
+        union = (sets | targets[:, None]).sum(-1)
+        oracle = (overlap / union.clamp_min(1)).masked_fill(~unique, 0).amax(-1)
+        energy = model.set_energy(decisions, unary, psi)
+        batch_items = {"targets": batch["y"], "probabilities": logits.sigmoid(),
+                       "unary_logits": unary, "conditional_logits": logits, "pair_potentials": psi,
+                       "decisions": decisions, "raw_axes": decisions.float() @ model.projection > 0,
+                       "effective_axes": model.axes(decisions), "energy": energy, "local_oracle_jaccard": oracle}
+        for key, values in batch_items.items():
+            items.setdefault(key, []).append(values.cpu().numpy())
+    arrays = {key: np.concatenate(values) for key, values in items.items()}
+    return arrays, {"pair_indices": list(zip(model.pair_left.tolist(), model.pair_right.tolist()))}
+
+
+def hh_validation_report(y, probabilities, arrays, scores, statistics):
+    actual = y.astype(bool)
+    unary, conditional, local, exact = arrays["decisions"].transpose(1, 0, 2)
+    unary_probabilities = torch.from_numpy(arrays["unary_logits"]).sigmoid().numpy()
+    def report(p, prediction):
+        return evaluate_metrics(y, p, .5, statistics["labels"]["support"],
+                                statistics["function_projection"], predicted=prediction)
+    added, deleted = conditional & ~unary, unary & ~conditional
+    delta = np.abs(arrays["conditional_logits"]-arrays["unary_logits"])
+    magnitude = np.abs(arrays["unary_logits"])
+    quantiles = lambda values: np.quantile(values, [.5, .9, .99]).tolist() if values.size else None
+    from .multimodal import independent_functions
+    multifunction = independent_functions(y, statistics["function_projection"]).sum(-1) >= 2
+    def counts(mask, prediction):
+        truth, predicted = actual[mask], prediction[mask]
+        return {"tp": int((truth & predicted).sum()), "fp": int((~truth & predicted).sum()),
+                "fn": int((truth & ~predicted).sum())}
+    return {**scores, "decision_order": ["unary", "conditional", "local", "exact"],
+            "unary": report(unary_probabilities, unary), "conditional": report(probabilities, conditional),
+            "local": report(probabilities, local), "exact": report(probabilities, exact),
+            "mean_energy_regret": float(np.maximum(arrays["energy"][:, 3]-arrays["energy"][:, 2], 0).mean()),
+            "mean_local_oracle_jaccard": float(arrays["local_oracle_jaccard"].mean()),
+            "added": int(added.sum()), "added_recorded": int((added & actual).sum()),
+            "deleted": int(deleted.sum()), "deleted_recorded": int((deleted & actual).sum()),
+            "quantiles": [0.5, 0.9, 0.99], "unary_abs": quantiles(magnitude), "correction_abs": quantiles(delta),
+            "relative_correction": quantiles(delta/(magnitude+1e-6)),
+            "flipped_unary_abs": quantiles(magnitude[added | deleted]),
+            "by_observed_function_count": {
+                name: {"unary": counts(mask, unary), "conditional": counts(mask, conditional)}
+                for name, mask in (("single_or_empty", ~multifunction), ("multiple", multifunction))}}
+
+
 def evaluate(checkpoint_path, data_root, feature_root, split, device, output, predictions=None, batch_size=32, decision_path=None,
-             without_private_evidence=False, peptide_feature_root=None):
+             without_private_evidence=False, peptide_feature_root=None, hh_diagnostics=False):
     model, checkpoint = load_model(checkpoint_path, device)
     if without_private_evidence:
         if checkpoint["model_name"] != "trirelay" or not hasattr(model, "evidence_partition"):
@@ -957,7 +1118,14 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
                                   sequence_only=sequence_only or (checkpoint["model_name"] == "privilegedbridge" and model.stage == "A"))
     validate_cache(dataset, checkpoint["config"], checkpoint["encoder"])
     loader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_multimodal)
-    y, probabilities = predict_loader(model, loader, device)
+    if hh_diagnostics:
+        if checkpoint["model_name"] != "hh_setreread" or split != "val":
+            raise ValueError("HH decoder diagnostics require an HH-SetReread checkpoint and --split val")
+        extra_outputs, scores = hh_validation_outputs(model, loader, device)
+        y, probabilities = extra_outputs.pop("targets"), extra_outputs.pop("probabilities")
+    else:
+        extra_outputs = {}
+        y, probabilities = predict_loader(model, loader, device)
     threshold = checkpoint["threshold"]
     decision, predicted = None, None
     if decision_path:
@@ -995,6 +1163,9 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
     suite = checkpoint.get("selection_suite", settings.get("metric_suite", "task_specific"))
     result["metric_protocol"] = protocol_description(suite, settings.get("threshold_strategy", "global"))
     result["primary_metrics"] = primary_metrics(result["metrics"], suite)
+    if hh_diagnostics:
+        result["hh_diagnostics"] = hh_validation_report(
+            y, probabilities, extra_outputs, scores, source.statistics)
     Path(output).parent.mkdir(parents=True, exist_ok=True)
     with Path(output).open("x", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2, allow_nan=False)
@@ -1004,7 +1175,7 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
             np.savez_compressed(f, row_id=source.data.rows[dataset.indices], ID=source.data.ids[dataset.indices],
                                 targets=y, probabilities=probabilities, label_names=np.array(source.data.labels), threshold=threshold,
                                 split=split, task=checkpoint['track'], decision_json=json.dumps(decision),
-                                inference_ablation_json=json.dumps(result.get('inference_ablation')))
+                                inference_ablation_json=json.dumps(result.get('inference_ablation')), **extra_outputs)
     return result
 
 

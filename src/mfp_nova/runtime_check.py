@@ -47,6 +47,7 @@ def inspect(feature_root, device):
 
 
 PROBES = {
+    "hh_setreread": ["backbone.sequence.plm.weight", "query", "shared_readout.weight", "private_readout.weight"],
     "setreread": ["features.projection.weight", "cnn.convs1.0.weight", "add_head.2.weight"],
     "termiscale": ["features.projection.weight", "blocks.0.router.weight", "label.weight", "condition_weights"],
     "motifspan": ["features.projection.weight", "velocity_out.weight", "left.weight", "detail_query.weight"],
@@ -105,6 +106,9 @@ def profile(config, source, dataset, device, batches, precisions, measured_steps
                  "vocab_size": len(source.statistics["chemical_vocab"])+2, "statistics": source.statistics["labels"], **config["model"]}
     if config["model_name"] == "setreread":
         arguments["function_projection"] = source.statistics["function_projection"]
+    if config["model_name"] == "hh_setreread":
+        from .models.hh_setreread import axis_statistics
+        arguments["axis_statistics"] = axis_statistics(source)
     if "peptide_encoder" in dataset.meta:
         arguments["peptide_input_dim"] = dataset.meta["peptide_encoder"]["input_dim"]
     samples = [dataset[i] for i in range(len(dataset))] if batch_scope == "diagnostic" else None
@@ -189,6 +193,7 @@ def profile(config, source, dataset, device, batches, precisions, measured_steps
                         if "peptide_encoder" in dataset.meta:
                             key = ("features.projection.weight" if config["model_name"] in ("termiscale", "motifspan") else
                                    "sequence.features.projection.weight" if config["model_name"] == "privilegedbridge" else
+                                   "backbone.sequence.plm.weight" if config["model_name"] == "hh_setreread" else
                                    "sequence.plm.weight")
                             boundary = dataset.meta["input_dim"]
                             for view, columns in (("primary", slice(None, boundary)), ("peptide", slice(boundary, None))):
@@ -234,6 +239,8 @@ def profile(config, source, dataset, device, batches, precisions, measured_steps
 def run(models, tasks, feature_root, device, output, esm="650m", batches=(2, 4, 8, 16),
         precisions=("fp32", "fp16"), steps=32, samples=128, data_root="data/therapeutic_2025", peptide_feature_root=None,
         profile_only=False):
+    if "hh_setreread" in models and (not profile_only or list(tasks) != ["fine39"] or esm != "650m"):
+        raise ValueError("Use --profile-only --tasks fine39 with the default ESM650M for HH GPU profiling")
     if len(set(tasks)) == 1 and tasks[0] in (*THERAPEP_TRACKS, "rich48"):
         if str(data_root) == "data/therapeutic_2025":
             data_root = "data/therapeutic_2025/rich48" if tasks[0] == "rich48" else THERAPEP_ROOTS[tasks[0]]
@@ -259,13 +266,19 @@ def run(models, tasks, feature_root, device, output, esm="650m", batches=(2, 4, 
     for name in models:
         for task in tasks:
             config = yaml.safe_load(Path(f"configs/{name}.yaml").read_text(encoding="utf-8"))
+            if name == "hh_setreread":
+                base = yaml.safe_load(Path("configs/theraset.yaml").read_text(encoding="utf-8"))
+                for key in ("encoder", "peptide_encoder"):
+                    config[key] = base[key]
+                config["model"] = {**base["model"], "label_context": False, "prototype_readout": False, **config["model"]}
+                config["loss"] = {**base["loss"], **config["loss"]}
             from .therapep import configure_task
             configure_task(config, task)
             if task not in (*THERAPEP_TRACKS, "rich48") or str(data_root) != "data/therapeutic_2025":
                 config["data"]["root"] = str(data_root)
             if task not in (*THERAPEP_TRACKS, "rich48") or str(feature_root) != f"features/esm2_{esm}":
                 config["data"]["features"] = str(feature_root)
-            if peptide_feature_root is not None and name in ("helixset", "theraset", "termiscale", "motifspan", "privilegedbridge"):
+            if peptide_feature_root is not None and name in ("helixset", "theraset", "termiscale", "motifspan", "privilegedbridge", "hh_setreread"):
                 config["data"]["peptide_features"] = str(peptide_feature_root)
             if name == "setreread":
                 config["train"]["correction_start_epoch"] = 1
