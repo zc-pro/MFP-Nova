@@ -111,7 +111,7 @@ def independent_functions(y, projection):
 
 class MultimodalData:
     def __init__(self, root, track, statistics=None, min_support=20, max_factors=32, sequence_only=False,
-                 sequence_chemistry=False):
+                 sequence_chemistry=False, train_indices=None):
         self.data = PeptideData(root, track)
         self.root = Path(root)
         self.sequence_only = sequence_only
@@ -155,7 +155,7 @@ class MultimodalData:
             if not np.array_equal(source["row_id"], self.data.rows):
                 raise ValueError("Multimodal row_id order differs from targets")
         self.read_chemistry()
-        train = self.data.indices("train")
+        train = self.data.indices("train") if train_indices is None else train_indices
         if statistics is None:
             node_values = np.stack([np.log1p(self.struct["ASA_A2"]), self.struct["RSA_unclipped"]], -1)
             selected_nodes = node_values[train][self.struct["residue_mask"][train]]
@@ -330,11 +330,12 @@ def sequence_inputs(data, i, esm):
 
 
 class MultimodalPeptides(Dataset):
-    def __init__(self, source, feature_root, split, limit=None, peptide_feature_root=None, sequence_only=False):
+    def __init__(self, source, feature_root, split, limit=None, peptide_feature_root=None, sequence_only=False, indices=None):
         self.source = source
         self.sequence_only = sequence_only
         self.cache = CachedPeptides(source.data, feature_root, split)
-        self.indices = diagnostic_indices(source, self.cache.indices, limit, split=="train") if limit else self.cache.indices
+        pool = self.cache.indices if indices is None else indices
+        self.indices = diagnostic_indices(source, pool, limit, split=="train") if limit else pool
         lookup = {int(i): j for j, i in enumerate(self.cache.indices)}
         self.cache_indices = [lookup[int(i)] for i in self.indices]
         self.meta = dict(self.cache.meta)

@@ -53,6 +53,9 @@ def main(argv=None):
             sub.add_argument("--hh-relation", choices=("off", "shared", "bilinear", "mlp"))
             sub.add_argument("--hh-ranking", choices=("none", "record", "weak"))
             sub.add_argument("--hh-v12-readout", choices=("conditional", "unconditional", "raw_unconditional", "affine"))
+            sub.add_argument("--hh-v13-readout", choices=("scores", "unconditional", "conditional"))
+            sub.add_argument("--hh-oof-fold", type=int, choices=range(3), help="Train a fresh Fine39 TheraSet for one held-out Train fold")
+            sub.add_argument("--hh-oof-files", nargs=3, help="Three TheraSet fold exports for HH V1.3 editor training")
             sub.add_argument("--annotations", help="B0/H1–H8: aligned NPZ of confirmed label and observation states")
             sub.add_argument("--unlabeled-weight", type=float, help="Sequence study: optional weak BCE weight for unannotated zero bits")
             sub.add_argument("--fold-dir", help="Sequence study: share training-only B0 fold checkpoints")
@@ -143,7 +146,8 @@ def main(argv=None):
     summarize.add_argument("--split", choices=("val", "test"), default="val")
     summarize.add_argument("--output", help="Optional JSON; otherwise print")
     gpu_check = commands.add_parser("gpu-check", help="Real-cache full-model server probes and bounded short training")
-    gpu_check.add_argument("--models", nargs="+", choices=RESEARCH_MODELS, default=list(LEGACY_MODELS))
+    gpu_check.add_argument("--models", nargs="+", choices=tuple(m for m in RESEARCH_MODELS if m != "hh_setreread_v13"),
+                           default=list(LEGACY_MODELS))
     gpu_check.add_argument("--tasks", nargs="+", choices=TRACKS, default=["major15", "fine39"])
     gpu_check.add_argument("--esm", choices=("35m", "650m"), default="650m")
     gpu_check.add_argument("--feature-root")
@@ -224,6 +228,18 @@ def main(argv=None):
                 if args.model != "hh_setreread_v12" or args.resume:
                     raise ValueError("--hh-v12-readout requires a fresh HH V1.2 run")
                 config["model"]["readout"] = args.hh_v12_readout
+            if args.hh_oof_fold is not None:
+                if args.model != "theraset" or (args.task or args.track) != "fine39":
+                    parser.error("--hh-oof-fold requires --model theraset --task fine39")
+                config["model"].update(label_context=False, prototype_readout=False)
+                config["train"].update(hh_oof_fold=args.hh_oof_fold, epochs=45, lr_decay_epochs=100,
+                                       batch_size=64, accumulation_steps=1, patience=0, metric_suite="micro_f1",
+                                       save_selection_candidates=False, export_validation_predictions=False)
+            if args.hh_v13_readout is not None or args.hh_oof_files:
+                if args.model != "hh_setreread_v13":
+                    parser.error("HH V1.3 editor options require --model hh_setreread_v13")
+                if args.hh_v13_readout is not None:
+                    config["model"]["readout"] = args.hh_v13_readout
             if args.resume and args.initialize_from:
                 raise ValueError("Use resume within a phase or initialize-from between phases")
             if args.model == "privilegedbridge":
@@ -350,6 +366,11 @@ def main(argv=None):
                 if args.resume_in_place or args.stop_file:
                     raise ValueError('Pause/in-place resume currently requires a research model')
                 train(config, name)
+            elif model_name == "hh_setreread_v13":
+                if args.resume or args.resume_in_place or args.stop_file:
+                    parser.error("HH V1.3 editor training uses fresh runs")
+                from .hh_v13 import train_editor
+                train_editor(config, name, args.hh_oof_files)
             else:
                 continuation = {}
                 if args.resume_in_place:

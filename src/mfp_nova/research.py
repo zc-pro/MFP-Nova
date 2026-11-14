@@ -25,6 +25,9 @@ from .metric_protocol import FIXED_THRESHOLD_SUITES, protocol_description, prima
 
 
 def make_model(name, arguments):
+    if name == "hh_setreread_v13":
+        from .models.hh_setreread_v13 import HHSetRereadV13
+        return HHSetRereadV13(**arguments)
     if name == "hh_setreread_v12":
         from .models.hh_setreread_v12 import HHSetRereadV12
         return HHSetRereadV12(**arguments)
@@ -295,6 +298,10 @@ def restore_history(run, checkpoint):
 
 def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     settings = config["train"]
+    fold = settings.get("hh_oof_fold")
+    if fold is not None and (resume or resume_in_place or stop_file or config["model_name"] != "theraset"
+                             or config["data"]["track"] != "fine39" or settings.get("initialize_from")):
+        raise ValueError("HH V1.3 fold training requires a fresh Fine39 TheraSet from random initialization")
     device = torch.device(settings["device"])
     if device.type=="cuda":
         torch.cuda.set_device(device)
@@ -460,10 +467,14 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         raise ValueError("Reconstruction gradient balancing currently supports TriRelay")
     reference_checkpoint = checkpoint or initial
     sequence_only = setreread or config["model_name"] in ("termiscale", "motifspan")
+    train_indices = held_indices = None
+    if fold is not None:
+        from .hh_v13 import fold_indices
+        train_indices, held_indices = fold_indices(config["data"]["root"], fold)
     source = MultimodalData(config["data"]["root"], config["data"]["track"],
                            reference_checkpoint["statistics"] if reference_checkpoint else None,
                            config.get("min_factor_support", 20), config.get("max_factors", 32),
-                           sequence_only=sequence_only, sequence_chemistry=setreread)
+                           sequence_only=sequence_only, sequence_chemistry=setreread, train_indices=train_indices)
     if pb and config["model"].get("stage", "A") != "A" and source.data.track in THERAPEP_TRACKS:
         raise ValueError("PB B/C need observed auxiliary inputs; use rich48 or stage A for author sequence tasks")
     if function_aux:
@@ -472,9 +483,10 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     diagnostic = bool(limit or settings.get("max_steps") or (checkpoint and checkpoint["config"]["train"].get("max_steps")))
     # Diagnostic optimization subsets retain full original-Train priors/statistics:
     # shrinking the subset must not erase empirical factors or prototype capacity.
-    datasets = [MultimodalPeptides(source, config["data"]["features"], split, limit,
+    datasets = [MultimodalPeptides(source, config["data"]["features"], "train" if fold is not None else split, limit,
                                    config["data"].get("peptide_features"),
-                                   sequence_only=sequence_only or (pb and config["model"].get("stage", "A") == "A")) for split in ("train", "val")]
+                                   sequence_only=sequence_only or (pb and config["model"].get("stage", "A") == "A"),
+                                   indices=indices) for split, indices in (("train", train_indices), ("val", held_indices))]
     validate_cache(datasets[0], config, reference_checkpoint["encoder"] if reference_checkpoint else None)
     validate_cache(datasets[1], config, datasets[0].meta)
     if datasets[0].meta["dataset"] != source.statistics["dataset"]:
@@ -662,6 +674,10 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
                                             "tracking_start_epoch": candidate_start,
                                             "stopping": "primary suite only; one shared optimizer trajectory"}
     if not resume_in_place or checkpoint is None:
+        if fold is not None:
+            metadata["val_rows"] = 0
+            metadata["held_rows"] = len(datasets[1])
+            metadata["metric_protocol"] = {"selection": "fixed_epoch_oof", "fold": fold}
         write_json(run/"metadata.json", metadata)
     static = {"model_name": config["model_name"], "model_args": args, "config": config, "statistics": source.statistics,
               "labels": source.data.labels, "track": source.data.track, "encoder": datasets[0].meta, "planned_epochs": planned_epochs}
@@ -670,9 +686,10 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     started = time.perf_counter()
     elapsed_before = checkpoint.get("elapsed_seconds", 0) if checkpoint else 0
     peak_memory = (checkpoint.get("peak_cuda_memory_bytes", 0) or 0) if checkpoint else 0
-    validation_groups = source.groups(datasets[1].indices, source.data.y[datasets[1].indices])
+    validation_groups = (source.groups(datasets[1].indices, source.data.y[datasets[1].indices])
+                         if fold is None else {})
     epoch = checkpoint["epoch"] if checkpoint else 0
-    if suite == "jaccard" and checkpoint is None:
+    if suite == "jaccard" and checkpoint is None and fold is None:
         y, probabilities, validation_loss = predict_loader(model, loaders[1], device, precision, config["loss"])
         report = metrics(y, probabilities, source.statistics)
         best_key, best_selection_threshold, _ = selection(y, probabilities, report, suite, "fixed_0_5")
@@ -781,8 +798,9 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
             if boundary:
                 valid_microbatches = 0
             n = len(batch["y"])
-            online_targets.append(batch["y"].detach().cpu().numpy())
-            online_probabilities.append(output["logits"].detach().float().sigmoid().cpu().numpy())
+            if fold is None:
+                online_targets.append(batch["y"].detach().cpu().numpy())
+                online_probabilities.append(output["logits"].detach().float().sigmoid().cpu().numpy())
             del output
             for key, value in {"total": loss, **components}.items():
                 totals[key] = totals.get(key, 0)+float(value.detach())*n
@@ -791,6 +809,13 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
                 break
             batch_done = time.perf_counter()
         train_seconds = time.perf_counter() - epoch_start
+        if fold is not None:
+            scheduler.step()
+            print(f"Fold {fold} | epoch {epoch}/{settings['epochs']} | "
+                  f"loss={totals['total']/count:.6f} | {train_seconds:.1f}s", flush=True)
+            if settings.get("max_steps") and global_step >= settings["max_steps"]:
+                break
+            continue
         train_report = metrics(np.concatenate(online_targets), np.concatenate(online_probabilities), source.statistics)
         del online_targets, online_probabilities
         validation_start = time.perf_counter()
@@ -969,6 +994,13 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         if stop_file is not None and Path(stop_file).exists() and epoch < settings['epochs']:
             print(f'Paused after epoch {epoch}; continue from {run / "last.pt"}', flush=True)
             return {'paused': True, 'epoch': epoch, 'checkpoint': str(run/'last.pt')}
+    if fold is not None:
+        from .hh_v13 import export_fold
+        selected = ema.module if ema is not None and int(ema.n_averaged)>0 else model
+        fold_checkpoint = {**static, "model_state": checkpoint_state(selected), "threshold": .5,
+                           "best_epoch": epoch, "weight_source": "ema" if selected is not model else "online"}
+        torch.save(fold_checkpoint, run/"best.pt")
+        return export_fold(run, selected, loaders[1], device, fold, epoch, diagnostic, time.perf_counter()-started)
     restore_model_state(model, best_state)
     y, probabilities, validation_loss = predict_loader(model, loaders[1], device, precision, config["loss"])
     threshold = final_threshold(y, probabilities, suite, settings.get("threshold_strategy", "global"))
@@ -1160,6 +1192,12 @@ def hh_v12_validation_report(y, arrays, statistics):
 def evaluate(checkpoint_path, data_root, feature_root, split, device, output, predictions=None, batch_size=32, decision_path=None,
              without_private_evidence=False, peptide_feature_root=None, hh_diagnostics=False):
     model, checkpoint = load_model(checkpoint_path, device)
+    if checkpoint["model_name"] == "hh_setreread_v13":
+        if decision_path or without_private_evidence or (hh_diagnostics and split != "val"):
+            raise ValueError("HH V1.3 uses the saved edit rule; background diagnostics use Validation")
+        from .hh_v13 import evaluate_editor
+        return evaluate_editor(model, checkpoint, data_root, feature_root, split, device, output, predictions,
+                               batch_size, peptide_feature_root, hh_diagnostics)
     if without_private_evidence:
         if checkpoint["model_name"] != "trirelay" or not hasattr(model, "evidence_partition"):
             raise ValueError("Private evidence ablation requires a shared-private TriRelay checkpoint")
@@ -1252,6 +1290,8 @@ def predict_inputs(checkpoint_path, input_path, device="cpu", batch_size=32, dec
     model, checkpoint = load_model(checkpoint_path, device)
     with np.load(input_path, allow_pickle=False) as z:
         raw = {k: z[k] for k in z.files if k not in ("y", "row_id", "ID")}
+    if checkpoint["model_name"] == "hh_setreread_v13":
+        raw.pop("base_logits", None)
     if checkpoint["model_name"] == "setreread" and "chemical" not in raw:
         from .multimodal import prepare_sequence_inputs
         inputs = prepare_sequence_inputs(raw, checkpoint["statistics"])
@@ -1260,15 +1300,36 @@ def predict_inputs(checkpoint_path, input_path, device="cpu", batch_size=32, dec
         inputs = prepare_inputs(raw, checkpoint["statistics"])
     else:
         inputs = {k: torch.from_numpy(v) for k, v in raw.items()}
-    probabilities = []
-    with torch.inference_mode():
-        for start in range(0, len(inputs["aa"]), batch_size):
-            batch = {k: v[start:start+batch_size].to(device) for k, v in inputs.items()}
-            probabilities.extend(model(batch)["logits"].sigmoid().cpu().tolist())
+    records = []
     scope = "sequence_only" if checkpoint["model_name"] in ("termiscale", "motifspan", "privilegedbridge") else "provided_multimodal_fields"
     if checkpoint["model_name"] == "privilegedbridge" and model.stage == "B":
         scope = "provided_multimodal_fields"
-    return prediction_records(checkpoint, probabilities, scope, decision_path)
+    with torch.inference_mode():
+        for start in range(0, len(inputs["aa"]), batch_size):
+            batch = {k: v[start:start+batch_size].to(device) for k, v in inputs.items()}
+            records.extend(model_prediction_records(model, checkpoint, batch, scope, decision_path))
+    return records
+
+
+def model_prediction_records(model, checkpoint, batch, scope, decision_path):
+    output = model(batch)
+    probabilities = output["logits"].sigmoid().cpu().tolist()
+    if checkpoint["model_name"] != "hh_setreread_v13":
+        return prediction_records(checkpoint, probabilities, scope, decision_path)
+    if decision_path:
+        raise ValueError("HH V1.3 predicts with its saved single-add rule")
+    from .models.hh_setreread_v13 import apply_edits
+    final, added = apply_edits(output["logits"], output["edit_gain"], checkpoint["edit_threshold"])
+    records = prediction_records(checkpoint, probabilities, scope)
+    names = checkpoint["labels"]
+    for item, base, chosen, label, gains in zip(records, output["logits"].cpu().tolist(),
+                                                final.cpu().tolist(), added.cpu().tolist(),
+                                                output["edit_gain"].cpu().tolist()):
+        item["base_labels"] = [name for name, u in zip(names, base) if u >= 0]
+        item["predicted_labels"] = [name for name, keep in zip(names, chosen) if keep]
+        item["edit_gain"] = {name: gain for name, u, gain in zip(names, base, gains) if u < 0}
+        item["added_label"] = names[label] if label >= 0 else None
+    return records
 
 
 def prediction_records(checkpoint, probabilities, scope, decision_path=None):
@@ -1323,10 +1384,9 @@ def predict_sequences(checkpoint_path, sequences, device="cpu", decision_path=No
             raw["esm_eos"] = torch.stack([states[i, len(s) + 1] for i, s in enumerate(selected)]).half().float().cpu().numpy()
         prepare = prepare_sequence_inputs if checkpoint["model_name"] == "setreread" else prepare_inputs
         inputs = prepare(raw, checkpoint["statistics"])
-        with torch.inference_mode():
-            probs = model(to_device(inputs, device))["logits"].sigmoid().cpu().tolist()
         scope = "sequence_only" if checkpoint["model_name"] in ("termiscale", "motifspan", "privilegedbridge") else "sequence_and_stereochemistry_only"
-        records = prediction_records(checkpoint, probs, scope, decision_path)
+        with torch.inference_mode():
+            records = model_prediction_records(model, checkpoint, to_device(inputs, device), scope, decision_path)
         for s, record in zip(selected, records):
             record["sequence"] = s
         output.extend(records)
