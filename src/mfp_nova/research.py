@@ -16,6 +16,7 @@ from torch.utils.data import DataLoader
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
 from .metrics import evaluate_metrics, evaluate_groups, format_epoch, fit_global_threshold, fit_label_thresholds
+from .models import HH_MODELS
 from .multimodal import MultimodalData, MultimodalPeptides, collate_multimodal
 from .research_layers import observed_label_loss
 from .consistency import bernoulli_consistency, consistency_weight
@@ -24,6 +25,9 @@ from .metric_protocol import FIXED_THRESHOLD_SUITES, protocol_description, prima
 
 
 def make_model(name, arguments):
+    if name == "hh_setreread_v12":
+        from .models.hh_setreread_v12 import HHSetRereadV12
+        return HHSetRereadV12(**arguments)
     if name == "hh_setreread":
         from .models.hh_setreread import HHSetReread
         return HHSetReread(**arguments)
@@ -157,7 +161,7 @@ def validate_cache(dataset, config, reference=None):
     if (peptide is None) != (settings is None):
         raise ValueError("Peptide encoder configuration and cache must be supplied together")
     if peptide is not None:
-        if config["model_name"] not in ("helixset", "theraset", "termiscale", "motifspan", "privilegedbridge", "hh_setreread"):
+        if config["model_name"] not in ("helixset", "theraset", "termiscale", "motifspan", "privilegedbridge", *HH_MODELS):
             raise ValueError("This architecture does not support dual frozen encoders")
         if peptide["name"] != settings["name"] or peptide["max_length"] != settings["max_length"]:
             raise ValueError("Configured peptide encoder differs from cache")
@@ -298,9 +302,11 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     checkpoint = torch.load(resume, map_location="cpu", weights_only=True) if resume else None
     pb = config["model_name"] == "privilegedbridge"
     hh = config["model_name"] == "hh_setreread"
+    hh_v12 = config["model_name"] == "hh_setreread_v12"
+    hh_model = hh or hh_v12
     initial = None
     initialize = settings.get("initialize_from")
-    if checkpoint is None and (hh or (config["model_name"] == "theraset" and initialize)):
+    if checkpoint is None and (hh_model or (config["model_name"] == "theraset" and initialize)):
         if not initialize:
             raise ValueError("HH-SetReread requires --initialize-from pointing to the Fine39 TheraSet best.pt")
         initial = torch.load(initialize, map_location="cpu", weights_only=True)
@@ -308,14 +314,18 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
             raise ValueError("Initialization requires a TheraSet checkpoint for the same task")
         backbone = {k: v for k, v in initial["model_args"].items()
                     if k not in ("input_dim", "num_labels", "vocab_size", "statistics", "peptide_input_dim")}
-        if hh and (backbone.get("label_context", True) or not backbone.get("evidence_decoder", True)
-                   or not initial["model_state"]["active"].sum(1).eq(1).all()):
-            raise ValueError("HH V1.1 requires the no_label_context_single_prototype checkpoint")
-        hh_options = ("relation", "lambda_pair", "fixed_overlap")
+        if hh_model and (backbone.get("label_context", True) or not backbone.get("evidence_decoder", True)
+                         or not initial["model_state"]["active"].sum(1).eq(1).all()):
+            raise ValueError("HH requires the no_label_context_single_prototype checkpoint")
+        hh_options = (("relation", "lambda_pair", "fixed_overlap") if hh else
+                      ("readout", "esm_bypass", "condition_query", "split_evidence", "background_dropout"))
         config["model"] = {**backbone, **{key: config["model"][key] for key in hh_options
-                                        if key in config["model"]}} if hh else backbone
+                                        if key in config["model"]}} if hh_model else backbone
         original = initial["config"]
-        config["loss"] = {**original["loss"], **config["loss"]} if hh else dict(original["loss"])
+        if hh:
+            config["loss"] = {**original["loss"], **config["loss"]}
+        elif not hh_v12:
+            config["loss"] = dict(original["loss"])
         config["encoder"] = original["encoder"]
         if "peptide_encoder" in original:
             config["peptide_encoder"] = original["peptide_encoder"]
@@ -381,9 +391,12 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
             if key not in ("device", "output", "epochs", "num_workers", "max_steps"):
                 settings[key] = value
     suite = settings.get("metric_suite", "task_specific")
-    if hh and (config["data"]["track"] != "fine39" or suite != "jaccard"
-               or config["encoder"]["max_length"] != 80):
-        raise ValueError("HH V1.1 requires Fine39, max_length=80 and the fixed-threshold jaccard protocol")
+    if hh_model and (config["data"]["track"] != "fine39" or suite != "jaccard"
+                     or config["encoder"]["max_length"] != 80):
+        raise ValueError("HH requires Fine39, max_length=80 and the fixed-threshold jaccard protocol")
+    if hh_v12 and (not config["data"].get("peptide_features")
+                   or config.get("peptide_encoder", {}).get("max_length") != 80):
+        raise ValueError("HH V1.2 requires length-80 caches for both encoders")
     frozen_epochs = settings["hh_frozen_epochs"] if hh else 0
     setreread = config["model_name"] == "setreread"
     if setreread and (config["data"]["track"] not in ("major15", "fine39") or suite != "micro_f1"):
@@ -487,7 +500,7 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         args["function_aux_statistics"] = source.statistics["function_auxiliary"]
     model = make_model(config["model_name"], args).to(device)
     if initial is not None and not pb:
-        restore_model_state(model.backbone if hh else model, initial["model_state"])
+        restore_model_state(model.backbone if hh_model else model, initial["model_state"])
         del initial
     elif initial is not None:
         previous = make_model("privilegedbridge", initial["model_args"]).to(device)
@@ -1102,6 +1115,48 @@ def hh_validation_report(y, probabilities, arrays, scores, statistics):
                 for name, mask in (("single_or_empty", ~multifunction), ("multiple", multifunction))}}
 
 
+@torch.inference_mode()
+def hh_v12_validation_outputs(model, loader, device):
+    items = {key: [] for key in ("targets", "unary_logits", "unconditional_logits", "conditional_logits")}
+    for batch in loader:
+        output = model(to_device(batch, device), return_unconditional=True)
+        for key, values in (("targets", batch["y"]), ("unary_logits", output["unary"]),
+                            ("unconditional_logits", output["unconditional_logits"]),
+                            ("conditional_logits", output["logits"])):
+            items[key].append(values.cpu().numpy())
+    return {key: np.concatenate(parts) for key, parts in items.items()}
+
+
+def hh_v12_validation_report(y, arrays, statistics):
+    from .multimodal import independent_functions
+    truth = y.astype(bool)
+    projection = statistics["function_projection"]
+    truth_axes = independent_functions(y, projection)
+    reports, predictions, hits = {}, {}, {}
+    for name in ("unary", "unconditional", "conditional"):
+        probabilities = torch.from_numpy(arrays[f"{name}_logits"]).sigmoid().numpy()
+        predictions[name] = probabilities >= .5
+        hits[name] = (independent_functions(predictions[name], projection) & truth_axes).sum(1)
+        reports[name] = metrics(y, probabilities, statistics)
+    transitions = {}
+    for start, end in (("unary", "unconditional"), ("unconditional", "conditional"), ("unary", "conditional")):
+        before, after = predictions[start], predictions[end]
+        added, deleted = after & ~before, before & ~after
+        multi = truth_axes.sum(1) >= 2
+        one_hit = multi & (hits[start] == 1)
+        transitions[f"{start}_to_{end}"] = {
+            "changed_rows": int((before != after).any(1).sum()),
+            "added_recorded": int((added & truth).sum()),
+            "added_unrecorded": int((added & ~truth).sum()),
+            "deleted_recorded": int((deleted & truth).sum()),
+            "deleted_unrecorded": int((deleted & ~truth).sum()),
+            "one_correct_axis_rows": int(one_hit.sum()),
+            "one_to_at_least_two_correct_axes": int((one_hit & (hits[end] >= 2)).sum()),
+            "at_least_two_to_fewer_correct_axes": int(((hits[start] >= 2) & (hits[end] < 2)).sum()),
+        }
+    return {**reports, "transitions": transitions}
+
+
 def evaluate(checkpoint_path, data_root, feature_root, split, device, output, predictions=None, batch_size=32, decision_path=None,
              without_private_evidence=False, peptide_feature_root=None, hh_diagnostics=False):
     model, checkpoint = load_model(checkpoint_path, device)
@@ -1119,10 +1174,15 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
     validate_cache(dataset, checkpoint["config"], checkpoint["encoder"])
     loader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_multimodal)
     if hh_diagnostics:
-        if checkpoint["model_name"] != "hh_setreread" or split != "val":
-            raise ValueError("HH decoder diagnostics require an HH-SetReread checkpoint and --split val")
-        extra_outputs, scores = hh_validation_outputs(model, loader, device)
-        y, probabilities = extra_outputs.pop("targets"), extra_outputs.pop("probabilities")
+        if checkpoint["model_name"] not in HH_MODELS or split != "val":
+            raise ValueError("HH diagnostics require an HH-SetReread checkpoint and --split val")
+        if checkpoint["model_name"] == "hh_setreread_v12":
+            extra_outputs = hh_v12_validation_outputs(model, loader, device)
+            y = extra_outputs.pop("targets")
+            probabilities = torch.from_numpy(extra_outputs["conditional_logits"]).sigmoid().numpy()
+        else:
+            extra_outputs, scores = hh_validation_outputs(model, loader, device)
+            y, probabilities = extra_outputs.pop("targets"), extra_outputs.pop("probabilities")
     else:
         extra_outputs = {}
         y, probabilities = predict_loader(model, loader, device)
@@ -1164,8 +1224,11 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
     result["metric_protocol"] = protocol_description(suite, settings.get("threshold_strategy", "global"))
     result["primary_metrics"] = primary_metrics(result["metrics"], suite)
     if hh_diagnostics:
-        result["hh_diagnostics"] = hh_validation_report(
-            y, probabilities, extra_outputs, scores, source.statistics)
+        result["hh_diagnostics"] = (hh_v12_validation_report(y, extra_outputs, source.statistics)
+                                    if checkpoint["model_name"] == "hh_setreread_v12" else
+                                    hh_validation_report(y, probabilities, extra_outputs, scores, source.statistics))
+        if checkpoint["model_name"] == "hh_setreread_v12":
+            extra_outputs["cluster_id"] = source.data.clusters[dataset.indices]
     Path(output).parent.mkdir(parents=True, exist_ok=True)
     with Path(output).open("x", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2, allow_nan=False)

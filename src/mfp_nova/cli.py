@@ -4,7 +4,7 @@ from pathlib import Path
 
 import yaml
 
-from .models import RESEARCH_MODELS, LEGACY_MODELS
+from .models import RESEARCH_MODELS, LEGACY_MODELS, HH_MODELS
 from .metric_protocol import SUITES
 from .models.hypotheses import MODELS as HYPOTHESIS_MODELS
 from .data import TRACKS
@@ -52,6 +52,7 @@ def main(argv=None):
             sub.add_argument("--initialize-from", help="Starting checkpoint for H1–H6, HH-SetReread, TheraSet continuation or PrivilegedBridge")
             sub.add_argument("--hh-relation", choices=("off", "shared", "bilinear", "mlp"))
             sub.add_argument("--hh-ranking", choices=("none", "record", "weak"))
+            sub.add_argument("--hh-v12-readout", choices=("conditional", "unconditional", "raw_unconditional", "affine"))
             sub.add_argument("--annotations", help="B0/H1–H8: aligned NPZ of confirmed label and observation states")
             sub.add_argument("--unlabeled-weight", type=float, help="Sequence study: optional weak BCE weight for unannotated zero bits")
             sub.add_argument("--fold-dir", help="Sequence study: share training-only B0 fold checkpoints")
@@ -125,7 +126,7 @@ def main(argv=None):
     evaluate.add_argument("--predictions", help="Optional aligned sample probabilities in NPZ format")
     evaluate.add_argument("--annotations", help="Sequence study: aligned annotation NPZ for evaluation")
     evaluate.add_argument("--evidence-diagnostics", action="store_true", help="H6: run keep/delete and matched random controls")
-    evaluate.add_argument("--hh-diagnostics", action="store_true", help="HH-SetReread: compare unary, conditional, local and exact sets on Validation")
+    evaluate.add_argument("--hh-diagnostics", action="store_true", help="Compare HH base, evidence and final decisions on Validation")
     evaluate.add_argument("--decision", help="Validation-fitted research-model decision.json; raw ranking scores stay unchanged")
     evaluate.add_argument("--without-private-evidence", action="store_true",
                           help="Shared-private TriRelay: use shared evidence alone in both reads, retaining weights and saved threshold")
@@ -210,7 +211,7 @@ def main(argv=None):
                 config["model"]["interval_evidence"] = True
             if args.stage is not None and args.model != "privilegedbridge":
                 raise ValueError("--stage is a PrivilegedBridge option")
-            if args.initialize_from and args.model not in ("privilegedbridge", "hh_setreread", "theraset"):
+            if args.initialize_from and args.model not in ("privilegedbridge", "theraset", *HH_MODELS):
                 raise ValueError("--initialize-from is unavailable for this research model")
             if args.hh_relation is not None or args.hh_ranking is not None:
                 if args.model != "hh_setreread" or args.resume:
@@ -219,6 +220,10 @@ def main(argv=None):
                     config["model"]["relation"] = args.hh_relation
                 if args.hh_ranking is not None:
                     config["loss"]["hh_ranking"] = args.hh_ranking
+            if args.hh_v12_readout is not None:
+                if args.model != "hh_setreread_v12" or args.resume:
+                    raise ValueError("--hh-v12-readout requires a fresh HH V1.2 run")
+                config["model"]["readout"] = args.hh_v12_readout
             if args.resume and args.initialize_from:
                 raise ValueError("Use resume within a phase or initialize-from between phases")
             if args.model == "privilegedbridge":
@@ -232,9 +237,9 @@ def main(argv=None):
         peptide_view = args.command == "features" and args.encoder_view == "peptide"
         if peptide_view and args.esm:
             raise ValueError("--encoder-view peptide uses peptide_encoder; omit --esm")
-        if args.esm and model_name == "hh_setreread" and args.esm != "650m":
-            parser.error("HH-SetReread V1.1 uses the initializing TheraSet's ESM650M cache")
-        if args.esm and model_name != "hh_setreread":
+        if args.esm and model_name in HH_MODELS and args.esm != "650m":
+            parser.error("HH-SetReread uses the initializing TheraSet's ESM650M cache")
+        if args.esm and model_name not in HH_MODELS:
             if config.get("model", {}).get("esm_tail") and args.esm != "650m":
                 raise ValueError("This HelixSet ESM-tail configuration uses ESM650M")
             config["encoder"]["name"] = "facebook/esm2_t12_35M_UR50D" if args.esm=="35m" else "facebook/esm2_t33_650M_UR50D"
@@ -385,7 +390,7 @@ def main(argv=None):
         batch_size = args.batch_size or checkpoint["config"]["train"].get("batch_size", 128)
         extra = {}
         if args.hh_diagnostics:
-            if checkpoint.get("model_name") != "hh_setreread" or args.split != "val" or args.decision:
+            if checkpoint.get("model_name") not in HH_MODELS or args.split != "val" or args.decision:
                 parser.error("--hh-diagnostics requires an HH-SetReread checkpoint, --split val and its saved decision")
             extra["hh_diagnostics"] = True
         if args.peptide_feature_root:
