@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 from sklearn.metrics import average_precision_score, f1_score
+from sklearn.model_selection import GroupKFold
 
 from mfp_nova.data import PeptideData
 from mfp_nova.multimodal import function_projection, independent_functions
@@ -89,6 +90,47 @@ def rank_diagnostics(targets, a_probs, a_pred, b_probs, b_pred, projection):
     }
 
 
+def addition_diagnostics(targets, base, baseline_probs, candidate_probs, clusters):
+    """Keep every reference prediction, then offer up to one new label."""
+    initial = sample_jaccard(targets, base)
+    rows = np.arange(len(base))
+    missing = targets & ~base
+    folds = list(GroupKFold(5).split(rows, groups=clusters))
+    has_room = (~base).any(1)
+    coverage, results = [], {}
+    for name, probs in (("baseline", baseline_probs), ("candidate", candidate_probs)):
+        masked = np.where(base, -np.inf, probs)
+        top = np.argsort(-masked, axis=1, kind="stable")[:, :3]
+        hit = np.take_along_axis(missing, top, axis=1)
+        coverage.append(hit.any(1))
+        incoming = top[:, 0]
+        confidence = masked[rows, incoming]
+        changed = base.copy()
+        changed[rows[has_room], incoming[has_room]] = True
+        delta = sample_jaccard(targets, changed) - initial
+        accepted = np.zeros(len(base), dtype=bool)
+        for fit, held_out in folds:
+            fit = fit[has_room[fit]]
+            order = fit[np.argsort(-confidence[fit], kind="stable")]
+            if not len(order):
+                continue
+            values = confidence[order]
+            ends = np.flatnonzero(np.r_[values[:-1] != values[1:], True])
+            cumulative = np.cumsum(delta[order], dtype=np.float64)
+            best = ends[cumulative[ends].argmax()]
+            if cumulative[best] > 0:
+                accepted[held_out] = confidence[held_out] >= values[best]
+        results[name] = {"top_1_missing_hit": int(hit[:, 0].sum()), "top_3_missing_hit": int(hit.any(1).sum()),
+                         "selected_additions": int(accepted.sum()),
+                         "recorded_additions": int((accepted & hit[:, 0]).sum()),
+                         "val_cross_fitted_threshold": percent_pair(initial.mean(), (initial + accepted * delta).mean())}
+    union_size = (base | targets).sum(1).clip(min=1)
+    results["oracle_one_addition_from_top_3"] = {
+        name: percent_pair(initial.mean(), (initial + hit / union_size).mean())
+        for name, hit in zip(("baseline", "candidate", "union"), (*coverage, coverage[0] | coverage[1]))}
+    return results
+
+
 def compare(data, baseline_run, candidate_run):
     rows = data.indices("val")
     rows = rows[np.argsort(data.rows[rows])]
@@ -129,6 +171,7 @@ def compare(data, baseline_run, candidate_run):
                                                                   f1_score(actual_mfp, b_mfp, zero_division=0)),
             "groups_jaccard": by_group,
             "candidate_ranking": rank_diagnostics(targets, a_probs, a_pred, b_probs, b_pred, projection),
+            "keep_and_add": addition_diagnostics(targets, a_pred, a_probs, b_probs, data.clusters[rows]),
             "label_ap_largest_gains": [row for row in per_label if row["delta_pp"] > 0][:5],
             "label_ap_largest_drops": [row for row in reversed(per_label) if row["delta_pp"] < 0][:5]}
 

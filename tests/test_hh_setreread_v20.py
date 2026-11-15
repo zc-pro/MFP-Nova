@@ -69,7 +69,7 @@ def test_matched_modes_padding_and_backward():
         if mode == "full":
             assert net.fine_queries.grad.abs().sum() > 0
 
-    for mode in ("chemical_cnn", "chemical_cnn_fusion"):
+    for mode in ("chemical_cnn", "chemical_cnn_fusion", "chemical_cnn_local"):
         with torch.random.fork_rng():
             stats = model().statistics
             torch.manual_seed(157)
@@ -83,7 +83,14 @@ def test_matched_modes_padding_and_backward():
         if mode == "chemical_cnn":
             torch.testing.assert_close(output, reference(batch)["logits"])
         loss, terms = net.compute_loss(batch, settings)
-        assert set(terms) == {"classification"} and torch.isfinite(loss)
+        assert torch.isfinite(loss)
+        if mode == "chemical_cnn_local":
+            terms["local_candidate"].backward()
+            assert net.cnn.convs1[0].weight.grad is None and net.direct[0].weight.grad is None
+            assert net.local_heads[0].weight.grad.abs().sum() > 0
+            loss, _ = net.compute_loss(batch, settings)
+        else:
+            assert set(terms) == {"classification"}
         loss.backward()
         assert net.cnn.convs1[0].weight.grad.abs().sum() > 0
         if mode == "chemical_cnn_fusion":

@@ -238,3 +238,61 @@ tar -czf "runs/$RUN/${RUN}_validation.tar.gz" -C "runs/$RUN" \
     chemical_cnn/{metadata.json,history.jsonl,results.json,best_validation.npz} \
     chemical_cnn_fusion/{metadata.json,history.jsonl,results.json,best_validation.npz}
 ~~~
+
+## 8. 残基级补标签候选
+
+纯化学 CNN 的验证 ACC 为 56.72%，全肽 ESM／位置融合降至 52.47%。保持 TheraSet 的输出集合时，用真值从其前三个未选标签中最多补一个，验证 ACC 上限为 70.32%。加入纯化学 CNN 自己的前三个未选标签，上限为 72.30%。这些是已知真值的候选覆盖诊断。
+
+`chemical_cnn_local` 在纯化学 CNN 的四张卷积图上，对每个标签分别给每个残基计分。将所有真实残基和卷积尺度的分数做 log-mean-exp 池化，再加到直接头分数上，得到候选排序。候选损失切断通往卷积图和直接头的梯度。训练集有多个已标注标签时，候选损失忽略直接头排最高的那个已标注标签，继续监督其余已标注标签，未标注位仍用弱权重。
+
+### V100 · 单卡后台
+
+~~~bash
+cd ~/wuzhencheng/projects/MFP-Nova
+conda activate MFP-Nova
+GPU=0
+CPU_THREADS=6
+RUN="hh_v20_local_fine39_s157_$(date +%Y%m%d_%H%M%S)"
+if git pull --ff-only origin main && mkdir -p "runs/$RUN"; then
+  nohup env CUDA_VISIBLE_DEVICES="$GPU" OMP_NUM_THREADS="$CPU_THREADS" \
+    MKL_NUM_THREADS="$CPU_THREADS" PYTHONPATH="$PWD/src" \
+    python -u -m mfp_nova.cli train --model hh_setreread_v20 --task fine39 \
+    --hh-v20-mode chemical_cnn_local --hh-v20-cnn-channels 128 \
+    --seed 157 --device cuda:0 --precision fp32 --batch-size 64 \
+    --epochs 60 --metric-suite jaccard --name "$RUN/chemical_cnn_local" \
+    > "runs/$RUN/chemical_cnn_local.log" 2>&1 < /dev/null &
+  printf 'PID=%s RUN=%s LOG=runs/%s/chemical_cnn_local.log\n' "$!" "$RUN" "$RUN"
+fi
+~~~
+
+### RTX 5070 · PowerShell
+
+~~~powershell
+Set-Location 'D:\Data\Code\MFP-Nova'
+conda activate MFP-Nova
+git pull --ff-only origin main
+$env:CUDA_VISIBLE_DEVICES = '0'
+$env:OMP_NUM_THREADS = '6'
+$env:MKL_NUM_THREADS = '6'
+$env:PYTHONPATH = "$PWD/src"
+$run = "hh_v20_local_fine39_s157_$(Get-Date -Format yyyyMMdd_HHmmss)"
+New-Item -ItemType Directory -Path "runs/$run" | Out-Null
+python -u -m mfp_nova.cli train --model hh_setreread_v20 --task fine39 `
+  --hh-v20-mode chemical_cnn_local --hh-v20-cnn-channels 128 `
+  --seed 157 --device cuda:0 --precision fp32 --batch-size 64 `
+  --epochs 60 --metric-suite jaccard --name "$run/chemical_cnn_local" 2>&1 |
+  Tee-Object -FilePath "runs/$run/chemical_cnn_local.log"
+~~~
+
+### 验证对比与打包
+
+训练完成后，将实际 TheraSet 基线的 `best_validation.npz` 所在目录填入 `BASE`。`keep_and_add` 报告基线与新头各自的遗漏标签覆盖、按同源簇五折选择阈值的单加 ACC，以及前三候选的真值上限。导出训练目录与 `paired.json` 即可比较。
+
+~~~bash
+BASE="runs/theraset_followup_seed42_v100/fine39/no_label_context_single_prototype/micro_f1"
+PYTHONPATH="$PWD/src" python scripts/compare_validation_predictions.py \
+    "$BASE" "runs/$RUN/chemical_cnn_local" > "runs/$RUN/paired.json" &&
+tar -czf "runs/$RUN/${RUN}_validation.tar.gz" -C "runs/$RUN" \
+    paired.json chemical_cnn_local.log \
+    chemical_cnn_local/{metadata.json,history.jsonl,results.json,best_validation.npz}
+~~~

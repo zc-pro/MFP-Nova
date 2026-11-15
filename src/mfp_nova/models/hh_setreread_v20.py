@@ -30,6 +30,9 @@ class HHSetRereadV20(nn.Module):
                 self.position = nn.Linear(4, dim, bias=False)
                 self.norm = nn.LayerNorm(dim)
                 self.context_summary = nn.Linear(2 * dim, self.cnn.output_channels, bias=False)
+            if mode == "chemical_cnn_local":
+                self.local_heads = nn.ModuleList(nn.Linear(cnn_channels, num_labels, bias=False)
+                                                 for _ in self.cnn.convs2)
             return
         self.terminal = nn.Linear(2, 64, bias=False)
         if mode != "theraset_direct":
@@ -100,13 +103,22 @@ class HHSetRereadV20(nn.Module):
 
     def forward(self, batch):
         if self.mode in HH_V20_CHEMICAL_MODES:
-            _, pooled = self.cnn(batch)
+            maps, pooled = self.cnn(batch)
             if self.mode == "chemical_cnn_fusion":
                 mask = batch["mask"]
                 residues = self.peptide(batch["esm"]) + self.position(endpoint_positions(mask))
                 _, summary = self.summarize(residues, mask)
                 pooled = pooled + self.context_summary(summary)
-            return {"logits": self.direct(pooled)}
+            direct = self.direct(pooled)
+            if self.mode == "chemical_cnn_local":
+                # Compare label-specific motif activations before pooling away their positions.
+                mask = batch["mask"]
+                evidence = torch.cat([head(h.detach()).float() for head, h in zip(self.local_heads, maps)], dim=1)
+                valid = mask.repeat(1, len(maps))
+                evidence = evidence.masked_fill(~valid[..., None], -torch.inf)
+                local = torch.logsumexp(evidence, dim=1) - valid.sum(1, keepdim=True).float().log()
+                return {"logits": direct.detach() + local, "direct": direct}
+            return {"logits": direct}
         residues, global_state = self.encode(batch)
         logits = self.direct(global_state)
         if self.mode in ("direct", "theraset_direct"):
@@ -139,9 +151,17 @@ class HHSetRereadV20(nn.Module):
         output = self(batch)
         target = batch["y"]
         weak = settings.get("unlabeled_weight", .3)
-        classification = observed_label_loss(output["logits"], target, self.statistics, weak)
+        classification = observed_label_loss(output.get("direct", output["logits"]), target, self.statistics, weak)
         terms = {"classification": classification}
         loss = classification
+        if self.mode == "chemical_cnn_local":
+            positives = target.bool()
+            anchor = output["direct"].detach().masked_fill(~positives, -torch.inf).argmax(1, keepdim=True)
+            anchor = torch.zeros_like(positives).scatter_(1, anchor, True)
+            supervise = ~(anchor & (positives.sum(1, keepdim=True) > 1))
+            local = observed_label_loss(output["logits"], target, self.statistics, weak, mask=supervise)
+            terms["local_candidate"] = local
+            loss = loss + local
         if self.mode in ("auxiliary", "full"):
             family_targets, specific, mask = self.supervision(target, batch["aux_y"], batch["aux_mask"])
             family_loss = observed_label_loss(output["family_logits"], family_targets.float(), self.family_statistics, weak)
