@@ -80,15 +80,19 @@ def load_oof(data, files, diagnostic=False):
 
 
 class ScoredPeptides(Dataset):
-    def __init__(self, dataset, scores):
+    def __init__(self, dataset, scores, neighbor_features=None):
         self.dataset = dataset
         self.scores = torch.from_numpy(scores)
+        self.neighbor_features = (torch.from_numpy(neighbor_features) if neighbor_features is not None else None)
 
     def __len__(self):
         return len(self.dataset)
 
     def __getitem__(self, index):
-        return {**self.dataset[index], "base_logits": self.scores[index]}
+        sample = {**self.dataset[index], "base_logits": self.scores[index]}
+        if self.neighbor_features is not None:
+            sample["neighbor_features"] = self.neighbor_features[index]
+        return sample
 
 
 def make_loader(dataset, settings, shuffle=False, generator=None):

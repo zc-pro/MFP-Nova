@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
 from .metrics import evaluate_metrics, evaluate_groups, format_epoch, fit_global_threshold, fit_label_thresholds
-from .models import HH_MODELS, HH_V15_RANKER, HH_V16, SEQUENCE_ONLY_MODELS
+from .models import HH_MODELS, HH_V15_RANKER, HH_V16, HH_V17, SEQUENCE_ONLY_MODELS
 from .multimodal import MultimodalData, MultimodalPeptides, collate_multimodal
 from .research_layers import observed_label_loss
 from .consistency import bernoulli_consistency, consistency_weight
@@ -26,6 +26,9 @@ from .metric_protocol import (FIXED_THRESHOLD_SUITES, JACCARD_ORDER, protocol_de
 
 
 def make_model(name, arguments):
+    if name == HH_V17:
+        from .models.hh_setreread_v17 import HHSetRereadV17
+        return HHSetRereadV17(**arguments)
     if name == HH_V16:
         from .models.hh_setreread_v16 import HHSetRereadV16
         return HHSetRereadV16(**arguments)
@@ -218,7 +221,7 @@ def validate_cache(dataset, config, reference=None):
     if (peptide is None) != (settings is None):
         raise ValueError("Peptide encoder configuration and cache must be supplied together")
     if peptide is not None:
-        if config["model_name"] not in ("helixset", "theraset", "privilegedbridge", *SEQUENCE_ONLY_MODELS, *HH_MODELS, HH_V16):
+        if config["model_name"] not in ("helixset", "theraset", "privilegedbridge", *SEQUENCE_ONLY_MODELS, *HH_MODELS, HH_V16, HH_V17):
             raise ValueError("This architecture does not support dual frozen encoders")
         if peptide["name"] != settings["name"] or peptide["max_length"] != settings["max_length"]:
             raise ValueError("Configured peptide encoder differs from cache")
@@ -1206,6 +1209,8 @@ def load_model(path, device="cpu"):
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     model = make_model(checkpoint["model_name"], checkpoint["model_args"]).to(device)
     restore_model_state(model, checkpoint["model_state"])
+    if checkpoint["model_name"] == HH_V17 and checkpoint["neighbor_reference"] is not None:
+        model.neighbor_vectors, model.neighbor_labels = (v.to(device) for v in checkpoint["neighbor_reference"])
     return model.eval(), checkpoint
 
 
@@ -1314,10 +1319,12 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
     joint = checkpoint["model_name"] == HH_V16
     if joint and (decision_path or (hh_diagnostics and split != "val")):
         raise ValueError("HH V1.6 uses its joint expected-Jaccard decoder; auxiliary diagnostics use Validation")
-    if checkpoint["model_name"] in ("hh_setreread_v13", "hh_setreread_v14"):
+    if checkpoint["model_name"] in ("hh_setreread_v13", "hh_setreread_v14", HH_V17):
         if decision_path or without_private_evidence or (hh_diagnostics and split != "val"):
             raise ValueError("HH uses the saved edit rule; background diagnostics use Validation")
-        if checkpoint["model_name"] == "hh_setreread_v14":
+        if checkpoint["model_name"] == HH_V17:
+            from .hh_v17 import evaluate_editor
+        elif checkpoint["model_name"] == "hh_setreread_v14":
             from .hh_v14 import evaluate_editor
         else:
             from .hh_v13 import evaluate_editor
@@ -1436,8 +1443,10 @@ def predict_inputs(checkpoint_path, input_path, device="cpu", batch_size=32, dec
     model, checkpoint = load_model(checkpoint_path, device)
     with np.load(input_path, allow_pickle=False) as z:
         raw = {k: z[k] for k in z.files if k not in ("y", "row_id", "ID")}
-    if checkpoint["model_name"] in ("hh_setreread_v13", "hh_setreread_v14"):
+    if checkpoint["model_name"] in ("hh_setreread_v13", "hh_setreread_v14", HH_V17):
         raw.pop("base_logits", None)
+    if checkpoint["model_name"] == HH_V17:
+        raw.pop("neighbor_features", None)
     if checkpoint["model_name"] == HH_V15_RANKER:
         inputs = {"esm": torch.from_numpy(raw["esm"]).float(),
                   "esm_peptide": torch.from_numpy(raw["esm_peptide"]).float(),
@@ -1468,6 +1477,21 @@ def model_prediction_records(model, checkpoint, batch, scope, decision_path):
             raise ValueError("HH V1.6 uses its joint expected-Jaccard decoder")
         marginal, predicted, _ = model.decode(output)
         return prediction_records(checkpoint, marginal.cpu().tolist(), scope, predicted=predicted.cpu().numpy())
+    if checkpoint["model_name"] == HH_V17:
+        if decision_path:
+            raise ValueError("HH V1.7 uses its saved reference-relative decision")
+        from .models.hh_setreread_v17 import decisions
+        base = output["base_logits"] >= 0
+        final, _, added, removed = decisions(base, model.proposals(output), checkpoint["edit_threshold"],
+                                               checkpoint["config"]["train"]["actions"])
+        records = prediction_records(checkpoint, output["logits"].sigmoid().cpu().tolist(), scope,
+                                     predicted=final.cpu().numpy())
+        names = checkpoint["labels"]
+        for record, old, plus, minus in zip(records, base.tolist(), added.tolist(), removed.tolist()):
+            record.update(base_labels=[name for name, present in zip(names, old) if present],
+                          added_label=names[plus] if plus >= 0 else None,
+                          removed_label=names[minus] if minus >= 0 else None)
+        return records
     probabilities = output["logits"].sigmoid().cpu().tolist()
     if checkpoint["model_name"] not in ("hh_setreread_v13", "hh_setreread_v14"):
         return prediction_records(checkpoint, probabilities, scope, decision_path)

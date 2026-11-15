@@ -13,6 +13,10 @@
 
 ## 当前研究
 
+### HH-SetReread V1.7 · Fine39 标签证据与集合纠错
+
+`--model hh_setreread_v17` 使用同源簇折外的 TheraSet 分数、短片段与端点读出，以及原 Train 簇近邻。保留参考预测作为默认动作，比较单加、单删和单换。见 [V1.7 架构与双平台训练命令](docs/HH_SetReread_Architecture_and_Training_Plan.md)。
+
 ### SetReread · 功能集合条件化的残基证据重读
 
 `--model setreread` 支持原始 `fine39` 和 `major15` 簇划分。默认使用两级 AA34 CNN 和一路冻结短肽 ESM-150M 缓存。训练前 5 轮学习两个基础读出，从第 6 轮联合训练加删换收益和留一阳性恢复，并开始正式 checkpoint 比较。两任务都用 `micro_f1` 选模及固定阈值 0.50。运行保存 `best.pt`、`last.pt`、`results.json` 和对齐的 `best_validation.npz`。完整机制和本地数据依据见 [SetReread 设计](docs/TheraSet-Set-Correction-Design.md)。

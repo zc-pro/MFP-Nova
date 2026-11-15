@@ -1,0 +1,28 @@
+model_name: hh_setreread_v17
+data:
+  root: data/therapeutic_2025
+  track: fine39
+  features: features/esm2_650m
+  peptide_features: features/esm2_peptide_150m
+model:
+  dim: 64
+  evidence: true
+  neighbors: true
+  coexistence: true
+  coexistence_bonus: 0.05
+loss:
+  coexistence_weight: 0.2
+train:
+  seed: 157
+  device: cpu
+  epochs: 30
+  batch_size: 64
+  num_workers: 0
+  precision: fp32
+  learning_rate: 0.0003
+  weight_decay: 0.01
+  gradient_clip: 5
+  patience: 6
+  metric_suite: jaccard
+  actions: all
+  output: runs

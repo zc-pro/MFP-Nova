@@ -4,7 +4,7 @@ from pathlib import Path
 
 import yaml
 
-from .models import RESEARCH_MODELS, LEGACY_MODELS, HH_MODELS, HH_V15_RANKER, HH_V16
+from .models import RESEARCH_MODELS, LEGACY_MODELS, HH_MODELS, HH_V15_RANKER, HH_V16, HH_V17
 from .metric_protocol import SUITES
 from .models.hypotheses import MODELS as HYPOTHESIS_MODELS
 from .data import TRACKS
@@ -59,6 +59,8 @@ def main(argv=None):
             sub.add_argument("--hh-v15-hard-weight", type=float, help="Fine39 ranker OOF pair loss weight")
             sub.add_argument("--hh-v16-mode", choices=("single", "mixture", "full"),
                              help="V1.6 single component, three components, or three with fragment evidence")
+            sub.add_argument("--hh-v17-actions", choices=("all", "add", "drop", "swap"),
+                             help="V1.7 decision ablation; keep remains available in every mode")
             sub.add_argument("--hh-oof-fold", type=int, choices=range(3), help="Train a fresh Fine39 TheraSet for one held-out Train fold")
             sub.add_argument("--hh-oof-files", nargs=3, help="Three TheraSet fold exports for HH training")
             sub.add_argument("--annotations", help="B0/H1–H8: aligned NPZ of confirmed label and observation states")
@@ -151,7 +153,7 @@ def main(argv=None):
     summarize.add_argument("--split", choices=("val", "test"), default="val")
     summarize.add_argument("--output", help="Optional JSON; otherwise print")
     gpu_check = commands.add_parser("gpu-check", help="Real-cache full-model server probes and bounded short training")
-    gpu_check.add_argument("--models", nargs="+", choices=tuple(m for m in RESEARCH_MODELS if m not in ("hh_setreread_v13", "hh_setreread_v14", HH_V15_RANKER)),
+    gpu_check.add_argument("--models", nargs="+", choices=tuple(m for m in RESEARCH_MODELS if m not in ("hh_setreread_v13", "hh_setreread_v14", HH_V15_RANKER, HH_V17)),
                            default=list(LEGACY_MODELS))
     gpu_check.add_argument("--tasks", nargs="+", choices=TRACKS, default=["major15", "fine39"])
     gpu_check.add_argument("--esm", choices=("35m", "650m"), default="650m")
@@ -220,7 +222,7 @@ def main(argv=None):
                 config["model"]["interval_evidence"] = True
             if args.stage is not None and args.model != "privilegedbridge":
                 raise ValueError("--stage is a PrivilegedBridge option")
-            if args.initialize_from and args.model not in ("privilegedbridge", "theraset", *HH_MODELS, HH_V16):
+            if args.initialize_from and args.model not in ("privilegedbridge", "theraset", *HH_MODELS, HH_V16, HH_V17):
                 raise ValueError("--initialize-from is unavailable for this research model")
             if args.hh_relation is not None or args.hh_ranking is not None:
                 if args.model != "hh_setreread" or args.resume:
@@ -240,8 +242,8 @@ def main(argv=None):
                 config["train"].update(hh_oof_fold=args.hh_oof_fold, epochs=45, lr_decay_epochs=100,
                                        batch_size=64, accumulation_steps=1, patience=0, metric_suite="micro_f1",
                                        save_selection_candidates=False, export_validation_predictions=False)
-            if args.hh_oof_files and args.model not in ("hh_setreread_v13", "hh_setreread_v14", HH_V15_RANKER, HH_V16):
-                parser.error("--hh-oof-files requires HH V1.3, V1.4, V1.5 ranker or V1.6")
+            if args.hh_oof_files and args.model not in ("hh_setreread_v13", "hh_setreread_v14", HH_V15_RANKER, HH_V16, HH_V17):
+                parser.error("--hh-oof-files requires an HH model using held-out Train fold predictions")
             if args.hh_v15_hard_weight is not None:
                 if args.model != HH_V15_RANKER or args.resume:
                     parser.error("--hh-v15-hard-weight requires a fresh V1.5 ranker run")
@@ -255,6 +257,10 @@ def main(argv=None):
                     parser.error("--hh-v16-mode requires a fresh V1.6 run")
                 config["model"].update(components=1 if args.hh_v16_mode == "single" else 3,
                                        fragments=args.hh_v16_mode == "full")
+            if args.hh_v17_actions is not None:
+                if args.model != HH_V17:
+                    parser.error("--hh-v17-actions requires a V1.7 run")
+                config["train"]["actions"] = args.hh_v17_actions
             if args.hh_v13_readout is not None:
                 if args.model != "hh_setreread_v13":
                     parser.error("HH V1.3 editor options require --model hh_setreread_v13")
@@ -279,9 +285,9 @@ def main(argv=None):
         peptide_view = args.command == "features" and args.encoder_view == "peptide"
         if peptide_view and args.esm:
             raise ValueError("--encoder-view peptide uses peptide_encoder; omit --esm")
-        if args.esm and model_name in (*HH_MODELS, HH_V16) and args.esm != "650m":
+        if args.esm and model_name in (*HH_MODELS, HH_V16, HH_V17) and args.esm != "650m":
             parser.error("HH-SetReread uses the initializing TheraSet's ESM650M cache")
-        if args.esm and model_name not in (*HH_MODELS, HH_V16):
+        if args.esm and model_name not in (*HH_MODELS, HH_V16, HH_V17):
             if config.get("model", {}).get("esm_tail") and args.esm != "650m":
                 raise ValueError("This HelixSet ESM-tail configuration uses ESM650M")
             config["encoder"]["name"] = "facebook/esm2_t12_35M_UR50D" if args.esm=="35m" else "facebook/esm2_t33_650M_UR50D"
@@ -392,10 +398,12 @@ def main(argv=None):
                 if args.resume_in_place or args.stop_file:
                     raise ValueError('Pause/in-place resume currently requires a research model')
                 train(config, name)
-            elif model_name in ("hh_setreread_v13", "hh_setreread_v14"):
+            elif model_name in ("hh_setreread_v13", "hh_setreread_v14", HH_V17):
                 if args.resume or args.resume_in_place or args.stop_file:
                     parser.error("HH editor training uses fresh runs")
-                if model_name == "hh_setreread_v14":
+                if model_name == HH_V17:
+                    from .hh_v17 import train_editor
+                elif model_name == "hh_setreread_v14":
                     from .hh_v14 import train_editor
                 else:
                     from .hh_v13 import train_editor
@@ -440,7 +448,7 @@ def main(argv=None):
         batch_size = args.batch_size or checkpoint["config"]["train"].get("batch_size", 128)
         extra = {}
         if args.hh_diagnostics:
-            if checkpoint.get("model_name") not in (*HH_MODELS, HH_V16) or args.split != "val" or args.decision:
+            if checkpoint.get("model_name") not in (*HH_MODELS, HH_V16, HH_V17) or args.split != "val" or args.decision:
                 parser.error("--hh-diagnostics requires an HH-SetReread checkpoint, --split val and its saved decision")
             extra["hh_diagnostics"] = True
         if args.peptide_feature_root:

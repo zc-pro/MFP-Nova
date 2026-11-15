@@ -19,22 +19,23 @@ def pooled_cache(cache):
     return normalize(torch.from_numpy(vectors))
 
 
+def neighbor_tensors(queries, library, labels):
+    """Recorded vote rates, best positive similarities and nearest similarity."""
+    match = (queries @ library.T).topk(min(NEIGHBORS, len(library)), dim=1)
+    observed = labels[match.indices]
+    best = match.values[..., None].masked_fill(~observed, -torch.inf).amax(1)
+    return observed.float().mean(1), best.masked_fill(~torch.isfinite(best), 0.), match.values[:, 0]
+
+
 def read_neighbors(queries, library, labels):
-    """Return per-label recorded vote rates, best positive similarities and nearest similarity."""
-    k = min(NEIGHBORS, len(library))
-    support, positive, nearest = [], [], []
+    labels = torch.as_tensor(labels)
+    evidence = []
     for batch in queries.split(256):
-        match = (batch @ library.T).topk(k, dim=1)
-        sims = match.values.numpy()
-        observed = labels[match.indices.numpy()]
-        support.append(observed.mean(axis=1, dtype=np.float32))
-        best = np.where(observed, sims[..., None], -np.inf).max(axis=1)
-        positive.append(np.where(np.isfinite(best), best, 0.))
-        nearest.append(sims[:, 0])
-    return tuple(np.concatenate(parts) for parts in (support, positive, nearest))
+        evidence.append(neighbor_tensors(batch, library, labels))
+    return tuple(torch.cat(parts).numpy() for parts in zip(*evidence))
 
 
-def fold_neighbor_evidence(data, feature_root, train_rows, val_rows):
+def fold_neighbor_evidence(data, feature_root, train_rows, val_rows, include_reference=False):
     train_cache, val_cache = (CachedPeptides(data, feature_root, split) for split in ("train", "val"))
     keys = ("resolved_revision", "input_dim", "max_length", "sequence_view")
     if any(train_cache.meta[key] != val_cache.meta[key] for key in keys):
@@ -61,5 +62,8 @@ def fold_neighbor_evidence(data, feature_root, train_rows, val_rows):
             evidence = read_neighbors(train_vectors[train_pos[held]], train_vectors[reps], labels[reps])
             for output, values in zip(train_evidence, evidence):
                 output[held] = values
-    val_evidence = read_neighbors(val_vectors[val_pos], train_vectors[representatives], labels[representatives])
+    reference = train_vectors[representatives], torch.from_numpy(labels[representatives])
+    val_evidence = read_neighbors(val_vectors[val_pos], *reference)
+    if include_reference:
+        return train_evidence, val_evidence, reference
     return train_evidence, val_evidence
