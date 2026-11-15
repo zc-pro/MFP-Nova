@@ -25,6 +25,9 @@ from .metric_protocol import FIXED_THRESHOLD_SUITES, protocol_description, prima
 
 
 def make_model(name, arguments):
+    if name == "hh_setreread_v14":
+        from .models.hh_setreread_v14 import HHSetRereadV14
+        return HHSetRereadV14(**arguments)
     if name == "hh_setreread_v13":
         from .models.hh_setreread_v13 import HHSetRereadV13
         return HHSetRereadV13(**arguments)
@@ -1192,10 +1195,13 @@ def hh_v12_validation_report(y, arrays, statistics):
 def evaluate(checkpoint_path, data_root, feature_root, split, device, output, predictions=None, batch_size=32, decision_path=None,
              without_private_evidence=False, peptide_feature_root=None, hh_diagnostics=False):
     model, checkpoint = load_model(checkpoint_path, device)
-    if checkpoint["model_name"] == "hh_setreread_v13":
+    if checkpoint["model_name"] in ("hh_setreread_v13", "hh_setreread_v14"):
         if decision_path or without_private_evidence or (hh_diagnostics and split != "val"):
-            raise ValueError("HH V1.3 uses the saved edit rule; background diagnostics use Validation")
-        from .hh_v13 import evaluate_editor
+            raise ValueError("HH uses the saved edit rule; background diagnostics use Validation")
+        if checkpoint["model_name"] == "hh_setreread_v14":
+            from .hh_v14 import evaluate_editor
+        else:
+            from .hh_v13 import evaluate_editor
         return evaluate_editor(model, checkpoint, data_root, feature_root, split, device, output, predictions,
                                batch_size, peptide_feature_root, hh_diagnostics)
     if without_private_evidence:
@@ -1290,7 +1296,7 @@ def predict_inputs(checkpoint_path, input_path, device="cpu", batch_size=32, dec
     model, checkpoint = load_model(checkpoint_path, device)
     with np.load(input_path, allow_pickle=False) as z:
         raw = {k: z[k] for k in z.files if k not in ("y", "row_id", "ID")}
-    if checkpoint["model_name"] == "hh_setreread_v13":
+    if checkpoint["model_name"] in ("hh_setreread_v13", "hh_setreread_v14"):
         raw.pop("base_logits", None)
     if checkpoint["model_name"] == "setreread" and "chemical" not in raw:
         from .multimodal import prepare_sequence_inputs
@@ -1314,10 +1320,13 @@ def predict_inputs(checkpoint_path, input_path, device="cpu", batch_size=32, dec
 def model_prediction_records(model, checkpoint, batch, scope, decision_path):
     output = model(batch)
     probabilities = output["logits"].sigmoid().cpu().tolist()
-    if checkpoint["model_name"] != "hh_setreread_v13":
+    if checkpoint["model_name"] not in ("hh_setreread_v13", "hh_setreread_v14"):
         return prediction_records(checkpoint, probabilities, scope, decision_path)
     if decision_path:
-        raise ValueError("HH V1.3 predicts with its saved single-add rule")
+        raise ValueError("HH predicts with its saved single-add rule")
+    if checkpoint["model_name"] == "hh_setreread_v14":
+        from .hh_v14 import prediction_records as second_axis_records
+        return second_axis_records(checkpoint, output, probabilities, scope)
     from .models.hh_setreread_v13 import apply_edits
     final, added = apply_edits(output["logits"], output["edit_gain"], checkpoint["edit_threshold"])
     records = prediction_records(checkpoint, probabilities, scope)

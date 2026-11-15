@@ -54,8 +54,10 @@ def main(argv=None):
             sub.add_argument("--hh-ranking", choices=("none", "record", "weak"))
             sub.add_argument("--hh-v12-readout", choices=("conditional", "unconditional", "raw_unconditional", "affine"))
             sub.add_argument("--hh-v13-readout", choices=("scores", "unconditional", "conditional"))
+            sub.add_argument("--hh-v14-row", choices=("scores", "evidence"))
+            sub.add_argument("--hh-v14-label", choices=("raw", "unconditional", "conditional"))
             sub.add_argument("--hh-oof-fold", type=int, choices=range(3), help="Train a fresh Fine39 TheraSet for one held-out Train fold")
-            sub.add_argument("--hh-oof-files", nargs=3, help="Three TheraSet fold exports for HH V1.3 editor training")
+            sub.add_argument("--hh-oof-files", nargs=3, help="Three TheraSet fold exports for HH V1.3/V1.4 training")
             sub.add_argument("--annotations", help="B0/H1–H8: aligned NPZ of confirmed label and observation states")
             sub.add_argument("--unlabeled-weight", type=float, help="Sequence study: optional weak BCE weight for unannotated zero bits")
             sub.add_argument("--fold-dir", help="Sequence study: share training-only B0 fold checkpoints")
@@ -146,7 +148,7 @@ def main(argv=None):
     summarize.add_argument("--split", choices=("val", "test"), default="val")
     summarize.add_argument("--output", help="Optional JSON; otherwise print")
     gpu_check = commands.add_parser("gpu-check", help="Real-cache full-model server probes and bounded short training")
-    gpu_check.add_argument("--models", nargs="+", choices=tuple(m for m in RESEARCH_MODELS if m != "hh_setreread_v13"),
+    gpu_check.add_argument("--models", nargs="+", choices=tuple(m for m in RESEARCH_MODELS if m not in ("hh_setreread_v13", "hh_setreread_v14")),
                            default=list(LEGACY_MODELS))
     gpu_check.add_argument("--tasks", nargs="+", choices=TRACKS, default=["major15", "fine39"])
     gpu_check.add_argument("--esm", choices=("35m", "650m"), default="650m")
@@ -235,11 +237,19 @@ def main(argv=None):
                 config["train"].update(hh_oof_fold=args.hh_oof_fold, epochs=45, lr_decay_epochs=100,
                                        batch_size=64, accumulation_steps=1, patience=0, metric_suite="micro_f1",
                                        save_selection_candidates=False, export_validation_predictions=False)
-            if args.hh_v13_readout is not None or args.hh_oof_files:
+            if args.hh_oof_files and args.model not in ("hh_setreread_v13", "hh_setreread_v14"):
+                parser.error("--hh-oof-files requires HH V1.3 or V1.4")
+            if args.hh_v13_readout is not None:
                 if args.model != "hh_setreread_v13":
                     parser.error("HH V1.3 editor options require --model hh_setreread_v13")
-                if args.hh_v13_readout is not None:
-                    config["model"]["readout"] = args.hh_v13_readout
+                config["model"]["readout"] = args.hh_v13_readout
+            if args.hh_v14_row is not None or args.hh_v14_label is not None:
+                if args.model != "hh_setreread_v14":
+                    parser.error("HH V1.4 editor options require --model hh_setreread_v14")
+                if args.hh_v14_row is not None:
+                    config["model"]["row_mode"] = args.hh_v14_row
+                if args.hh_v14_label is not None:
+                    config["model"]["label_mode"] = args.hh_v14_label
             if args.resume and args.initialize_from:
                 raise ValueError("Use resume within a phase or initialize-from between phases")
             if args.model == "privilegedbridge":
@@ -366,10 +376,13 @@ def main(argv=None):
                 if args.resume_in_place or args.stop_file:
                     raise ValueError('Pause/in-place resume currently requires a research model')
                 train(config, name)
-            elif model_name == "hh_setreread_v13":
+            elif model_name in ("hh_setreread_v13", "hh_setreread_v14"):
                 if args.resume or args.resume_in_place or args.stop_file:
-                    parser.error("HH V1.3 editor training uses fresh runs")
-                from .hh_v13 import train_editor
+                    parser.error("HH editor training uses fresh runs")
+                if model_name == "hh_setreread_v14":
+                    from .hh_v14 import train_editor
+                else:
+                    from .hh_v13 import train_editor
                 train_editor(config, name, args.hh_oof_files)
             else:
                 continuation = {}

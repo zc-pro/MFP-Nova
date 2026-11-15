@@ -1,0 +1,22 @@
+model_name: hh_setreread_v14
+data:
+  root: data/therapeutic_2025
+  track: fine39
+  features: features/esm2_650m
+  peptide_features: features/esm2_peptide_150m
+model:
+  row_mode: evidence
+  label_mode: conditional
+loss: {}
+train:
+  seed: 157
+  device: cpu
+  epochs: 20
+  batch_size: 128
+  num_workers: 0
+  precision: fp32
+  learning_rate: 0.0003
+  weight_decay: 0.01
+  gradient_clip: 5
+  patience: 5
+  output: runs
