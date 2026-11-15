@@ -4,7 +4,7 @@ from pathlib import Path
 
 import yaml
 
-from .models import RESEARCH_MODELS, LEGACY_MODELS, HH_MODELS
+from .models import RESEARCH_MODELS, LEGACY_MODELS, HH_MODELS, HH_V15_RANKER
 from .metric_protocol import SUITES
 from .models.hypotheses import MODELS as HYPOTHESIS_MODELS
 from .data import TRACKS
@@ -56,8 +56,9 @@ def main(argv=None):
             sub.add_argument("--hh-v13-readout", choices=("scores", "unconditional", "conditional"))
             sub.add_argument("--hh-v14-row", choices=("scores", "evidence"))
             sub.add_argument("--hh-v14-label", choices=("raw", "unconditional", "conditional"))
+            sub.add_argument("--hh-v15-hard-weight", type=float, help="Fine39 ranker OOF pair loss weight")
             sub.add_argument("--hh-oof-fold", type=int, choices=range(3), help="Train a fresh Fine39 TheraSet for one held-out Train fold")
-            sub.add_argument("--hh-oof-files", nargs=3, help="Three TheraSet fold exports for HH V1.3/V1.4 training")
+            sub.add_argument("--hh-oof-files", nargs=3, help="Three TheraSet fold exports for HH training")
             sub.add_argument("--annotations", help="B0/H1–H8: aligned NPZ of confirmed label and observation states")
             sub.add_argument("--unlabeled-weight", type=float, help="Sequence study: optional weak BCE weight for unannotated zero bits")
             sub.add_argument("--fold-dir", help="Sequence study: share training-only B0 fold checkpoints")
@@ -148,7 +149,7 @@ def main(argv=None):
     summarize.add_argument("--split", choices=("val", "test"), default="val")
     summarize.add_argument("--output", help="Optional JSON; otherwise print")
     gpu_check = commands.add_parser("gpu-check", help="Real-cache full-model server probes and bounded short training")
-    gpu_check.add_argument("--models", nargs="+", choices=tuple(m for m in RESEARCH_MODELS if m not in ("hh_setreread_v13", "hh_setreread_v14")),
+    gpu_check.add_argument("--models", nargs="+", choices=tuple(m for m in RESEARCH_MODELS if m not in ("hh_setreread_v13", "hh_setreread_v14", HH_V15_RANKER)),
                            default=list(LEGACY_MODELS))
     gpu_check.add_argument("--tasks", nargs="+", choices=TRACKS, default=["major15", "fine39"])
     gpu_check.add_argument("--esm", choices=("35m", "650m"), default="650m")
@@ -237,8 +238,16 @@ def main(argv=None):
                 config["train"].update(hh_oof_fold=args.hh_oof_fold, epochs=45, lr_decay_epochs=100,
                                        batch_size=64, accumulation_steps=1, patience=0, metric_suite="micro_f1",
                                        save_selection_candidates=False, export_validation_predictions=False)
-            if args.hh_oof_files and args.model not in ("hh_setreread_v13", "hh_setreread_v14"):
-                parser.error("--hh-oof-files requires HH V1.3 or V1.4")
+            if args.hh_oof_files and args.model not in ("hh_setreread_v13", "hh_setreread_v14", HH_V15_RANKER):
+                parser.error("--hh-oof-files requires HH V1.3, V1.4 or the V1.5 ranker")
+            if args.hh_v15_hard_weight is not None:
+                if args.model != HH_V15_RANKER or args.resume:
+                    parser.error("--hh-v15-hard-weight requires a fresh V1.5 ranker run")
+                config["loss"]["hard_pair"] = args.hh_v15_hard_weight
+            if args.model == HH_V15_RANKER and args.hh_oof_files:
+                if args.resume:
+                    parser.error("V1.5 ranker resume uses the checkpoint's OOF files")
+                config["train"]["oof_files"] = args.hh_oof_files
             if args.hh_v13_readout is not None:
                 if args.model != "hh_setreread_v13":
                     parser.error("HH V1.3 editor options require --model hh_setreread_v13")

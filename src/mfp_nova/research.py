@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
 from .metrics import evaluate_metrics, evaluate_groups, format_epoch, fit_global_threshold, fit_label_thresholds
-from .models import HH_MODELS
+from .models import HH_MODELS, HH_V15_RANKER, SEQUENCE_ONLY_MODELS
 from .multimodal import MultimodalData, MultimodalPeptides, collate_multimodal
 from .research_layers import observed_label_loss
 from .consistency import bernoulli_consistency, consistency_weight
@@ -25,6 +25,9 @@ from .metric_protocol import FIXED_THRESHOLD_SUITES, protocol_description, prima
 
 
 def make_model(name, arguments):
+    if name == HH_V15_RANKER:
+        from .models.hh_setreread_v15_ranker import HHSetRereadV15Ranker
+        return HHSetRereadV15Ranker(**arguments)
     if name == "hh_setreread_v14":
         from .models.hh_setreread_v14 import HHSetRereadV14
         return HHSetRereadV14(**arguments)
@@ -167,7 +170,7 @@ def validate_cache(dataset, config, reference=None):
     if (peptide is None) != (settings is None):
         raise ValueError("Peptide encoder configuration and cache must be supplied together")
     if peptide is not None:
-        if config["model_name"] not in ("helixset", "theraset", "termiscale", "motifspan", "privilegedbridge", *HH_MODELS):
+        if config["model_name"] not in ("helixset", "theraset", "privilegedbridge", *SEQUENCE_ONLY_MODELS, *HH_MODELS):
             raise ValueError("This architecture does not support dual frozen encoders")
         if peptide["name"] != settings["name"] or peptide["max_length"] != settings["max_length"]:
             raise ValueError("Configured peptide encoder differs from cache")
@@ -314,6 +317,7 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     hh = config["model_name"] == "hh_setreread"
     hh_v12 = config["model_name"] == "hh_setreread_v12"
     hh_model = hh or hh_v12
+    ranker = config["model_name"] == HH_V15_RANKER
     initial = None
     initialize = settings.get("initialize_from")
     if checkpoint is None and (hh_model or (config["model_name"] == "theraset" and initialize)):
@@ -407,6 +411,17 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     if hh_v12 and (not config["data"].get("peptide_features")
                    or config.get("peptide_encoder", {}).get("max_length") != 80):
         raise ValueError("HH V1.2 requires length-80 caches for both encoders")
+    hard_weight = config["loss"].get("hard_pair", 0.) if ranker else 0.
+    if ranker:
+        if (config["data"]["track"] != "fine39" or suite != "jaccard"
+                or config["encoder"]["max_length"] != 80
+                or not config["data"].get("peptide_features")
+                or config.get("peptide_encoder", {}).get("max_length") != 80):
+            raise ValueError("The V1.5 ranker uses Fine39, dual length-80 caches and the jaccard protocol")
+        if not math.isfinite(hard_weight) or hard_weight < 0:
+            raise ValueError("V1.5 hard pair loss weight must be finite and nonnegative")
+        if hard_weight and len(settings.get("oof_files", ())) != 3:
+            raise ValueError("V1.5 hard pair training requires three TheraSet --hh-oof-files")
     frozen_epochs = settings["hh_frozen_epochs"] if hh else 0
     setreread = config["model_name"] == "setreread"
     if setreread and (config["data"]["track"] not in ("major15", "fine39") or suite != "micro_f1"):
@@ -469,7 +484,7 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     if reconstruction_gradient != "sum" and config["model_name"] != "trirelay":
         raise ValueError("Reconstruction gradient balancing currently supports TriRelay")
     reference_checkpoint = checkpoint or initial
-    sequence_only = setreread or config["model_name"] in ("termiscale", "motifspan")
+    sequence_only = setreread or config["model_name"] in SEQUENCE_ONLY_MODELS
     train_indices = held_indices = None
     if fold is not None:
         from .hh_v13 import fold_indices
@@ -484,6 +499,9 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         source.enable_function_auxiliary()
     limit = settings.get("limit_samples")
     diagnostic = bool(limit or settings.get("max_steps") or (checkpoint and checkpoint["config"]["train"].get("max_steps")))
+    if hard_weight:
+        from .hh_v13 import ScoredPeptides, load_oof
+        train_indices, oof_scores = load_oof(source.data, settings["oof_files"], diagnostic)
     # Diagnostic optimization subsets retain full original-Train priors/statistics:
     # shrinking the subset must not erase empirical factors or prototype capacity.
     datasets = [MultimodalPeptides(source, config["data"]["features"], "train" if fold is not None else split, limit,
@@ -497,9 +515,12 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     generator = torch.Generator().manual_seed(settings["seed"])
     num_workers = settings["num_workers"]
     pin_memory = device.type == "cuda" and num_workers > 0
+    training_data = datasets[0]
+    if hard_weight:
+        training_data = ScoredPeptides(training_data, oof_scores[np.searchsorted(train_indices, training_data.indices)])
     loaders = [DataLoader(data, batch_size=settings["batch_size"], shuffle=shuffle, num_workers=num_workers,
                           pin_memory=pin_memory, collate_fn=collate_multimodal, generator=generator if shuffle else None)
-               for data, shuffle in zip(datasets, (True, False))]
+               for data, shuffle in ((training_data, True), (datasets[1], False))]
     print(f"DataLoader | workers={num_workers} pin_memory={pin_memory}", flush=True)
     args = {"input_dim": datasets[0].meta["input_dim"], "num_labels": len(source.data.labels),
             "vocab_size": len(source.statistics["chemical_vocab"])+2,
@@ -1209,7 +1230,7 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
             raise ValueError("Private evidence ablation requires a shared-private TriRelay checkpoint")
         model.private_evidence_enabled = False
     setreread = checkpoint["model_name"] == "setreread"
-    sequence_only = setreread or checkpoint["model_name"] in ("termiscale", "motifspan")
+    sequence_only = setreread or checkpoint["model_name"] in SEQUENCE_ONLY_MODELS
     source = MultimodalData(data_root, checkpoint["track"], checkpoint["statistics"],
                            sequence_only=sequence_only, sequence_chemistry=setreread)
     dataset = MultimodalPeptides(source, feature_root, split,
@@ -1298,7 +1319,11 @@ def predict_inputs(checkpoint_path, input_path, device="cpu", batch_size=32, dec
         raw = {k: z[k] for k in z.files if k not in ("y", "row_id", "ID")}
     if checkpoint["model_name"] in ("hh_setreread_v13", "hh_setreread_v14"):
         raw.pop("base_logits", None)
-    if checkpoint["model_name"] == "setreread" and "chemical" not in raw:
+    if checkpoint["model_name"] == HH_V15_RANKER:
+        inputs = {"esm": torch.from_numpy(raw["esm"]).float(),
+                  "esm_peptide": torch.from_numpy(raw["esm_peptide"]).float(),
+                  "mask": torch.from_numpy(raw["mask"]).bool()}
+    elif checkpoint["model_name"] == "setreread" and "chemical" not in raw:
         from .multimodal import prepare_sequence_inputs
         inputs = prepare_sequence_inputs(raw, checkpoint["statistics"])
     elif "phys_raw" in raw:
@@ -1307,11 +1332,11 @@ def predict_inputs(checkpoint_path, input_path, device="cpu", batch_size=32, dec
     else:
         inputs = {k: torch.from_numpy(v) for k, v in raw.items()}
     records = []
-    scope = "sequence_only" if checkpoint["model_name"] in ("termiscale", "motifspan", "privilegedbridge") else "provided_multimodal_fields"
+    scope = "sequence_only" if checkpoint["model_name"] in (*SEQUENCE_ONLY_MODELS, "privilegedbridge") else "provided_multimodal_fields"
     if checkpoint["model_name"] == "privilegedbridge" and model.stage == "B":
         scope = "provided_multimodal_fields"
     with torch.inference_mode():
-        for start in range(0, len(inputs["aa"]), batch_size):
+        for start in range(0, len(inputs["mask"]), batch_size):
             batch = {k: v[start:start+batch_size].to(device) for k, v in inputs.items()}
             records.extend(model_prediction_records(model, checkpoint, batch, scope, decision_path))
     return records
@@ -1391,9 +1416,9 @@ def predict_sequences(checkpoint_path, sequences, device="cpu", decision_path=No
         if prefix is not None:
             raw["esm_cls"] = states[:, 0].half().float().cpu().numpy()
             raw["esm_eos"] = torch.stack([states[i, len(s) + 1] for i, s in enumerate(selected)]).half().float().cpu().numpy()
-        prepare = prepare_sequence_inputs if checkpoint["model_name"] == "setreread" else prepare_inputs
+        prepare = prepare_sequence_inputs if checkpoint["model_name"] in ("setreread", HH_V15_RANKER) else prepare_inputs
         inputs = prepare(raw, checkpoint["statistics"])
-        scope = "sequence_only" if checkpoint["model_name"] in ("termiscale", "motifspan", "privilegedbridge") else "sequence_and_stereochemistry_only"
+        scope = "sequence_only" if checkpoint["model_name"] in (*SEQUENCE_ONLY_MODELS, "privilegedbridge") else "sequence_and_stereochemistry_only"
         with torch.inference_mode():
             records = model_prediction_records(model, checkpoint, to_device(inputs, device), scope, decision_path)
         for s, record in zip(selected, records):
