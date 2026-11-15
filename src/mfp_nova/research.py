@@ -16,15 +16,19 @@ from torch.utils.data import DataLoader
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
 from .metrics import evaluate_metrics, evaluate_groups, format_epoch, fit_global_threshold, fit_label_thresholds
-from .models import HH_MODELS, HH_V15_RANKER, SEQUENCE_ONLY_MODELS
+from .models import HH_MODELS, HH_V15_RANKER, HH_V16, SEQUENCE_ONLY_MODELS
 from .multimodal import MultimodalData, MultimodalPeptides, collate_multimodal
 from .research_layers import observed_label_loss
 from .consistency import bernoulli_consistency, consistency_weight
 from .trainer import seed_everything, write_json
-from .metric_protocol import FIXED_THRESHOLD_SUITES, protocol_description, primary_metrics, selection, format_primary, final_threshold
+from .metric_protocol import (FIXED_THRESHOLD_SUITES, JACCARD_ORDER, protocol_description,
+                              primary_metrics, selection, format_primary, final_threshold)
 
 
 def make_model(name, arguments):
+    if name == HH_V16:
+        from .models.hh_setreread_v16 import HHSetRereadV16
+        return HHSetRereadV16(**arguments)
     if name == HH_V15_RANKER:
         from .models.hh_setreread_v15_ranker import HHSetRereadV15Ranker
         return HHSetRereadV15Ranker(**arguments)
@@ -87,40 +91,79 @@ def autocast_context(device, precision="fp32"):
 
 
 @torch.inference_mode()
-def predict_loader(model, loader, device, precision="fp32", loss_settings=None):
+def predict_loader(model, loader, device, precision="fp32", loss_settings=None, decode_sets=False):
     model.eval()
-    targets, probabilities = [], []
+    targets, probabilities, decisions, count_decisions = [], [], [], []
+    component_weights, component_counts = [], []
     loss_total, rows = 0., 0
     for batch in loader:
         moved = to_device(batch, device)
         with autocast_context(device, precision):
             output = model(moved)
             if loss_settings is not None:
-                loss = observed_label_loss(output["logits"], moved["y"], model.statistics,
-                                           loss_settings.get("unlabeled_weight", .3))
+                if decode_sets:
+                    loss = model.set_nll(output, moved["y"]).mean()
+                else:
+                    loss = observed_label_loss(output["logits"], moved["y"], model.statistics,
+                                               loss_settings.get("unlabeled_weight", .3))
                 loss_total += float(loss)*len(batch["y"])
                 rows += len(batch["y"])
         # A NumPy view keeps the worker's shared tensor (and its FD) alive.
         targets.append(batch["y"].numpy().copy())
-        probabilities.append(output["logits"].float().sigmoid().cpu().numpy())
+        if decode_sets:
+            marginal, predicted, count_predicted = model.decode(output)
+            probabilities.append(marginal.cpu().numpy())
+            decisions.append(predicted.cpu().numpy())
+            count_decisions.append(count_predicted.cpu().numpy())
+            weight = output["mixture_logits"].float().softmax(-1)
+            count = output["count_logits"].float().softmax(-1)
+            component_weights.append(weight.cpu().numpy())
+            component_counts.append((weight[..., None] * count).sum(0).cpu().numpy())
+        else:
+            probabilities.append(output["logits"].float().sigmoid().cpu().numpy())
     result = np.concatenate(targets), np.concatenate(probabilities)
-    return (*result, loss_total/rows) if loss_settings is not None else result
+    if loss_settings is not None:
+        result = (*result, loss_total / rows)
+    if not decode_sets:
+        return result
+    weights = np.concatenate(component_weights)
+    counts = np.sum(component_counts, axis=0)
+    components = {"mean_weights": weights.mean(axis=0).tolist(),
+                  "dominant_fraction": (np.bincount(weights.argmax(1), minlength=weights.shape[1]) / len(weights)).tolist(),
+                  "weighted_count_distribution": (counts / counts.sum(axis=1, keepdims=True).clip(min=1e-8)).tolist()}
+    return (*result, np.concatenate(decisions), np.concatenate(count_decisions), components)
 
 
-def metrics(y, probabilities, statistics, threshold=.5):
-    return evaluate_metrics(y, probabilities, threshold, statistics["labels"]["support"], statistics["function_projection"])
+def metrics(y, probabilities, statistics, threshold=.5, predicted=None):
+    return evaluate_metrics(y, probabilities, threshold, statistics["labels"]["support"],
+                            statistics["function_projection"], predicted)
 
 
-def export_validation(run, stem, source, dataset, y, probabilities, threshold, epoch, weight_source, objective):
+def joint_set_protocol():
+    return {"metric_suite": "jaccard", "threshold_strategy": "joint_expected_jaccard",
+            "threshold_fit_split": None, "selection_threshold": None,
+            "selection": [f"val_decoded_{key}" for key in JACCARD_ORDER] + ["earlier_epoch"]}
+
+
+def v16_count_support(data):
+    count = data.y[data.indices("train")].sum(axis=1, dtype=int)
+    return np.bincount(count, minlength=len(data.labels) + 1)[1:].tolist()
+
+
+def export_validation(run, stem, source, dataset, y, probabilities, threshold, epoch, weight_source, objective,
+                      predicted=None, count_predicted=None):
     """Reuse collected Val predictions; no extra model forward or Test access."""
     rows = dataset.indices
     path = run/f"{stem}_validation.npz"
+    extra = {} if predicted is None else {"predicted": predicted, "prediction_rule": "joint_expected_jaccard",
+                                         "count_predicted": count_predicted}
     np.savez_compressed(path, row_id=source.data.rows[rows], ID=source.data.ids[rows],
                         cluster_id=source.data.clusters[rows], targets=y, probabilities=probabilities,
                         label_names=np.array(source.data.labels), threshold=threshold, split="val",
                         task=source.data.track, epoch=epoch, weight_source=weight_source,
-                        selection_objective=objective)
-    actual, predicted = y.astype(bool), probabilities >= threshold
+                        selection_objective=objective, **extra)
+    actual = y.astype(bool)
+    predicted = probabilities >= threshold if predicted is None else predicted
     from .multimodal import independent_functions
     projection = source.statistics["function_projection"]
     summary = {
@@ -170,7 +213,7 @@ def validate_cache(dataset, config, reference=None):
     if (peptide is None) != (settings is None):
         raise ValueError("Peptide encoder configuration and cache must be supplied together")
     if peptide is not None:
-        if config["model_name"] not in ("helixset", "theraset", "privilegedbridge", *SEQUENCE_ONLY_MODELS, *HH_MODELS):
+        if config["model_name"] not in ("helixset", "theraset", "privilegedbridge", *SEQUENCE_ONLY_MODELS, *HH_MODELS, HH_V16):
             raise ValueError("This architecture does not support dual frozen encoders")
         if peptide["name"] != settings["name"] or peptide["max_length"] != settings["max_length"]:
             raise ValueError("Configured peptide encoder differs from cache")
@@ -255,7 +298,10 @@ def restore_model_state(model, state):
 
 def make_optimizer(model, settings):
     parameters = [(key, value) for key, value in model.named_parameters() if value.requires_grad]
-    if hasattr(model, "backbone_frozen"):
+    if "v16_backbone_lr" in settings:
+        groups = [{"params": model.backbone.parameters(), "lr": settings["v16_backbone_lr"]},
+                  {"params": [p for key, p in parameters if not key.startswith("backbone.")]}]
+    elif hasattr(model, "backbone_frozen"):
         groups = [
             {"params": [p for key, p in parameters if key.startswith("backbone.")]},
             {"params": [p for key, p in parameters if not key.startswith("backbone.")],
@@ -317,10 +363,11 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     hh = config["model_name"] == "hh_setreread"
     hh_v12 = config["model_name"] == "hh_setreread_v12"
     hh_model = hh or hh_v12
+    hh_v16 = config["model_name"] == HH_V16
     ranker = config["model_name"] == HH_V15_RANKER
     initial = None
     initialize = settings.get("initialize_from")
-    if checkpoint is None and (hh_model or (config["model_name"] == "theraset" and initialize)):
+    if checkpoint is None and (hh_model or hh_v16 or (config["model_name"] == "theraset" and initialize)):
         if not initialize:
             raise ValueError("HH-SetReread requires --initialize-from pointing to the Fine39 TheraSet best.pt")
         initial = torch.load(initialize, map_location="cpu", weights_only=True)
@@ -328,17 +375,20 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
             raise ValueError("Initialization requires a TheraSet checkpoint for the same task")
         backbone = {k: v for k, v in initial["model_args"].items()
                     if k not in ("input_dim", "num_labels", "vocab_size", "statistics", "peptide_input_dim")}
-        if hh_model and (backbone.get("label_context", True) or not backbone.get("evidence_decoder", True)
+        if (hh_model or hh_v16) and (backbone.get("label_context", True) or not backbone.get("evidence_decoder", True)
                          or not initial["model_state"]["active"].sum(1).eq(1).all()):
             raise ValueError("HH requires the no_label_context_single_prototype checkpoint")
-        hh_options = (("relation", "lambda_pair", "fixed_overlap") if hh else
-                      ("readout", "esm_bypass", "condition_query", "split_evidence", "background_dropout"))
-        config["model"] = {**backbone, **{key: config["model"][key] for key in hh_options
-                                        if key in config["model"]}} if hh_model else backbone
+        if hh_v16:
+            config["model"] = {**backbone, **config["model"]}
+        else:
+            hh_options = (("relation", "lambda_pair", "fixed_overlap") if hh else
+                          ("readout", "esm_bypass", "condition_query", "split_evidence", "background_dropout"))
+            config["model"] = {**backbone, **{key: config["model"][key] for key in hh_options
+                                            if key in config["model"]}} if hh_model else backbone
         original = initial["config"]
         if hh:
             config["loss"] = {**original["loss"], **config["loss"]}
-        elif not hh_v12:
+        elif not hh_v12 and not hh_v16:
             config["loss"] = dict(original["loss"])
         config["encoder"] = original["encoder"]
         if "peptide_encoder" in original:
@@ -411,6 +461,11 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     if hh_v12 and (not config["data"].get("peptide_features")
                    or config.get("peptide_encoder", {}).get("max_length") != 80):
         raise ValueError("HH V1.2 requires length-80 caches for both encoders")
+    if hh_v16 and (config["data"]["track"] != "fine39" or suite != "jaccard"
+                    or config["encoder"]["max_length"] != 80
+                    or not config["data"].get("peptide_features")
+                    or config.get("peptide_encoder", {}).get("max_length") != 80):
+        raise ValueError("HH V1.6 requires Fine39, dual length-80 caches and the jaccard protocol")
     hard_weight = config["loss"].get("hard_pair", 0.) if ranker else 0.
     if ranker:
         if (config["data"]["track"] != "fine39" or suite != "jaccard"
@@ -422,7 +477,7 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
             raise ValueError("V1.5 hard pair loss weight must be finite and nonnegative")
         if hard_weight and len(settings.get("oof_files", ())) != 3:
             raise ValueError("V1.5 hard pair training requires three TheraSet --hh-oof-files")
-    frozen_epochs = settings["hh_frozen_epochs"] if hh else 0
+    frozen_epochs = settings["hh_frozen_epochs"] if hh else settings.get("v16_frozen_epochs", 0)
     setreread = config["model_name"] == "setreread"
     if setreread and (config["data"]["track"] not in ("major15", "fine39") or suite != "micro_f1"):
         raise ValueError("SetReread uses major15 or fine39 with the fixed-0.50 micro_f1 protocol")
@@ -437,6 +492,8 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         if settings.get("rdrop_start_epoch", 6) < 1 or settings.get("rdrop_ramp_epochs", 5) < 1:
             raise ValueError("R-Drop start epoch and ramp length must be positive")
     protocol = protocol_description(suite, settings.get("threshold_strategy", "global"))
+    if hh_v16:
+        protocol = joint_set_protocol()
     setreread_start = settings.get("correction_start_epoch", 6) if setreread else 1
     if setreread:
         protocol["selection_start_epoch"] = setreread_start if settings["epochs"] >= setreread_start else 1
@@ -499,7 +556,11 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         source.enable_function_auxiliary()
     limit = settings.get("limit_samples")
     diagnostic = bool(limit or settings.get("max_steps") or (checkpoint and checkpoint["config"]["train"].get("max_steps")))
-    if hard_weight:
+    use_oof = bool(hard_weight or (hh_v16 and
+                   (config["loss"].get("hard_row_weight", 0.) or config["loss"].get("retain", 0.))))
+    if use_oof:
+        if len(settings.get("oof_files", ())) != 3:
+            raise ValueError("HH V1.6 requires three TheraSet --hh-oof-files")
         from .hh_v13 import ScoredPeptides, load_oof
         train_indices, oof_scores = load_oof(source.data, settings["oof_files"], diagnostic)
     # Diagnostic optimization subsets retain full original-Train priors/statistics:
@@ -516,7 +577,7 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     num_workers = settings["num_workers"]
     pin_memory = device.type == "cuda" and num_workers > 0
     training_data = datasets[0]
-    if hard_weight:
+    if use_oof:
         training_data = ScoredPeptides(training_data, oof_scores[np.searchsorted(train_indices, training_data.indices)])
     loaders = [DataLoader(data, batch_size=settings["batch_size"], shuffle=shuffle, num_workers=num_workers,
                           pin_memory=pin_memory, collate_fn=collate_multimodal, generator=generator if shuffle else None)
@@ -525,6 +586,8 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     args = {"input_dim": datasets[0].meta["input_dim"], "num_labels": len(source.data.labels),
             "vocab_size": len(source.statistics["chemical_vocab"])+2,
             "statistics": source.statistics["labels"], **config["model"]}
+    if hh_v16:
+        args["count_support"] = v16_count_support(source.data)
     if setreread:
         args["function_projection"] = source.statistics["function_projection"]
     if hh:
@@ -536,7 +599,7 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         args["function_aux_statistics"] = source.statistics["function_auxiliary"]
     model = make_model(config["model_name"], args).to(device)
     if initial is not None and not pb:
-        restore_model_state(model.backbone if hh_model else model, initial["model_state"])
+        restore_model_state(model.backbone if hh_model or hh_v16 else model, initial["model_state"])
         del initial
     elif initial is not None:
         previous = make_model("privilegedbridge", initial["model_args"]).to(device)
@@ -561,6 +624,8 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         run.mkdir(parents=True, exist_ok=False)
     if hh:
         model.freeze_backbone(bool(frozen_epochs and (checkpoint is None or checkpoint["epoch"] <= frozen_epochs)))
+    if hh_v16:
+        model.freeze_backbone(bool(frozen_epochs and (checkpoint is None or checkpoint["epoch"] < frozen_epochs)))
     optimizer = make_optimizer(model, settings)
     precision = settings.get("precision", "fp32")
     accumulation = settings.get("accumulation_steps", 1)
@@ -570,7 +635,7 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     decay_epochs = settings.get("lr_decay_epochs", planned_epochs)
     if "lr_decay_epochs" in settings and decay_epochs <= warmup:
         raise ValueError("lr_decay_epochs must exceed warmup_epochs")
-    save_candidates = settings.get("save_selection_candidates", False) and suite != "micro_f1"
+    save_candidates = settings.get("save_selection_candidates", False) and suite != "micro_f1" and not hh_v16
     alternate_suite = {"traditional5": "task_specific", "jaccard": "micro_f1"}.get(suite, "traditional5")
     alternate_stem = {"traditional5": "best_ap", "jaccard": "best_micro_f1"}.get(suite, "best_accuracy")
     alternate_best = checkpoint.get("alternate_best") if checkpoint and save_candidates else None
@@ -598,7 +663,7 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     def phase_schedule(optimizer, frozen):
         if suite != "jaccard":
             return torch.optim.lr_scheduler.LambdaLR(optimizer, schedule)
-        length = frozen_epochs if frozen else decay_epochs-frozen_epochs
+        length = decay_epochs if hh_v16 else (frozen_epochs if frozen else decay_epochs-frozen_epochs)
         def ratio(index):
             if index < warmup:
                 return (index+1)/warmup
@@ -712,9 +777,14 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     peak_memory = (checkpoint.get("peak_cuda_memory_bytes", 0) or 0) if checkpoint else 0
     validation_groups = (source.groups(datasets[1].indices, source.data.y[datasets[1].indices])
                          if fold is None else {})
+
+    def collect_validation(candidate):
+        values = predict_loader(candidate, loaders[1], device, precision, config["loss"], decode_sets=hh_v16)
+        return values if hh_v16 else (*values, None, None, None)
+
     epoch = checkpoint["epoch"] if checkpoint else 0
-    if suite == "jaccard" and checkpoint is None and fold is None:
-        y, probabilities, validation_loss = predict_loader(model, loaders[1], device, precision, config["loss"])
+    if suite == "jaccard" and checkpoint is None and fold is None and not hh_v16:
+        y, probabilities, validation_loss, _, _, _ = collect_validation(model)
         report = metrics(y, probabilities, source.statistics)
         best_key, best_selection_threshold, _ = selection(y, probabilities, report, suite, "fixed_0_5")
         phase_best = best_key[0]
@@ -732,6 +802,9 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     terminal_resume = checkpoint is not None and (start>settings["epochs"] or
                         (start>frozen_epochs+1 and settings["patience"] and stale>=settings["patience"]))
     for epoch in (() if terminal_resume else range(start, settings["epochs"]+1)):
+        if hh_v16 and frozen_epochs and epoch == frozen_epochs + 1:
+            model.freeze_backbone(False)
+            stale = 0
         if hh and frozen_epochs and epoch == frozen_epochs+1:
             model.freeze_backbone(False)
             optimizer = make_optimizer(model, settings)
@@ -843,8 +916,8 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         train_report = metrics(np.concatenate(online_targets), np.concatenate(online_probabilities), source.statistics)
         del online_targets, online_probabilities
         validation_start = time.perf_counter()
-        y, probabilities, validation_loss = predict_loader(model, loaders[1], device, precision, config["loss"])
-        report = metrics(y, probabilities, source.statistics)
+        y, probabilities, validation_loss, predicted, _, components = collect_validation(model)
+        report = metrics(y, probabilities, source.statistics, predicted=predicted)
         selected_model, validation_weights = model, "online"
         online_report, online_loss = report, validation_loss
         if ema is not None:
@@ -859,16 +932,18 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
                 # An extra DataLoader iterator consumes a CPU base seed, even with
                 # zero workers. Preserve it so this observation does not change Train RNG.
                 with torch.random.fork_rng(devices=[]):
-                    y, probabilities, validation_loss = predict_loader(selected_model, loaders[1], device, precision, config["loss"])
-                report = metrics(y, probabilities, source.statistics)
+                    y, probabilities, validation_loss, predicted, _, components = collect_validation(selected_model)
+                report = metrics(y, probabilities, source.statistics, predicted=predicted)
         groups = evaluate_groups(y, probabilities, validation_groups, .5, source.statistics["labels"]["support"],
-                                 source.statistics["function_projection"])
+                                 source.statistics["function_projection"], predicted)
         validation_seconds = time.perf_counter() - validation_start
         if report["macro_ap"] is None:
             raise ValueError("No positive Validation labels for checkpoint selection")
         key, selection_threshold, selection_report = (
             online_selection if ema is not None and selected_model is model
             else selection(y, probabilities, report, suite, protocol["threshold_strategy"]))
+        if hh_v16:
+            selection_threshold = None
         if key>best_key:
             best_key, best_epoch = key, epoch
             if suite != "jaccard":
@@ -915,6 +990,11 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
             history.update(hh_phase="frozen" if model.backbone_frozen else "joint",
                            hh_phase_epoch=phase_epoch, hh_head_lr=optimizer.param_groups[-1]["lr"],
                            phase_trainable_parameters=sum(p.numel() for p in model.parameters() if p.requires_grad))
+        if hh_v16:
+            history.update(validation_loss_scope="recorded_set_nll", decision_rule="joint_expected_jaccard",
+                           train_metrics_scope="online_auxiliary_label_logits",
+                           v16_phase="frozen" if model.backbone_frozen else "joint",
+                           v16_head_lr=optimizer.param_groups[-1]["lr"], joint_components=components)
         if getattr(model, "esm_tail", None) is not None:
             history["esm_lr"] = optimizer.param_groups[1]["lr"]
         if pb and model.stage == "C":
@@ -967,6 +1047,9 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         with (run/"history.jsonl").open("a", encoding="utf-8") as f:
             f.write(json.dumps(history, allow_nan=False)+"\n")
         print(format_epoch(config["model_name"], source.data.track, settings["seed"], settings["epochs"], history, settings["patience"]), flush=True)
+        if hh_v16:
+            print(f"V1.6 | Phase={history['v16_phase']} BackboneLR={history['lr']:.3g} "
+                  f"HeadLR={history['v16_head_lr']:.3g}", flush=True)
         print(f"Timing | Train={train_seconds:.1f}s DataWait={data_wait_seconds:.1f}s Val={validation_seconds:.1f}s", flush=True)
         if "metric_suite" in settings:
             print(f"Selection | suite={suite} key={key} best={best_key}@{best_epoch} "
@@ -1026,7 +1109,7 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         torch.save(fold_checkpoint, run/"best.pt")
         return export_fold(run, selected, loaders[1], device, fold, epoch, diagnostic, time.perf_counter()-started)
     restore_model_state(model, best_state)
-    y, probabilities, validation_loss = predict_loader(model, loaders[1], device, precision, config["loss"])
+    y, probabilities, validation_loss, predicted, count_predicted, components = collect_validation(model)
     threshold = final_threshold(y, probabilities, suite, settings.get("threshold_strategy", "global"))
     torch.save({**static, "model_state": best_state, "best_epoch": best_epoch, "threshold": threshold,
                 "weight_source": best_weights}, run/"best.pt")
@@ -1040,10 +1123,10 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
               "threshold_strategy": settings.get("threshold_strategy", "global"), "trainable_parameters": params,
               "elapsed_seconds": elapsed_before+time.perf_counter()-started,
               "peak_cuda_memory_bytes": peak_memory if device.type=="cuda" else None,
-              "diagnostic_subset": diagnostic, "validation": metrics(y, probabilities, source.statistics, threshold),
+              "diagnostic_subset": diagnostic, "validation": metrics(y, probabilities, source.statistics, threshold, predicted),
               "validation_loss": validation_loss, "validation_loss_scope": "main_classification_clean_eval",
               "validation_groups": evaluate_groups(y, probabilities, validation_groups, threshold,
-                  source.statistics["labels"]["support"], source.statistics["function_projection"]),
+                  source.statistics["labels"]["support"], source.statistics["function_projection"], predicted),
               "labels": source.data.labels, "monitor_threshold": .5,
               "final_metrics_scope": ("best_checkpoint_at_fixed_0_5" if suite in FIXED_THRESHOLD_SUITES
                                       else "best_checkpoint_with_validation_fitted_threshold"),
@@ -1051,12 +1134,19 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
               "checkpoint": str(run/"best.pt")}
     result.update(metric_protocol=protocol, primary_metrics=primary_metrics(result["validation"], suite),
                   best_selection_key=list(best_key))
+    if hh_v16:
+        result.update(threshold_strategy="joint_expected_jaccard", validation_loss_scope="recorded_set_nll",
+                      final_metrics_scope="best_checkpoint_with_decoded_label_sets",
+                      validation_marginal_fixed_threshold=metrics(y, probabilities, source.statistics, .5),
+                      validation_marginal_top_count=metrics(y, probabilities, source.statistics, .5, count_predicted),
+                      joint_components=components)
     if setreread:
         result["correction_active"] = bool(model.correction_active)
     export_predictions = settings.get("export_validation_predictions", False)
     if export_predictions:
         result["validation_predictions"] = export_validation(
-            run, "best", source, datasets[1], y, probabilities, threshold, best_epoch, best_weights, suite)
+            run, "best", source, datasets[1], y, probabilities, threshold, best_epoch, best_weights, suite,
+            predicted=predicted, count_predicted=count_predicted)
     if save_candidates and alternate_best is not None:
         candidate = alternate_best
         alternate_path = run/f"{alternate_stem}.pt"
@@ -1216,6 +1306,9 @@ def hh_v12_validation_report(y, arrays, statistics):
 def evaluate(checkpoint_path, data_root, feature_root, split, device, output, predictions=None, batch_size=32, decision_path=None,
              without_private_evidence=False, peptide_feature_root=None, hh_diagnostics=False):
     model, checkpoint = load_model(checkpoint_path, device)
+    joint = checkpoint["model_name"] == HH_V16
+    if joint and (decision_path or hh_diagnostics):
+        raise ValueError("HH V1.6 uses its joint expected-Jaccard decoder and aligned prediction export")
     if checkpoint["model_name"] in ("hh_setreread_v13", "hh_setreread_v14"):
         if decision_path or without_private_evidence or (hh_diagnostics and split != "val"):
             raise ValueError("HH uses the saved edit rule; background diagnostics use Validation")
@@ -1238,7 +1331,12 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
                                   sequence_only=sequence_only or (checkpoint["model_name"] == "privilegedbridge" and model.stage == "A"))
     validate_cache(dataset, checkpoint["config"], checkpoint["encoder"])
     loader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_multimodal)
-    if hh_diagnostics:
+    decision, predicted = None, None
+    if joint:
+        y, probabilities, predicted, count_predicted, components = predict_loader(model, loader, device, decode_sets=True)
+        extra_outputs = {"predicted": predicted, "count_predicted": count_predicted,
+                         "prediction_rule": "joint_expected_jaccard"}
+    elif hh_diagnostics:
         if checkpoint["model_name"] not in HH_MODELS or split != "val":
             raise ValueError("HH diagnostics require an HH-SetReread checkpoint and --split val")
         if checkpoint["model_name"] == "hh_setreread_v12":
@@ -1252,7 +1350,6 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
         extra_outputs = {}
         y, probabilities = predict_loader(model, loader, device)
     threshold = checkpoint["threshold"]
-    decision, predicted = None, None
     if decision_path:
         from .decisions import apply_decision
         decision = json.loads(Path(decision_path).read_text(encoding='utf-8'))
@@ -1287,6 +1384,11 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
     settings = checkpoint["config"]["train"]
     suite = checkpoint.get("selection_suite", settings.get("metric_suite", "task_specific"))
     result["metric_protocol"] = protocol_description(suite, settings.get("threshold_strategy", "global"))
+    if joint:
+        result["metric_protocol"] = joint_set_protocol()
+        result["joint_components"] = components
+        result["marginal_fixed_threshold"] = metrics(y, probabilities, source.statistics, .5)
+        result["marginal_top_count"] = metrics(y, probabilities, source.statistics, .5, count_predicted)
     result["primary_metrics"] = primary_metrics(result["metrics"], suite)
     if hh_diagnostics:
         result["hh_diagnostics"] = (hh_v12_validation_report(y, extra_outputs, source.statistics)
@@ -1344,6 +1446,11 @@ def predict_inputs(checkpoint_path, input_path, device="cpu", batch_size=32, dec
 
 def model_prediction_records(model, checkpoint, batch, scope, decision_path):
     output = model(batch)
+    if checkpoint["model_name"] == HH_V16:
+        if decision_path:
+            raise ValueError("HH V1.6 uses its joint expected-Jaccard decoder")
+        marginal, predicted, _ = model.decode(output)
+        return prediction_records(checkpoint, marginal.cpu().tolist(), scope, predicted=predicted.cpu().numpy())
     probabilities = output["logits"].sigmoid().cpu().tolist()
     if checkpoint["model_name"] not in ("hh_setreread_v13", "hh_setreread_v14"):
         return prediction_records(checkpoint, probabilities, scope, decision_path)
@@ -1366,8 +1473,9 @@ def model_prediction_records(model, checkpoint, batch, scope, decision_path):
     return records
 
 
-def prediction_records(checkpoint, probabilities, scope, decision_path=None):
-    predicted = np.asarray(probabilities) >= checkpoint['threshold']
+def prediction_records(checkpoint, probabilities, scope, decision_path=None, predicted=None):
+    if predicted is None:
+        predicted = np.asarray(probabilities) >= checkpoint['threshold']
     if decision_path:
         from .decisions import apply_decision
         decision = json.loads(Path(decision_path).read_text(encoding='utf-8'))

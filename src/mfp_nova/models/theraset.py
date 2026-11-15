@@ -239,7 +239,7 @@ class TheraSet(nn.Module):
         nn.init.zeros_(self.correction_gate.weight)
         nn.init.constant_(self.correction_gate.bias, -2.)
 
-    def forward(self, batch, return_evidence=False, return_residues=False):
+    def forward(self, batch, return_evidence=False, return_residues=False, return_states=False):
         if self.b0_backbone is not None:
             logits = self.b0_backbone(batch["aa"], batch["mask"]).logits
             return {"logits": logits, "direct": logits}
@@ -306,8 +306,10 @@ class TheraSet(nn.Module):
             evidence_state, global_state[:, None].expand_as(evidence_state)], -1)).squeeze(-1).sigmoid()
         output = {"logits": direct + gate*delta, "direct": direct,
                   "evidence_logits": self.prior+delta}
-        if return_residues:
+        if return_residues or return_states:
             output["residues"] = residues
+        if return_states:
+            output.update(evidence_state=evidence_state, global_state=global_state)
         if return_evidence:
             output.update(correction_gate=gate, correction=gate*delta, prototype_weights=prototype_weights,
                           scale_weights=scales.reshape(b, *self.active.shape, 4),

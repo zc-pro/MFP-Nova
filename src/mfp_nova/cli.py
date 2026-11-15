@@ -4,7 +4,7 @@ from pathlib import Path
 
 import yaml
 
-from .models import RESEARCH_MODELS, LEGACY_MODELS, HH_MODELS, HH_V15_RANKER
+from .models import RESEARCH_MODELS, LEGACY_MODELS, HH_MODELS, HH_V15_RANKER, HH_V16
 from .metric_protocol import SUITES
 from .models.hypotheses import MODELS as HYPOTHESIS_MODELS
 from .data import TRACKS
@@ -57,6 +57,8 @@ def main(argv=None):
             sub.add_argument("--hh-v14-row", choices=("scores", "evidence"))
             sub.add_argument("--hh-v14-label", choices=("raw", "unconditional", "conditional"))
             sub.add_argument("--hh-v15-hard-weight", type=float, help="Fine39 ranker OOF pair loss weight")
+            sub.add_argument("--hh-v16-mode", choices=("single", "mixture", "full"),
+                             help="V1.6 single component, three components, or three with fragment evidence")
             sub.add_argument("--hh-oof-fold", type=int, choices=range(3), help="Train a fresh Fine39 TheraSet for one held-out Train fold")
             sub.add_argument("--hh-oof-files", nargs=3, help="Three TheraSet fold exports for HH training")
             sub.add_argument("--annotations", help="B0/H1–H8: aligned NPZ of confirmed label and observation states")
@@ -218,7 +220,7 @@ def main(argv=None):
                 config["model"]["interval_evidence"] = True
             if args.stage is not None and args.model != "privilegedbridge":
                 raise ValueError("--stage is a PrivilegedBridge option")
-            if args.initialize_from and args.model not in ("privilegedbridge", "theraset", *HH_MODELS):
+            if args.initialize_from and args.model not in ("privilegedbridge", "theraset", *HH_MODELS, HH_V16):
                 raise ValueError("--initialize-from is unavailable for this research model")
             if args.hh_relation is not None or args.hh_ranking is not None:
                 if args.model != "hh_setreread" or args.resume:
@@ -238,16 +240,21 @@ def main(argv=None):
                 config["train"].update(hh_oof_fold=args.hh_oof_fold, epochs=45, lr_decay_epochs=100,
                                        batch_size=64, accumulation_steps=1, patience=0, metric_suite="micro_f1",
                                        save_selection_candidates=False, export_validation_predictions=False)
-            if args.hh_oof_files and args.model not in ("hh_setreread_v13", "hh_setreread_v14", HH_V15_RANKER):
-                parser.error("--hh-oof-files requires HH V1.3, V1.4 or the V1.5 ranker")
+            if args.hh_oof_files and args.model not in ("hh_setreread_v13", "hh_setreread_v14", HH_V15_RANKER, HH_V16):
+                parser.error("--hh-oof-files requires HH V1.3, V1.4, V1.5 ranker or V1.6")
             if args.hh_v15_hard_weight is not None:
                 if args.model != HH_V15_RANKER or args.resume:
                     parser.error("--hh-v15-hard-weight requires a fresh V1.5 ranker run")
                 config["loss"]["hard_pair"] = args.hh_v15_hard_weight
-            if args.model == HH_V15_RANKER and args.hh_oof_files:
+            if args.model in (HH_V15_RANKER, HH_V16) and args.hh_oof_files:
                 if args.resume:
-                    parser.error("V1.5 ranker resume uses the checkpoint's OOF files")
+                    parser.error("Resume uses the checkpoint's OOF files")
                 config["train"]["oof_files"] = args.hh_oof_files
+            if args.hh_v16_mode is not None:
+                if args.model != HH_V16 or args.resume:
+                    parser.error("--hh-v16-mode requires a fresh V1.6 run")
+                config["model"].update(components=1 if args.hh_v16_mode == "single" else 3,
+                                       fragments=args.hh_v16_mode == "full")
             if args.hh_v13_readout is not None:
                 if args.model != "hh_setreread_v13":
                     parser.error("HH V1.3 editor options require --model hh_setreread_v13")
@@ -272,9 +279,9 @@ def main(argv=None):
         peptide_view = args.command == "features" and args.encoder_view == "peptide"
         if peptide_view and args.esm:
             raise ValueError("--encoder-view peptide uses peptide_encoder; omit --esm")
-        if args.esm and model_name in HH_MODELS and args.esm != "650m":
+        if args.esm and model_name in (*HH_MODELS, HH_V16) and args.esm != "650m":
             parser.error("HH-SetReread uses the initializing TheraSet's ESM650M cache")
-        if args.esm and model_name not in HH_MODELS:
+        if args.esm and model_name not in (*HH_MODELS, HH_V16):
             if config.get("model", {}).get("esm_tail") and args.esm != "650m":
                 raise ValueError("This HelixSet ESM-tail configuration uses ESM650M")
             config["encoder"]["name"] = "facebook/esm2_t12_35M_UR50D" if args.esm=="35m" else "facebook/esm2_t33_650M_UR50D"

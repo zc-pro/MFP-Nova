@@ -16,9 +16,9 @@ import yaml
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
 from .multimodal import MultimodalData, MultimodalPeptides, collate_multimodal
-from .models import HH_MODELS
+from .models import HH_MODELS, HH_V16
 from .research import (autocast_context, make_model, to_device, train, validate_cache,
-                       load_model, predict_loader, metrics, make_optimizer, update_ema)
+                       load_model, predict_loader, metrics, make_optimizer, update_ema, v16_count_support)
 from .trainer import seed_everything, write_json
 
 
@@ -51,6 +51,8 @@ PROBES = {
     "hh_setreread": ["backbone.sequence.plm.weight", "query", "shared_readout.weight", "private_readout.weight"],
     "hh_setreread_v12": ["residue_projection.weight", "esm_projection.weight", "peptide_projection.weight",
                        "fine_queries", "evidence_readout.2.weight"],
+    HH_V16: ["backbone.sequence.plm.weight", "label_weights", "count.weight",
+             "fragment_evidence.fragment.weight"],
     "setreread": ["features.projection.weight", "cnn.convs1.0.weight", "add_head.2.weight"],
     "termiscale": ["features.projection.weight", "blocks.0.router.weight", "label.weight", "condition_weights"],
     "motifspan": ["features.projection.weight", "velocity_out.weight", "left.weight", "detail_query.weight"],
@@ -86,6 +88,11 @@ def check_inputs(model, samples, device, precision):
     torch.testing.assert_close(original["logits"], padded["logits"], rtol=.005 if precision!="fp32" else 1e-4, atol=.005 if precision!="fp32" else 1e-4)
     if not torch.isfinite(original["logits"]).all():
         raise FloatingPointError("Nonfinite diagnostic logits")
+    if "energies" in original:
+        for key in ("energies", "count_logits", "mixture_logits"):
+            torch.testing.assert_close(original[key], padded[key],
+                                       rtol=.005 if precision != "fp32" else 1e-4,
+                                       atol=.005 if precision != "fp32" else 1e-4)
     for key in ("fusion", "routing"):
         if key in original:
             if not torch.isfinite(original[key]).all():
@@ -112,6 +119,8 @@ def profile(config, source, dataset, device, batches, precisions, measured_steps
     if config["model_name"] == "hh_setreread":
         from .models.hh_setreread import axis_statistics
         arguments["axis_statistics"] = axis_statistics(source)
+    if config["model_name"] == HH_V16:
+        arguments["count_support"] = v16_count_support(source.data)
     if "peptide_encoder" in dataset.meta:
         arguments["peptide_input_dim"] = dataset.meta["peptide_encoder"]["input_dim"]
     samples = [dataset[i] for i in range(len(dataset))] if batch_scope == "diagnostic" else None
@@ -196,7 +205,7 @@ def profile(config, source, dataset, device, batches, precisions, measured_steps
                         if "peptide_encoder" in dataset.meta and config["model_name"] != "hh_setreread_v12":
                             key = ("features.projection.weight" if config["model_name"] in ("termiscale", "motifspan") else
                                    "sequence.features.projection.weight" if config["model_name"] == "privilegedbridge" else
-                                   "backbone.sequence.plm.weight" if config["model_name"] == "hh_setreread" else
+                                   "backbone.sequence.plm.weight" if config["model_name"] in ("hh_setreread", HH_V16) else
                                    "sequence.plm.weight")
                             boundary = dataset.meta["input_dim"]
                             for view, columns in (("primary", slice(None, boundary)), ("peptide", slice(boundary, None))):
@@ -242,7 +251,7 @@ def profile(config, source, dataset, device, batches, precisions, measured_steps
 def run(models, tasks, feature_root, device, output, esm="650m", batches=(2, 4, 8, 16),
         precisions=("fp32", "fp16"), steps=32, samples=128, data_root="data/therapeutic_2025", peptide_feature_root=None,
         profile_only=False):
-    if any(name in HH_MODELS for name in models) and (not profile_only or list(tasks) != ["fine39"] or esm != "650m"):
+    if any(name in (*HH_MODELS, HH_V16) for name in models) and (not profile_only or list(tasks) != ["fine39"] or esm != "650m"):
         raise ValueError("Use --profile-only --tasks fine39 with the default ESM650M for HH GPU profiling")
     if len(set(tasks)) == 1 and tasks[0] in (*THERAPEP_TRACKS, "rich48"):
         if str(data_root) == "data/therapeutic_2025":
@@ -269,7 +278,7 @@ def run(models, tasks, feature_root, device, output, esm="650m", batches=(2, 4, 
     for name in models:
         for task in tasks:
             config = yaml.safe_load(Path(f"configs/{name}.yaml").read_text(encoding="utf-8"))
-            if name in HH_MODELS:
+            if name in (*HH_MODELS, HH_V16):
                 base = yaml.safe_load(Path("configs/theraset.yaml").read_text(encoding="utf-8"))
                 for key in ("encoder", "peptide_encoder"):
                     config[key] = base[key]
@@ -282,7 +291,7 @@ def run(models, tasks, feature_root, device, output, esm="650m", batches=(2, 4, 
                 config["data"]["root"] = str(data_root)
             if task not in (*THERAPEP_TRACKS, "rich48") or str(feature_root) != f"features/esm2_{esm}":
                 config["data"]["features"] = str(feature_root)
-            if peptide_feature_root is not None and name in ("helixset", "theraset", "termiscale", "motifspan", "privilegedbridge", *HH_MODELS):
+            if peptide_feature_root is not None and name in ("helixset", "theraset", "termiscale", "motifspan", "privilegedbridge", *HH_MODELS, HH_V16):
                 config["data"]["peptide_features"] = str(peptide_feature_root)
             if name == "setreread":
                 config["train"]["correction_start_epoch"] = 1

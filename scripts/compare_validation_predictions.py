@@ -23,6 +23,8 @@ def read_validation(run, data, rows):
             raise ValueError(f"{path} does not match the original {data.track} Validation rows and labels")
         probabilities = saved["probabilities"][order]
         threshold = saved["threshold"].item()
+        if "prediction_rule" in saved and saved["prediction_rule"].item() == "joint_expected_jaccard":
+            return probabilities, saved["predicted"][order]
     return probabilities, probabilities >= threshold
 
 

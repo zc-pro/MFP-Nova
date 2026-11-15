@@ -1,0 +1,37 @@
+model_name: hh_setreread_v16
+data:
+  root: data/therapeutic_2025
+  track: fine39
+  features: features/esm2_650m
+  peptide_features: features/esm2_peptide_150m
+  augment: false
+model:
+  components: 3
+  fragments: true
+  fragment_dim: 128
+  max_contacts: 32
+  max_output_size: 14
+loss:
+  unlabeled_weight: 0.3
+  hard_row_weight: 0.5
+  weak: 0.2
+  fragment: 0.1
+  retain: 0.05
+train:
+  seed: 157
+  device: cpu
+  epochs: 40
+  learning_rate: 0.0002
+  v16_backbone_lr: 0.00001
+  v16_frozen_epochs: 3
+  batch_size: 16
+  accumulation_steps: 1
+  precision: fp32
+  weight_decay: 0.01
+  gradient_clip: 5
+  warmup_epochs: 3
+  patience: 8
+  num_workers: 0
+  metric_suite: jaccard
+  export_validation_predictions: true
+  output: runs
