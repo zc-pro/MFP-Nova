@@ -91,10 +91,12 @@ def autocast_context(device, precision="fp32"):
 
 
 @torch.inference_mode()
-def predict_loader(model, loader, device, precision="fp32", loss_settings=None, decode_sets=False):
+def predict_loader(model, loader, device, precision="fp32", loss_settings=None, decode_sets=False,
+                   include_auxiliary=False):
     model.eval()
     targets, probabilities, decisions, count_decisions = [], [], [], []
     component_weights, component_counts = [], []
+    auxiliary = []
     loss_total, rows = 0., 0
     for batch in loader:
         moved = to_device(batch, device)
@@ -115,6 +117,8 @@ def predict_loader(model, loader, device, precision="fp32", loss_settings=None, 
             probabilities.append(marginal.cpu().numpy())
             decisions.append(predicted.cpu().numpy())
             count_decisions.append(count_predicted.cpu().numpy())
+            if include_auxiliary:
+                auxiliary.append(output["logits"].float().sigmoid().cpu().numpy())
             weight = output["mixture_logits"].float().softmax(-1)
             count = output["count_logits"].float().softmax(-1)
             component_weights.append(weight.cpu().numpy())
@@ -131,7 +135,8 @@ def predict_loader(model, loader, device, precision="fp32", loss_settings=None, 
     components = {"mean_weights": weights.mean(axis=0).tolist(),
                   "dominant_fraction": (np.bincount(weights.argmax(1), minlength=weights.shape[1]) / len(weights)).tolist(),
                   "weighted_count_distribution": (counts / counts.sum(axis=1, keepdims=True).clip(min=1e-8)).tolist()}
-    return (*result, np.concatenate(decisions), np.concatenate(count_decisions), components)
+    result = (*result, np.concatenate(decisions), np.concatenate(count_decisions), components)
+    return (*result, np.concatenate(auxiliary)) if include_auxiliary else result
 
 
 def metrics(y, probabilities, statistics, threshold=.5, predicted=None):
@@ -1307,8 +1312,8 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
              without_private_evidence=False, peptide_feature_root=None, hh_diagnostics=False):
     model, checkpoint = load_model(checkpoint_path, device)
     joint = checkpoint["model_name"] == HH_V16
-    if joint and (decision_path or hh_diagnostics):
-        raise ValueError("HH V1.6 uses its joint expected-Jaccard decoder and aligned prediction export")
+    if joint and (decision_path or (hh_diagnostics and split != "val")):
+        raise ValueError("HH V1.6 uses its joint expected-Jaccard decoder; auxiliary diagnostics use Validation")
     if checkpoint["model_name"] in ("hh_setreread_v13", "hh_setreread_v14"):
         if decision_path or without_private_evidence or (hh_diagnostics and split != "val"):
             raise ValueError("HH uses the saved edit rule; background diagnostics use Validation")
@@ -1333,9 +1338,13 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
     loader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_multimodal)
     decision, predicted = None, None
     if joint:
-        y, probabilities, predicted, count_predicted, components = predict_loader(model, loader, device, decode_sets=True)
+        joint_outputs = predict_loader(model, loader, device, decode_sets=True, include_auxiliary=hh_diagnostics)
+        y, probabilities, predicted, count_predicted, components = joint_outputs[:5]
         extra_outputs = {"predicted": predicted, "count_predicted": count_predicted,
                          "prediction_rule": "joint_expected_jaccard"}
+        if hh_diagnostics:
+            auxiliary = joint_outputs[-1]
+            extra_outputs.update(auxiliary_probabilities=auxiliary, cluster_id=source.data.clusters[dataset.indices])
     elif hh_diagnostics:
         if checkpoint["model_name"] not in HH_MODELS or split != "val":
             raise ValueError("HH diagnostics require an HH-SetReread checkpoint and --split val")
@@ -1390,7 +1399,15 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
         result["marginal_fixed_threshold"] = metrics(y, probabilities, source.statistics, .5)
         result["marginal_top_count"] = metrics(y, probabilities, source.statistics, .5, count_predicted)
     result["primary_metrics"] = primary_metrics(result["metrics"], suite)
-    if hh_diagnostics:
+    if joint and hh_diagnostics:
+        auxiliary_report = metrics(y, auxiliary, source.statistics, .5)
+        result["hh_diagnostics"] = {
+            "auxiliary_threshold": .5,
+            "auxiliary": auxiliary_report,
+            "joint_minus_auxiliary_jaccard_pp": 100. * (
+                result["metrics"]["sample_jaccard"] - auxiliary_report["sample_jaccard"]),
+        }
+    elif hh_diagnostics:
         result["hh_diagnostics"] = (hh_v12_validation_report(y, extra_outputs, source.statistics)
                                     if checkpoint["model_name"] == "hh_setreread_v12" else
                                     hh_validation_report(y, probabilities, extra_outputs, scores, source.statistics))

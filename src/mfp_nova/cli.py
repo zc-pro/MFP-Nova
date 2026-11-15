@@ -440,7 +440,7 @@ def main(argv=None):
         batch_size = args.batch_size or checkpoint["config"]["train"].get("batch_size", 128)
         extra = {}
         if args.hh_diagnostics:
-            if checkpoint.get("model_name") not in HH_MODELS or args.split != "val" or args.decision:
+            if checkpoint.get("model_name") not in (*HH_MODELS, HH_V16) or args.split != "val" or args.decision:
                 parser.error("--hh-diagnostics requires an HH-SetReread checkpoint, --split val and its saved decision")
             extra["hh_diagnostics"] = True
         if args.peptide_feature_root:
