@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
 from .metrics import evaluate_metrics, evaluate_groups, format_epoch, fit_global_threshold, fit_label_thresholds
-from .models import HH_MODELS, HH_V15_RANKER, HH_V16, HH_V17, SEQUENCE_ONLY_MODELS
+from .models import HH_MODELS, HH_V15_RANKER, HH_V16, HH_V17, HH_V20, SEQUENCE_ONLY_MODELS
 from .multimodal import MultimodalData, MultimodalPeptides, collate_multimodal
 from .research_layers import observed_label_loss
 from .consistency import bernoulli_consistency, consistency_weight
@@ -26,6 +26,9 @@ from .metric_protocol import (FIXED_THRESHOLD_SUITES, JACCARD_ORDER, protocol_de
 
 
 def make_model(name, arguments):
+    if name == HH_V20:
+        from .models.hh_setreread_v20 import HHSetRereadV20
+        return HHSetRereadV20(**arguments)
     if name == HH_V17:
         from .models.hh_setreread_v17 import HHSetRereadV17
         return HHSetRereadV17(**arguments)
@@ -372,6 +375,9 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     hh_v12 = config["model_name"] == "hh_setreread_v12"
     hh_model = hh or hh_v12
     hh_v16 = config["model_name"] == HH_V16
+    hh_v20 = config["model_name"] == HH_V20
+    if hh_v20 and config["data"]["track"] != "fine39":
+        raise ValueError("HH V2.0 predicts Fine39 and uses Major15 as auxiliary supervision")
     ranker = config["model_name"] == HH_V15_RANKER
     initial = None
     initialize = settings.get("initialize_from")
@@ -549,6 +555,7 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     if reconstruction_gradient != "sum" and config["model_name"] != "trirelay":
         raise ValueError("Reconstruction gradient balancing currently supports TriRelay")
     reference_checkpoint = checkpoint or initial
+    family_supervision = hh_v20 and config["model"]["mode"] != "direct"
     sequence_only = setreread or config["model_name"] in SEQUENCE_ONLY_MODELS
     train_indices = held_indices = None
     if fold is not None:
@@ -557,10 +564,11 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     source = MultimodalData(config["data"]["root"], config["data"]["track"],
                            reference_checkpoint["statistics"] if reference_checkpoint else None,
                            config.get("min_factor_support", 20), config.get("max_factors", 32),
-                           sequence_only=sequence_only, sequence_chemistry=setreread, train_indices=train_indices)
+                           sequence_only=sequence_only, sequence_chemistry=setreread or hh_v20,
+                           train_indices=train_indices, localize_terminals=hh_v20)
     if pb and config["model"].get("stage", "A") != "A" and source.data.track in THERAPEP_TRACKS:
         raise ValueError("PB B/C need observed auxiliary inputs; use rich48 or stage A for author sequence tasks")
-    if function_aux:
+    if function_aux or family_supervision:
         source.enable_function_auxiliary()
     limit = settings.get("limit_samples")
     diagnostic = bool(limit or settings.get("max_steps") or (checkpoint and checkpoint["config"]["train"].get("max_steps")))
@@ -605,6 +613,8 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         args["peptide_input_dim"] = datasets[0].meta["peptide_encoder"]["input_dim"]
     if function_aux:
         args["function_aux_statistics"] = source.statistics["function_auxiliary"]
+    if family_supervision:
+        args["family_statistics"] = source.statistics["function_auxiliary"]
     model = make_model(config["model_name"], args).to(device)
     if initial is not None and not pb:
         restore_model_state(model.backbone if hh_model or hh_v16 else model, initial["model_state"])
@@ -745,7 +755,7 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
             "trainable_parameters": sum(p.numel() for p in model.esm_tail.parameters() if p.requires_grad),
             "pretrained_weights_in_checkpoint": False,
             "learning_rate": settings.get("esm_learning_rate", 1e-5)}
-    if function_aux:
+    if function_aux or family_supervision:
         aux_stats = source.statistics["function_auxiliary"]
         metadata["function_auxiliary"] = {"task": aux_stats["track"], "labels": aux_stats["labels"],
                                           "statistics_train_rows": aux_stats["train_rows"]}
@@ -1335,9 +1345,11 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
             raise ValueError("Private evidence ablation requires a shared-private TriRelay checkpoint")
         model.private_evidence_enabled = False
     setreread = checkpoint["model_name"] == "setreread"
+    hh_v20 = checkpoint["model_name"] == HH_V20
     sequence_only = setreread or checkpoint["model_name"] in SEQUENCE_ONLY_MODELS
     source = MultimodalData(data_root, checkpoint["track"], checkpoint["statistics"],
-                           sequence_only=sequence_only, sequence_chemistry=setreread)
+                           sequence_only=sequence_only, sequence_chemistry=setreread or hh_v20,
+                           localize_terminals=hh_v20)
     dataset = MultimodalPeptides(source, feature_root, split,
                                   peptide_feature_root=peptide_feature_root or checkpoint["config"]["data"].get("peptide_features"),
                                   sequence_only=sequence_only or (checkpoint["model_name"] == "privilegedbridge" and model.stage == "A"))
@@ -1451,7 +1463,7 @@ def predict_inputs(checkpoint_path, input_path, device="cpu", batch_size=32, dec
         inputs = {"esm": torch.from_numpy(raw["esm"]).float(),
                   "esm_peptide": torch.from_numpy(raw["esm_peptide"]).float(),
                   "mask": torch.from_numpy(raw["mask"]).bool()}
-    elif checkpoint["model_name"] == "setreread" and "chemical" not in raw:
+    elif checkpoint["model_name"] in ("setreread", HH_V20) and "chemical" not in raw:
         from .multimodal import prepare_sequence_inputs
         inputs = prepare_sequence_inputs(raw, checkpoint["statistics"])
     elif "phys_raw" in raw:
@@ -1565,7 +1577,7 @@ def predict_sequences(checkpoint_path, sequences, device="cpu", decision_path=No
         if prefix is not None:
             raw["esm_cls"] = states[:, 0].half().float().cpu().numpy()
             raw["esm_eos"] = torch.stack([states[i, len(s) + 1] for i, s in enumerate(selected)]).half().float().cpu().numpy()
-        prepare = prepare_sequence_inputs if checkpoint["model_name"] in ("setreread", HH_V15_RANKER) else prepare_inputs
+        prepare = prepare_sequence_inputs if checkpoint["model_name"] in ("setreread", HH_V15_RANKER, HH_V20) else prepare_inputs
         inputs = prepare(raw, checkpoint["statistics"])
         scope = "sequence_only" if checkpoint["model_name"] in (*SEQUENCE_ONLY_MODELS, "privilegedbridge") else "sequence_and_stereochemistry_only"
         with torch.inference_mode():

@@ -13,6 +13,10 @@
 
 ## 当前研究
 
+### HH-SetReread V2.0 · 家族监督与细标签局部证据
+
+`--model hh_setreread_v20` 从肽输入直接预测 Fine39。用家族与记录细化监督训练共享化学序列表示，独立读取家族内各具体标签的局部证据。见 [V2.0 架构与双平台训练命令](docs/HH_SetReread_V2_Architecture_and_Training_Plan.md)。
+
 ### HH-SetReread V1.7 · Fine39 标签证据与集合纠错
 
 `--model hh_setreread_v17` 使用同源簇折外的 TheraSet 分数、短片段与端点读出，以及原 Train 簇近邻。保留参考预测作为默认动作，比较单加、单删和单换。见 [V1.7 架构与双平台训练命令](docs/HH_SetReread_Architecture_and_Training_Plan.md)。

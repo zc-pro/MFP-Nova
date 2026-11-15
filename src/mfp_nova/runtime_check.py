@@ -16,7 +16,7 @@ import yaml
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
 from .multimodal import MultimodalData, MultimodalPeptides, collate_multimodal
-from .models import HH_MODELS, HH_V16
+from .models import HH_MODELS, HH_V16, HH_V20
 from .research import (autocast_context, make_model, to_device, train, validate_cache,
                        load_model, predict_loader, metrics, make_optimizer, update_ema, v16_count_support)
 from .trainer import seed_everything, write_json
@@ -53,6 +53,7 @@ PROBES = {
                        "fine_queries", "evidence_readout.2.weight"],
     HH_V16: ["backbone.sequence.plm.weight", "label_weights", "count.weight",
              "fragment_evidence.fragment.weight"],
+    HH_V20: ["cnn.convs1.0.weight", "peptide.1.weight", "family_queries", "fine_weights"],
     "setreread": ["features.projection.weight", "cnn.convs1.0.weight", "add_head.2.weight"],
     "termiscale": ["features.projection.weight", "blocks.0.router.weight", "label.weight", "condition_weights"],
     "motifspan": ["features.projection.weight", "velocity_out.weight", "left.weight", "detail_query.weight"],
@@ -121,6 +122,8 @@ def profile(config, source, dataset, device, batches, precisions, measured_steps
         arguments["axis_statistics"] = axis_statistics(source)
     if config["model_name"] == HH_V16:
         arguments["count_support"] = v16_count_support(source.data)
+    if config["model_name"] == HH_V20:
+        arguments["family_statistics"] = source.statistics["function_auxiliary"]
     if "peptide_encoder" in dataset.meta:
         arguments["peptide_input_dim"] = dataset.meta["peptide_encoder"]["input_dim"]
     samples = [dataset[i] for i in range(len(dataset))] if batch_scope == "diagnostic" else None
@@ -278,6 +281,8 @@ def run(models, tasks, feature_root, device, output, esm="650m", batches=(2, 4, 
     for name in models:
         for task in tasks:
             config = yaml.safe_load(Path(f"configs/{name}.yaml").read_text(encoding="utf-8"))
+            if name == HH_V20 and task != "fine39":
+                raise ValueError("Use --tasks fine39 for HH V2.0")
             if name in (*HH_MODELS, HH_V16):
                 base = yaml.safe_load(Path("configs/theraset.yaml").read_text(encoding="utf-8"))
                 for key in ("encoder", "peptide_encoder"):
@@ -297,11 +302,14 @@ def run(models, tasks, feature_root, device, output, esm="650m", batches=(2, 4, 
                 config["train"]["correction_start_epoch"] = 1
                 if str(feature_root) == f"features/esm2_{esm}":
                     config["data"]["features"] = "features/esm2_peptide_150m"
-            else:
+            elif name != HH_V20:
                 config["encoder"]["name"] = "facebook/esm2_t33_650M_UR50D" if esm=="650m" else "facebook/esm2_t12_35M_UR50D"
-            sequence_only = name in ("termiscale", "motifspan", "setreread")
+            sequence_only = name in ("termiscale", "motifspan", "setreread", HH_V20)
             source = MultimodalData(config["data"]["root"], task, sequence_only=sequence_only,
-                                   sequence_chemistry=name == "setreread")
+                                   sequence_chemistry=name in ("setreread", HH_V20),
+                                   localize_terminals=name == HH_V20)
+            if name == HH_V20:
+                source.enable_function_auxiliary()
             task_features = config["data"]["features"]
             data = MultimodalPeptides(source, task_features, "train", None if profile_only else samples,
                                      config["data"].get("peptide_features"),
@@ -344,7 +352,9 @@ def run(models, tasks, feature_root, device, output, esm="650m", batches=(2, 4, 
             restored = train(continued, f"{name}_{task}_resume", resume=root/f"{name}_{task}"/"last.pt")
             model, checkpoint = load_model(root/f"{name}_{task}_resume"/"best.pt", device)
             source = MultimodalData(config["data"]["root"], task, checkpoint["statistics"],
-                                   sequence_only=name == "setreread", sequence_chemistry=name == "setreread")
+                                   sequence_only=name in ("setreread", HH_V20),
+                                   sequence_chemistry=name in ("setreread", HH_V20),
+                                   localize_terminals=name == HH_V20)
             val = MultimodalPeptides(source, task_features, "val", min(samples, 64), config["data"].get("peptide_features"))
             loader = torch.utils.data.DataLoader(val, batch_size=chosen["batch_size"], collate_fn=collate_multimodal)
             y, p = predict_loader(model, loader, device, chosen["precision"])

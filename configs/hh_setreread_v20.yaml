@@ -1,0 +1,37 @@
+model_name: hh_setreread_v20
+data:
+  root: data/therapeutic_2025
+  track: fine39
+  features: features/esm2_peptide_150m
+  augment: false
+encoder:
+  name: jiahuizhang/esm-150m-peptide-fine-tune
+  revision: 6d8cebf74c53b1032b6f5917e75e3253cb70f575
+  max_length: 80
+  batch_size: 16
+model:
+  mode: full
+  dim: 96
+  cnn_channels: 64
+  dropout: 0.15
+  peptide_plm: true
+loss:
+  unlabeled_weight: 0.3
+  family_weight: 0.3
+  detail_weight: 0.1
+train:
+  seed: 157
+  device: cpu
+  epochs: 60
+  batch_size: 64
+  accumulation_steps: 1
+  precision: fp32
+  learning_rate: 0.0003
+  weight_decay: 0.01
+  patience: 10
+  warmup_epochs: 5
+  gradient_clip: 5
+  num_workers: 0
+  metric_suite: jaccard
+  export_validation_predictions: true
+  output: runs

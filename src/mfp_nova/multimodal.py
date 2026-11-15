@@ -109,13 +109,29 @@ def independent_functions(y, projection):
     return result
 
 
+def localize_terminal_chemistry(tokens):
+    """Move supported, consistent acetyl/amidation records to the two ends."""
+    terminal = []
+    remaining = list(tokens)
+    for marker, prefix, aliases in (
+        ("[ac]", "N-terminal modification:", {"acetylation", "acetyl", "n-acetylation", "n-acetyl"}),
+        ("[am]", "C-terminal modification:", {"amidation", "amide", "c-amidation", "c-terminal amidation"}),
+    ):
+        explicit = [t for t in tokens if t.startswith(prefix)]
+        recognized = [t for t in explicit if t[len(prefix):].strip().casefold() in aliases]
+        terminal.append((marker in tokens or bool(recognized)) and len(recognized) == len(explicit))
+        remaining = [t for t in remaining if t != marker and t not in recognized]
+    return remaining, terminal
+
+
 class MultimodalData:
     def __init__(self, root, track, statistics=None, min_support=20, max_factors=32, sequence_only=False,
-                 sequence_chemistry=False, train_indices=None):
+                 sequence_chemistry=False, train_indices=None, localize_terminals=False):
         self.data = PeptideData(root, track)
         self.root = Path(root)
         self.sequence_only = sequence_only
         self.sequence_chemistry = sequence_chemistry
+        self.localize_terminals = localize_terminals
         if track in THERAPEP_TRACKS:
             from .therapep import init_multimodal
             init_multimodal(self, statistics, min_support, max_factors)
@@ -141,6 +157,8 @@ class MultimodalData:
                 statistics["phys"]["zero_missing"] = True
                 if sequence_chemistry:
                     statistics["chemical_vocab"] = self.chemical_vocabulary(train)
+                if localize_terminals:
+                    statistics["localized_terminal_chemistry"] = True
             if statistics["labels"]["labels"] != self.data.labels:
                 raise ValueError("Checkpoint label order differs from data")
             self.statistics = statistics
@@ -188,6 +206,8 @@ class MultimodalData:
         if [int(r["row_id"]) for r in records] != self.data.rows.tolist():
             raise ValueError("Chemical records differ from array row_id order")
         self.chemical, self.residue_chemical = [], []
+        if self.localize_terminals:
+            self.terminal_chemical = []
         self.source = []
         for i, record in enumerate(records):
             tokens = symbols[int(self.data.rows[i])]
@@ -201,6 +221,9 @@ class MultimodalData:
             parts = record["HELM notation"].split("$")
             if len(parts)>1 and parts[1]:
                 global_tokens.append("connection:"+parts[1])
+            if self.localize_terminals:
+                global_tokens, terminal = localize_terminal_chemistry(global_tokens)
+                self.terminal_chemical.append(terminal)
             self.chemical.append(global_tokens)
             self.source.append(record["source_evidence"])
 
@@ -210,8 +233,11 @@ class MultimodalData:
 
     def chemical_inputs(self, i, length):
         vocab = self.statistics["chemical_vocab"]
-        return {"chemical": torch.tensor([vocab.get(t, 1) for t in self.chemical[i]] or [0]),
-                "residue_chem": torch.tensor([vocab.get(t, 1) for t in self.residue_chemical[i]] or [0]*length)}
+        inputs = {"chemical": torch.tensor([vocab.get(t, 1) for t in self.chemical[i]] or [0]),
+                  "residue_chem": torch.tensor([vocab.get(t, 1) for t in self.residue_chemical[i]] or [0]*length)}
+        if self.localize_terminals:
+            inputs["terminal_chemical"] = torch.tensor(self.terminal_chemical[i], dtype=torch.bool)
+        return inputs
 
     def enable_function_auxiliary(self):
         """Pair actual Train labels only; out-of-scope rows have no auxiliary supervision."""
@@ -416,12 +442,20 @@ def prepare_sequence_inputs(raw, statistics):
     def chemical_ids(values):
         return np.array([[0 if not str(t) else vocabulary.get(str(t), 1) for t in row] for row in values], np.int64)
 
+    chemistry = raw.get("chemical_tokens", np.full((b, 1), ""))
+    localized = statistics.get("localized_terminal_chemistry")
+    if localized:
+        localized_rows = [localize_terminal_chemistry([str(t) for t in row if str(t)]) for row in chemistry]
+        width = max(1, max((len(tokens) for tokens, _ in localized_rows), default=0))
+        chemistry = [tokens + [""] * (width - len(tokens)) for tokens, _ in localized_rows]
     arrays = {
         "esm": raw["esm"].astype(np.float32), "aa": raw["aa"].astype(np.int64),
         "d": (raw["d"] * (raw["aa"] != 6)).astype(np.int64), "mask": raw["mask"].astype(bool),
-        "chemical": chemical_ids(raw.get("chemical_tokens", np.full((b, 1), ""))),
+        "chemical": chemical_ids(chemistry),
         "residue_chem": chemical_ids(raw.get("residue_chem_tokens", np.full((b, length), ""))),
     }
+    if localized:
+        arrays["terminal_chemical"] = np.asarray([terminal for _, terminal in localized_rows], dtype=bool).reshape(b, 2)
     for key in ("esm_cls", "esm_eos", "esm_peptide"):
         if key in raw:
             arrays[key] = raw[key].astype(np.float32)
