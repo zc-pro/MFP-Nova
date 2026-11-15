@@ -10,11 +10,13 @@ import joblib
 import numpy as np
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.metrics import f1_score
+from sklearn.model_selection import GroupKFold
 
 from compare_validation_predictions import read_validation, sample_jaccard
 from mfp_nova.data import PeptideData
 from mfp_nova.hh_v13 import load_oof
 from mfp_nova.metrics import fit_global_threshold
+from mfp_nova.neighbor_evidence import NEIGHBORS, fold_neighbor_evidence
 
 
 MAX_K = 6
@@ -22,6 +24,7 @@ RANK_RANGES = [(0, k) for k in range(1, MAX_K + 1)] + [(k, k + 1) for k in range
 CANDIDATE_NAMES = ["keep"] + [f"top_{k}" for k in range(1, MAX_K + 1)] + [
     f"only_rank_{k}" for k in range(2, MAX_K + 1)]
 GAIN_THRESHOLDS = (0., .01, .02, .04, .06, .10, .15, .20, np.inf)
+HARM_BUDGETS = (0, 10, 25, 50, 84)
 
 
 def proposal_features(probabilities, lengths):
@@ -71,6 +74,27 @@ def predict_gains(model, features, valid):
     return gains
 
 
+def add_neighbor_features(features, candidates, evidence):
+    vote, positive_sim, nearest = evidence
+    shape = candidates[:, 1:].shape[:2]
+    before, choices = candidates[:, :1], candidates[:, 1:]
+
+    def summarize(mask):
+        mean_vote = (mask * vote[:, None]).sum(axis=-1) / mask.sum(axis=-1).clip(min=1)
+        strongest_vote = np.where(mask, vote[:, None], 0.).max(axis=-1)
+        best_similarity = np.where(mask & (vote[:, None] > 0.), positive_sim[:, None], -np.inf).max(axis=-1)
+        best_similarity = np.where(np.isfinite(best_similarity), best_similarity, 0.)
+        return tuple(np.broadcast_to(field, shape) for field in (mean_vote, strongest_vote, best_similarity))
+
+    base = summarize(before)
+    added = summarize(choices & ~before)
+    removed = summarize(before & ~choices)
+    extra = np.stack((*base, *added, *removed, added[0] - removed[0],
+                      np.broadcast_to(nearest[:, None], shape)), axis=-1).astype(np.float32)
+    # Keep the four categorical label fields at the end.
+    return np.concatenate((features[..., :-4], extra, features[..., -4:]), axis=-1)
+
+
 def selection(gains, threshold):
     best = gains.argmax(axis=1)
     return np.where(gains[np.arange(len(gains)), best] > threshold, best + 1, 0)
@@ -99,6 +123,43 @@ def edit_summary(y, base, selected):
         "jaccard_delta_wrong_nonempty_pp": float(100. * delta[wrong].sum() / len(y)),
         "jaccard_delta_with_overlap_pp": float(100. * delta[before > 0].sum() / len(y)),
     }
+
+
+def compare_with_fixed_empty_fill(y, candidates, scores, gains, clusters):
+    """Compare nonempty decisions while both arms fill empty sets with Top-1."""
+    rows = np.arange(len(y))
+    base = candidates[:, 0]
+    empty = ~base.any(axis=1)
+    best = gains.argmax(axis=1)
+    max_gain = gains[rows, best]
+    proposed = best + 1
+    decisions = np.stack([np.where(empty, 1, np.where(max_gain > t, proposed, 0)) for t in GAIN_THRESHOLDS])
+    decision_scores = scores[rows, decisions]
+    crossfit = np.empty(len(y), dtype=int)
+    thresholds = []
+    for fit, hold in GroupKFold(3).split(rows, groups=clusters):
+        # Prefer the stricter threshold when Jaccard ties.
+        fit_jaccard = decision_scores[:, fit].mean(axis=1)
+        best_index = len(GAIN_THRESHOLDS) - 1 - fit_jaccard[::-1].argmax()
+        crossfit[hold] = decisions[best_index, hold]
+        threshold = GAIN_THRESHOLDS[best_index]
+        thresholds.append(threshold if np.isfinite(threshold) else None)
+
+    order = np.flatnonzero(~empty & (max_gain > 0))
+    order = order[np.argsort(-max_gain[order], kind="stable")]
+    harms = (scores[order, 0] == 1.) & (scores[order, proposed[order]] < 1.)
+    cumulative = np.cumsum(harms)
+    budgets = {}
+    for cap in HARM_BUDGETS:
+        selected = empty.astype(int)
+        within_budget = order[:np.searchsorted(cumulative, cap, side="right")]
+        selected[within_budget] = proposed[within_budget]
+        budgets[str(cap)] = edit_summary(y, base, candidates[rows, selected])
+    return {
+        "cluster_cross_validation": {"thresholds": thresholds, **edit_summary(y, base, candidates[rows, crossfit])},
+        "fixed_zero_gain": edit_summary(y, base, candidates[rows, decisions[0]]),
+        "matched_harm_budgets": budgets,
+    }, crossfit
 
 
 def proposal_summary(candidates, scores, targets):
@@ -168,17 +229,37 @@ def run(args):
         "selected_candidate_counts": dict(zip(CANDIDATE_NAMES, np.bincount(decision, minlength=len(CANDIDATE_NAMES)).tolist())),
         "gain_threshold_curve": curve,
     }
+    exports = {}
+    checkpoint = {"model": model, "gain_threshold": outcome["val_selected_selector"]["gain_threshold"],
+                  "labels": data.labels}
+    if args.neighbor_feature_root is not None:
+        print(f"Reading {NEIGHBORS} neighbors per peptide with training-cluster isolation", flush=True)
+        train_evidence, val_evidence = fold_neighbor_evidence(data, args.neighbor_feature_root, train_rows, val_rows)
+        enhanced_model = fit_selector(add_neighbor_features(train_features, train_sets, train_evidence),
+                                      train_valid, train_scores, args.seed)
+        enhanced_gains = predict_gains(enhanced_model, add_neighbor_features(features, candidates, val_evidence), valid)
+        control_result, control_choice = compare_with_fixed_empty_fill(targets, candidates, scores, gains, data.clusters[val_rows])
+        enhanced_result, enhanced_choice = compare_with_fixed_empty_fill(
+            targets, candidates, scores, enhanced_gains, data.clusters[val_rows])
+        outcome["neighbor_comparison"] = {
+            "feature_root": str(args.neighbor_feature_root), "neighbors": NEIGHBORS,
+            "elapsed_seconds_including_retrieval": time.perf_counter() - started,
+            "scores_only": control_result, "with_neighbor_evidence": enhanced_result,
+        }
+        checkpoint["neighbor_model"] = enhanced_model
+        exports = {"neighbor_candidate_gains": enhanced_gains, "score_only_crossfit_candidate": control_choice,
+                   "neighbor_crossfit_candidate": enhanced_choice, "neighbor_label_support": val_evidence[0],
+                   "neighbor_best_positive_similarity": val_evidence[1], "neighbor_max_similarity": val_evidence[2]}
     args.output.mkdir(parents=True, exist_ok=False)
     (args.output / "results.json").write_text(json.dumps(outcome, indent=2) + "\n", encoding="utf-8")
-    joblib.dump({"model": model, "gain_threshold": outcome["val_selected_selector"]["gain_threshold"],
-                 "labels": data.labels}, args.output / "selector.joblib")
+    joblib.dump(checkpoint, args.output / "selector.joblib")
     np.savez_compressed(
         args.output / "val_predictions.npz",
         row_id=data.rows[val_rows], ID=data.ids[val_rows], cluster_id=data.clusters[val_rows],
         label_names=data.labels, targets=targets, probabilities=probabilities, baseline=base,
         candidate_names=CANDIDATE_NAMES, candidate_gains=gains, selected_candidate=decision,
         predicted=candidates[rows, decision],
-        split="val", task=data.track,
+        split="val", task=data.track, **exports,
     )
     print(json.dumps({key: val for key, val in outcome.items() if key != "gain_threshold_curve"}, indent=2))
 
@@ -190,6 +271,8 @@ def main():
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--seed", default=157, type=int)
     parser.add_argument("--data-root", default=Path("data/therapeutic_2025"), type=Path)
+    parser.add_argument("--neighbor-feature-root", type=Path,
+                        help="Peptide ESM cache for the matched annotation-evidence comparison")
     run(parser.parse_args())
 
 
