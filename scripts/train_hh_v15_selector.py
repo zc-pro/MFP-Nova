@@ -15,6 +15,7 @@ from sklearn.model_selection import GroupKFold
 from compare_validation_predictions import read_validation, sample_jaccard
 from mfp_nova.data import PeptideData
 from mfp_nova.hh_v13 import load_oof
+from mfp_nova.hypothesis_data import family_folds
 from mfp_nova.metrics import fit_global_threshold
 from mfp_nova.neighbor_evidence import NEIGHBORS, fold_neighbor_evidence
 
@@ -55,17 +56,19 @@ def candidate_jaccard(candidates, y):
     return overlap / np.maximum(union, 1)
 
 
+def fit_regressor(features, targets, seed, categorical_count, weights=None):
+    model = HistGradientBoostingRegressor(
+        max_iter=120, max_leaf_nodes=15, min_samples_leaf=128, learning_rate=.08,
+        categorical_features=list(range(features.shape[-1] - categorical_count, features.shape[-1])),
+        early_stopping=False, random_state=seed,
+    )
+    return model.fit(features, targets, sample_weight=weights)
+
+
 def fit_selector(features, valid, scores, seed):
     delta = scores[:, 1:] - scores[:, :1]
     weights = np.broadcast_to(1. / valid.sum(axis=1, keepdims=True), valid.shape)
-    # The last four fields are label IDs and enter as categorical features.
-    model = HistGradientBoostingRegressor(
-        max_iter=120, max_leaf_nodes=15, min_samples_leaf=128, learning_rate=.08,
-        categorical_features=list(range(features.shape[-1] - 4, features.shape[-1])),
-        early_stopping=False, random_state=seed,
-    )
-    model.fit(features[valid], delta[valid], sample_weight=weights[valid])
-    return model
+    return fit_regressor(features[valid], delta[valid], seed, categorical_count=4, weights=weights[valid])
 
 
 def predict_gains(model, features, valid):
@@ -93,6 +96,50 @@ def add_neighbor_features(features, candidates, evidence):
                       np.broadcast_to(nearest[:, None], shape)), axis=-1).astype(np.float32)
     # Keep the four categorical label fields at the end.
     return np.concatenate((features[..., :-4], extra, features[..., -4:]), axis=-1)
+
+
+def singleton_pair_features(probabilities, candidates, lengths, evidence):
+    """Estimate one keep value for A and compare it against each singleton B."""
+    rows = np.flatnonzero(candidates[:, 0].sum(axis=1) == 1)
+    a_label = candidates[rows, 0].argmax(axis=1)
+    b_labels = candidates[rows, MAX_K + 1:].argmax(axis=2)
+    pair_rows = rows[:, None]
+    vote, positive_sim, nearest = evidence
+    p_a, p_b = probabilities[rows, a_label], probabilities[pair_rows, b_labels]
+    v_a, v_b = vote[rows, a_label], vote[pair_rows, b_labels]
+    s_a, s_b = positive_sim[rows, a_label], positive_sim[pair_rows, b_labels]
+    shared = np.column_stack((lengths[rows], nearest[rows], p_a, p_b[:, 0], p_a - p_b[:, 0],
+                              v_a, v_b.max(axis=1), s_a, s_b.max(axis=1)))
+    keep = np.column_stack((shared, a_label)).astype(np.float32)
+    context = np.broadcast_to(shared[:, None], (*b_labels.shape, shared.shape[-1]))
+    alternatives = np.stack((
+        np.broadcast_to(np.arange(2, MAX_K + 1), b_labels.shape),
+        p_b, v_b, s_b, p_b - p_a[:, None], v_b - v_a[:, None], s_b - s_a[:, None],
+        np.broadcast_to(a_label[:, None], b_labels.shape), b_labels,
+    ), axis=-1)
+    replace = np.concatenate((context, alternatives), axis=-1).astype(np.float32)
+    return rows, keep, replace
+
+
+def fit_singleton_pairs(pair_features, scores, seed):
+    rows, keep, replace = pair_features
+    # A singleton scores 1 / |Y| when its label is recorded and 0 otherwise.
+    return (
+        fit_regressor(keep, scores[rows, 0], seed, categorical_count=1),
+        fit_regressor(replace.reshape(-1, replace.shape[-1]),
+                      scores[rows, MAX_K + 1:].ravel(), seed, categorical_count=2),
+    )
+
+
+def predict_singleton_gains(models, pair_features, neighbor_gains):
+    rows, keep, replace = pair_features
+    keep_model, replace_model = models
+    keep_value = keep_model.predict(keep).clip(0., 1.)
+    replace_value = replace_model.predict(replace.reshape(-1, replace.shape[-1])).clip(0., 1.)
+    replace_value = replace_value.reshape(replace.shape[:2])
+    gains = neighbor_gains.copy()
+    gains[rows, MAX_K:] = replace_value - keep_value[:, None]
+    return gains, keep_value, replace_value
 
 
 def selection(gains, threshold):
@@ -125,7 +172,7 @@ def edit_summary(y, base, selected):
     }
 
 
-def compare_with_fixed_empty_fill(y, candidates, scores, gains, clusters):
+def compare_with_fixed_empty_fill(y, candidates, scores, gains, clusters, folds=None):
     """Compare nonempty decisions while both arms fill empty sets with Top-1."""
     rows = np.arange(len(y))
     base = candidates[:, 0]
@@ -137,7 +184,9 @@ def compare_with_fixed_empty_fill(y, candidates, scores, gains, clusters):
     decision_scores = scores[rows, decisions]
     crossfit = np.empty(len(y), dtype=int)
     thresholds = []
-    for fit, hold in GroupKFold(3).split(rows, groups=clusters):
+    if folds is None:
+        folds = GroupKFold(3).split(rows, groups=clusters)
+    for fit, hold in folds:
         # Prefer the stricter threshold when Jaccard ties.
         fit_jaccard = decision_scores[:, fit].mean(axis=1)
         best_index = len(GAIN_THRESHOLDS) - 1 - fit_jaccard[::-1].argmax()
@@ -238,9 +287,14 @@ def run(args):
         enhanced_model = fit_selector(add_neighbor_features(train_features, train_sets, train_evidence),
                                       train_valid, train_scores, args.seed)
         enhanced_gains = predict_gains(enhanced_model, add_neighbor_features(features, candidates, val_evidence), valid)
-        control_result, control_choice = compare_with_fixed_empty_fill(targets, candidates, scores, gains, data.clusters[val_rows])
+        clusters = data.clusters[val_rows]
+        folds = None
+        if args.paired_replacements:
+            fold_ids = family_folds(clusters, 3)
+            folds = [(fold_ids != k, fold_ids == k) for k in range(3)]
+        control_result, control_choice = compare_with_fixed_empty_fill(targets, candidates, scores, gains, clusters, folds)
         enhanced_result, enhanced_choice = compare_with_fixed_empty_fill(
-            targets, candidates, scores, enhanced_gains, data.clusters[val_rows])
+            targets, candidates, scores, enhanced_gains, clusters, folds)
         outcome["neighbor_comparison"] = {
             "feature_root": str(args.neighbor_feature_root), "neighbors": NEIGHBORS,
             "elapsed_seconds_including_retrieval": time.perf_counter() - started,
@@ -250,6 +304,26 @@ def run(args):
         exports = {"neighbor_candidate_gains": enhanced_gains, "score_only_crossfit_candidate": control_choice,
                    "neighbor_crossfit_candidate": enhanced_choice, "neighbor_label_support": val_evidence[0],
                    "neighbor_best_positive_similarity": val_evidence[1], "neighbor_max_similarity": val_evidence[2]}
+        if args.paired_replacements:
+            train_pairs = singleton_pair_features(probs, train_sets, np.char.str_len(data.sequences[train_rows]), train_evidence)
+            val_pairs = singleton_pair_features(probabilities, candidates, np.char.str_len(data.sequences[val_rows]), val_evidence)
+            pair_models = fit_singleton_pairs(train_pairs, train_scores, args.seed)
+            pair_gains, keep_value, replace_value = predict_singleton_gains(pair_models, val_pairs, enhanced_gains)
+            pair_result, pair_choice = compare_with_fixed_empty_fill(targets, candidates, scores, pair_gains, clusters, folds)
+            replacement_mask = (base.sum(axis=1) == 1)[:, None] & (np.arange(valid.shape[1]) >= MAX_K)
+            only_replacement = {}
+            for arm, arm_gains in (("with_neighbor_evidence", enhanced_gains), ("paired", pair_gains)):
+                only_replacement[arm], _ = compare_with_fixed_empty_fill(
+                    targets, candidates, scores, np.where(replacement_mask, arm_gains, -np.inf), clusters, folds)
+            outcome["paired_replacement_comparison"] = {
+                "train_single_label_predictions": len(train_pairs[0]), "val_single_label_predictions": len(val_pairs[0]),
+                "elapsed_seconds": time.perf_counter() - started,
+                "paired": pair_result, "singleton_replacement_only": only_replacement,
+            }
+            checkpoint["singleton_pair_models"] = pair_models
+            exports.update(paired_candidate_gains=pair_gains, paired_crossfit_candidate=pair_choice,
+                           validation_fold=fold_ids, singleton_row_id=data.rows[val_rows[val_pairs[0]]],
+                           singleton_keep_value=keep_value, singleton_replacement_values=replace_value)
     args.output.mkdir(parents=True, exist_ok=False)
     (args.output / "results.json").write_text(json.dumps(outcome, indent=2) + "\n", encoding="utf-8")
     joblib.dump(checkpoint, args.output / "selector.joblib")
@@ -273,7 +347,12 @@ def main():
     parser.add_argument("--data-root", default=Path("data/therapeutic_2025"), type=Path)
     parser.add_argument("--neighbor-feature-root", type=Path,
                         help="Peptide ESM cache for the matched annotation-evidence comparison")
-    run(parser.parse_args())
+    parser.add_argument("--paired-replacements", action="store_true",
+                        help="Compare a keep/replace utility model on base singleton predictions")
+    args = parser.parse_args()
+    if args.paired_replacements and args.neighbor_feature_root is None:
+        parser.error("--paired-replacements requires --neighbor-feature-root")
+    run(args)
 
 
 if __name__ == "__main__":
