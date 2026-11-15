@@ -74,6 +74,14 @@ def rank_diagnostics(targets, a_probs, a_pred, b_probs, b_pred, projection):
         coverage[name] = counts
     return {
         "baseline_wrong_singletons": coverage,
+        "top_1_annotated_hit": {"baseline": int((a_hits[:, 0] > 0).sum()),
+                                "candidate": int((b_hits[:, 0] > 0).sum())},
+        "top_5_at_least_two_annotated_hits": {"baseline": int((a_hits[:, 4] >= 2).sum()),
+                                             "candidate": int((b_hits[:, 4] >= 2).sum())},
+        "top_5_at_least_three_annotated_hits": {"baseline": int((a_hits[:, 4] >= 3).sum()),
+                                               "candidate": int((b_hits[:, 4] >= 3).sum())},
+        "exact_set_matches": {"baseline": int((a_score == 1).sum()), "candidate": int((b_score == 1).sum()),
+                              "preserved": int(((a_score == 1) & (b_score == 1)).sum())},
         "baseline_zero_overlap_recovered": int(((a_score == 0) & (b_score > 0)).sum()),
         "baseline_positive_overlap_lost": int(((a_score > 0) & (b_score == 0)).sum()),
         "oracle_fixed_sets_and_top_1_to_6": percent_pair(original.mean(), expanded.mean()),

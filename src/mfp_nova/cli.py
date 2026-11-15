@@ -61,8 +61,10 @@ def main(argv=None):
                              help="V1.6 single component, three components, or three with fragment evidence")
             sub.add_argument("--hh-v17-actions", choices=("all", "add", "drop", "swap"),
                              help="V1.7 decision ablation; keep remains available in every mode")
-            sub.add_argument("--hh-v20-mode", choices=("direct", "auxiliary", "full"),
-                             help="V2.0 matched direct, auxiliary-supervision or hierarchical readout")
+            sub.add_argument("--hh-v20-mode", choices=("direct", "theraset_direct", "auxiliary", "full"),
+                             help="V2.0 direct, TheraSet CNN/readout control, auxiliary-supervision or hierarchical readout")
+            sub.add_argument("--hh-v20-cnn-channels", type=int, choices=(64, 128),
+                             help="Match V2.0 (64) or TheraSet (128) CNN channels per scale")
             sub.add_argument("--hh-oof-fold", type=int, choices=range(3), help="Train a fresh Fine39 TheraSet for one held-out Train fold")
             sub.add_argument("--hh-oof-files", nargs=3, help="Three TheraSet fold exports for HH training")
             sub.add_argument("--annotations", help="B0/H1–H8: aligned NPZ of confirmed label and observation states")
@@ -263,10 +265,13 @@ def main(argv=None):
                 if args.model != HH_V17:
                     parser.error("--hh-v17-actions requires a V1.7 run")
                 config["train"]["actions"] = args.hh_v17_actions
-            if args.hh_v20_mode is not None:
+            if args.hh_v20_mode is not None or args.hh_v20_cnn_channels is not None:
                 if args.model != HH_V20 or args.resume:
-                    parser.error("--hh-v20-mode requires a fresh V2.0 run")
-                config["model"]["mode"] = args.hh_v20_mode
+                    parser.error("--hh-v20-mode and --hh-v20-cnn-channels require a fresh V2.0 run")
+                if args.hh_v20_mode is not None:
+                    config["model"]["mode"] = args.hh_v20_mode
+                if args.hh_v20_cnn_channels is not None:
+                    config["model"]["cnn_channels"] = args.hh_v20_cnn_channels
             if args.hh_v13_readout is not None:
                 if args.model != "hh_setreread_v13":
                     parser.error("HH V1.3 editor options require --model hh_setreread_v13")

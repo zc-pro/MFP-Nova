@@ -51,7 +51,7 @@ def test_matched_modes_padding_and_backward():
     padded = dict(batch, esm=F.pad(batch["esm"], (0, 0, 0, 4), value=25))
     for key in ("aa", "mask", "d", "residue_chem"):
         padded[key] = F.pad(batch[key], (0, 4))
-    for mode in ("direct", "auxiliary", "full"):
+    for mode in ("direct", "theraset_direct", "auxiliary", "full"):
         net = model(mode).eval()
         if mode == "full":
             with torch.no_grad():
@@ -59,8 +59,11 @@ def test_matched_modes_padding_and_backward():
         loss, terms, out = net.compute_loss(batch, settings, return_output=True)
         torch.testing.assert_close(out["logits"], net(padded)["logits"])
         assert out["logits"].shape == (2, 4)
-        assert ("annotation_detail" in terms) == (mode != "direct")
+        assert ("annotation_detail" in terms) == (mode in ("auxiliary", "full"))
         loss.backward()
         assert torch.isfinite(loss) and net.terminal.weight.grad.abs().sum() > 0
+        if mode == "theraset_direct":
+            assert net.direct[0].in_features == net.cnn.output_channels
+            assert net.peptide[1].weight.grad.abs().sum() > 0
         if mode == "full":
             assert net.fine_queries.grad.abs().sum() > 0

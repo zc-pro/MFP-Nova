@@ -555,7 +555,7 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     if reconstruction_gradient != "sum" and config["model_name"] != "trirelay":
         raise ValueError("Reconstruction gradient balancing currently supports TriRelay")
     reference_checkpoint = checkpoint or initial
-    family_supervision = hh_v20 and config["model"]["mode"] != "direct"
+    family_supervision = hh_v20 and config["model"]["mode"] in ("auxiliary", "full")
     sequence_only = setreread or config["model_name"] in SEQUENCE_ONLY_MODELS
     train_indices = held_indices = None
     if fold is not None:

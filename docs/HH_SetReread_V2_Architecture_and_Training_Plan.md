@@ -123,3 +123,75 @@ foreach ($mode in 'direct', 'auxiliary', 'full') {
 ~~~
 
 如要先测显存，可用 `gpu-check --models hh_setreread_v20 --tasks fine39 --profile-only --device cuda:0 --precisions fp32 --batch-sizes 32 64 96 --steps 8 --output <新实验子目录>`。测试会使用真实随机批次和最长肽批次执行反向。
+
+## 6. 主干与直接头对照
+
+首轮 `direct` 的 Fine39 验证 ACC 为 47.96%，已有 TheraSet 在同一验证集上达到 61.05%。以下对照沿用首轮 Fine39 原始划分、ESM150M、最大长度 80、化学输入和训练配置，只使用 Fine39 损失并从头训练。
+
+| 实验 | 参数 | 比较用途 |
+|---|---|---|
+| 首轮 `direct` | `--hh-v20-mode direct --hh-v20-cnn-channels 64` | 复用首轮结果 |
+| `wide_direct` | `--hh-v20-mode direct --hh-v20-cnn-channels 128` | 单独测量增加每尺度通道数的影响 |
+| `theraset_direct` | `--hh-v20-mode theraset_direct --hh-v20-cnn-channels 128` | 恢复每尺度的 masked max pooling 和 TheraSet 的 `512 → 1024 → 512 → 39` 直接头 |
+
+`theraset_direct` 保留 V2.0 的末端化学、位置和 ESM150M 输入。CNN 的四组最大池化向量按通道拼接。位置和 ESM 的残基向量单独做均值与最大池化，投影到 512 维后与 CNN 向量相加。因此它与 `wide_direct` 的差值衡量池化、融合和直接头的组合效果。
+
+### V100 · 两张卡并行
+
+~~~bash
+cd ~/wuzhencheng/projects/MFP-Nova
+conda activate MFP-Nova
+git pull --ff-only origin main
+GPUS=(0 1)  # 改为实际空闲的物理卡号
+CPU_THREADS=6
+RUN="hh_v20_direct_fine39_s157_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "runs/$RUN"
+
+launch() {
+  local gpu="$1" name="$2" mode="$3"
+  nohup env CUDA_VISIBLE_DEVICES="$gpu" OMP_NUM_THREADS="$CPU_THREADS" \
+    MKL_NUM_THREADS="$CPU_THREADS" PYTHONPATH="$PWD/src" \
+    python -u -m mfp_nova.cli train --model hh_setreread_v20 --task fine39 \
+    --hh-v20-mode "$mode" --hh-v20-cnn-channels 128 \
+    --seed 157 --device cuda:0 --precision fp32 --batch-size 64 \
+    --epochs 60 --metric-suite jaccard --name "$RUN/$name" \
+    > "runs/$RUN/$name.log" 2>&1 < /dev/null &
+  printf 'GPU=%s PID=%s LOG=runs/%s/%s.log\n' "$gpu" "$!" "$RUN" "$name"
+}
+launch "${GPUS[0]}" wide_direct direct
+launch "${GPUS[1]}" theraset_direct theraset_direct
+~~~
+
+### RTX 5070 · 单卡顺序
+
+~~~powershell
+Set-Location 'D:\Data\Code\MFP-Nova'
+conda activate MFP-Nova
+git pull --ff-only origin main
+$env:CUDA_VISIBLE_DEVICES = '0'
+$env:OMP_NUM_THREADS = '6'
+$env:MKL_NUM_THREADS = '6'
+$env:PYTHONPATH = "$PWD/src"
+$run = "hh_v20_direct_fine39_s157_$(Get-Date -Format yyyyMMdd_HHmmss)"
+New-Item -ItemType Directory -Path "runs/$run" | Out-Null
+foreach ($name in 'wide_direct', 'theraset_direct') {
+    $mode = if ($name -eq 'wide_direct') { 'direct' } else { 'theraset_direct' }
+    python -u -m mfp_nova.cli train --model hh_setreread_v20 --task fine39 `
+      --hh-v20-mode $mode --hh-v20-cnn-channels 128 `
+      --seed 157 --device cuda:0 --precision fp32 --batch-size 64 `
+      --epochs 60 --metric-suite jaccard --name "$run/$name" 2>&1 |
+      Tee-Object -FilePath "runs/$run/$name.log"
+    if ($LASTEXITCODE -ne 0) { break }
+}
+~~~
+
+### 训练结束后导出
+
+在启动训练的 V100 终端执行。归档包含整批配置、日志、指标及两组逐样本验证预测。
+
+~~~bash
+tar -czf "runs/$RUN/validation.tar.gz" -C "runs/$RUN" \
+  wide_direct.log theraset_direct.log \
+  wide_direct/{metadata.json,history.jsonl,results.json,best_validation.npz} \
+  theraset_direct/{metadata.json,history.jsonl,results.json,best_validation.npz}
+~~~

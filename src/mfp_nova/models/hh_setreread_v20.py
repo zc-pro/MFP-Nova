@@ -9,7 +9,7 @@ from ..multimodal import function_projection
 from ..research_layers import masked_mean, observed_label_loss
 from .sequence_features import prior_bias
 from .termiscale import endpoint_positions
-from .theraset import MotifCNN
+from .theraset import MotifCNN, motif_classifier
 
 
 class HHSetRereadV20(nn.Module):
@@ -21,14 +21,19 @@ class HHSetRereadV20(nn.Module):
         self.mode = mode
         self.cnn = MotifCNN(vocab_size, cnn_channels, dropout, chemical_evidence=True)
         self.terminal = nn.Linear(2, 64, bias=False)
-        self.local = nn.Linear(self.cnn.output_channels, dim)
+        if mode != "theraset_direct":
+            self.local = nn.Linear(self.cnn.output_channels, dim)
         self.peptide = nn.Sequential(nn.LayerNorm(input_dim), nn.Linear(input_dim, dim)) if peptide_plm else None
         self.position = nn.Linear(4, dim, bias=False)
         self.norm = nn.LayerNorm(dim)
-        self.direct = nn.Sequential(nn.Linear(2 * dim, dim), nn.GELU(), nn.Dropout(dropout), nn.Linear(dim, num_labels))
+        if mode == "theraset_direct":
+            self.context_summary = nn.Linear(2 * dim, self.cnn.output_channels, bias=False)
+            self.direct = motif_classifier(self.cnn.output_channels, num_labels, dropout)
+        else:
+            self.direct = nn.Sequential(nn.Linear(2 * dim, dim), nn.GELU(), nn.Dropout(dropout), nn.Linear(dim, num_labels))
         with torch.no_grad():
             self.direct[-1].bias.copy_(prior_bias(statistics))
-        if mode == "direct":
+        if mode in ("direct", "theraset_direct"):
             return
 
         labels = statistics["labels"]
@@ -62,12 +67,15 @@ class HHSetRereadV20(nn.Module):
             endpoints = torch.stack((mask & (position == 0), mask & last), -1)
             x = x + self.terminal((endpoints & terminal[:, None].bool()).to(x.dtype))
         maps = self.cnn.residue_maps(batch, x)
-        residues = self.local(torch.cat(maps, -1)) + self.position(endpoint_positions(mask))
+        positions = self.position(endpoint_positions(mask))
+        residues = positions if self.mode == "theraset_direct" else self.local(torch.cat(maps, -1)) + positions
         if self.peptide is not None:
             residues = residues + self.peptide(batch["esm"])
         residues = self.norm(residues).masked_fill(~mask[..., None], 0.)
         global_state = torch.cat((masked_mean(residues, mask),
                                   residues.masked_fill(~mask[..., None], -torch.inf).amax(1)), -1)
+        if self.mode == "theraset_direct":
+            global_state = self.cnn.pool_maps(maps, mask) + self.context_summary(global_state)
         return residues, global_state
 
     def read(self, queries, keys, residues, mask):
@@ -78,7 +86,7 @@ class HHSetRereadV20(nn.Module):
     def forward(self, batch):
         residues, global_state = self.encode(batch)
         logits = self.direct(global_state)
-        if self.mode == "direct":
+        if self.mode in ("direct", "theraset_direct"):
             return {"logits": logits}
         mask = batch["mask"]
         keys = self.keys(residues)
@@ -111,7 +119,7 @@ class HHSetRereadV20(nn.Module):
         classification = observed_label_loss(output["logits"], target, self.statistics, weak)
         terms = {"classification": classification}
         loss = classification
-        if self.mode != "direct":
+        if self.mode in ("auxiliary", "full"):
             family_targets, specific, mask = self.supervision(target, batch["aux_y"], batch["aux_mask"])
             family_loss = observed_label_loss(output["family_logits"], family_targets.float(), self.family_statistics, weak)
             detail = F.binary_cross_entropy_with_logits(output["detail_logits"].float(), specific.float(), reduction="none")

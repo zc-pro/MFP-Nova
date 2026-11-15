@@ -83,9 +83,16 @@ class MotifCNN(nn.Module):
 
     def forward(self, batch):
         maps = self.residue_maps(batch)
-        mask = batch["mask"]
-        pooled = torch.cat([h.masked_fill(~mask[..., None], torch.finfo(h.dtype).min).amax(1) for h in maps], -1)
-        return maps, pooled
+        return maps, self.pool_maps(maps, batch["mask"])
+
+    @staticmethod
+    def pool_maps(maps, mask):
+        return torch.cat([h.masked_fill(~mask[..., None], torch.finfo(h.dtype).min).amax(1) for h in maps], -1)
+
+
+def motif_classifier(input_dim, num_labels, dropout):
+    return nn.Sequential(nn.Linear(input_dim, 1024), nn.GELU(), nn.Dropout(dropout),
+                         nn.Linear(1024, 512), nn.GELU(), nn.Dropout(dropout), nn.Linear(512, num_labels))
 
 
 class FactorizedPairs(nn.Module):
@@ -206,8 +213,7 @@ class TheraSet(nn.Module):
                 self.b0_backbone.label_bias.copy_(prior)
             return
         self.cnn = MotifCNN(vocab_size, cnn_channels, dropout, chemical_evidence)
-        self.direct = nn.Sequential(nn.Linear(4*cnn_channels, 1024), nn.GELU(), nn.Dropout(dropout),
-                                    nn.Linear(1024, 512), nn.GELU(), nn.Dropout(dropout), nn.Linear(512, num_labels))
+        self.direct = motif_classifier(self.cnn.output_channels, num_labels, dropout)
         with torch.no_grad():
             self.direct[-1].bias.copy_(prior)
         if not evidence_decoder:
