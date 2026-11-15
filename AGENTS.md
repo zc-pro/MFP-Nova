@@ -24,6 +24,7 @@
 - 0 表示未标注。fine39 的 `__unknown` 是具体亚类未知；预测标签数不等于独立生物学功能数。合成测试不报告为真实模型性能，旧项目成绩不当作新项目成绩。
 - 使用 pathlib；Windows 多进程入口需 main guard。数据、缓存、权重、checkpoint、大型日志、运行输出和密钥不提交普通 Git。
 - 实验只记录必要配置、seed、Git commit、数据标识、最佳 epoch、指标和运行环境。运行目录不静默覆盖，不在运行中的项目目录盲目更新源码；未经授权不修改服务器系统配置或占用共享 GPU。
+- 每次训练或同批对照实验在 `runs/<实验名>_<时间戳>/` 建立独立目录，集中存放启动日志、训练输出、验证结果和打包文件。同批多 seed 或多配置使用该目录下的子目录。以后给出的 Bash、PowerShell 启动命令及结果导出命令均使用此目录布局。
 - 三机连接遵守用户约定：V100 使用 SSH 密码登录，不要求安装公钥；本机与 RTX 5070 不建立 SSH 连接。源码及小型文件经 GitHub 同步：本机与 RTX 5070 使用 HTTPS；V100 按用户最新授权使用 MFP-Nova 专用 Deploy key，通过 SSH 访问 GitHub，支持 pull/push。此授权不改变本机登录 V100 的密码认证，也不为 RTX 5070 启用 SSH。RTX 5070 的大文件通过 UU 远程传输；私钥、密码和 GitHub 登录凭据不写入仓库。
 - 环境按 GPU 适配：V100 用 Conda `--clone` 从 `trifusion_mfp` 创建独立环境 `MFP-Nova`，保留 PyTorch 2.4.1+cu121，不为统一版本升级原环境；RTX 5070 在 Windows 上用 `configs/environment-rtx5070.yaml` 创建 Conda 环境 `MFP-Nova`，使用支持 Blackwell 的构建（当前方案 2.8.0+cu128）。尽量保持主要 Python 依赖和实验协议一致，不要求两机使用相同 CUDA/PyTorch 构建。
 - 以后提供训练命令时，默认同时给出 RTX 5070（Windows PowerShell）与 V100（Ubuntu Bash）两个版本，保持模型、任务、seed及实验协议一致；设备特有的执行设置明确说明。V100 命令支持选择 GPU、CPU 线程，并默认支持关闭 SSH 后继续运行。用户明确指定仅一个平台时遵从该次要求。
