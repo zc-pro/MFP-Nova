@@ -7,6 +7,7 @@ from torch.nn import functional as F
 
 from ..multimodal import function_projection
 from ..research_layers import masked_mean, observed_label_loss
+from . import HH_V20_CHEMICAL_MODES
 from .sequence_features import prior_bias
 from .termiscale import endpoint_positions
 from .theraset import MotifCNN, motif_classifier
@@ -20,6 +21,16 @@ class HHSetRereadV20(nn.Module):
         self.family_statistics = family_statistics
         self.mode = mode
         self.cnn = MotifCNN(vocab_size, cnn_channels, dropout, chemical_evidence=True)
+        if mode in HH_V20_CHEMICAL_MODES:
+            self.direct = motif_classifier(self.cnn.output_channels, num_labels, dropout)
+            with torch.no_grad():
+                self.direct[-1].bias.copy_(prior_bias(statistics))
+            if mode == "chemical_cnn_fusion":
+                self.peptide = nn.Sequential(nn.LayerNorm(input_dim), nn.Linear(input_dim, dim))
+                self.position = nn.Linear(4, dim, bias=False)
+                self.norm = nn.LayerNorm(dim)
+                self.context_summary = nn.Linear(2 * dim, self.cnn.output_channels, bias=False)
+            return
         self.terminal = nn.Linear(2, 64, bias=False)
         if mode != "theraset_direct":
             self.local = nn.Linear(self.cnn.output_channels, dim)
@@ -71,12 +82,16 @@ class HHSetRereadV20(nn.Module):
         residues = positions if self.mode == "theraset_direct" else self.local(torch.cat(maps, -1)) + positions
         if self.peptide is not None:
             residues = residues + self.peptide(batch["esm"])
-        residues = self.norm(residues).masked_fill(~mask[..., None], 0.)
-        global_state = torch.cat((masked_mean(residues, mask),
-                                  residues.masked_fill(~mask[..., None], -torch.inf).amax(1)), -1)
+        residues, global_state = self.summarize(residues, mask)
         if self.mode == "theraset_direct":
             global_state = self.cnn.pool_maps(maps, mask) + self.context_summary(global_state)
         return residues, global_state
+
+    def summarize(self, residues, mask):
+        residues = self.norm(residues).masked_fill(~mask[..., None], 0.)
+        summary = torch.cat((masked_mean(residues, mask),
+                             residues.masked_fill(~mask[..., None], -torch.inf).amax(1)), -1)
+        return residues, summary
 
     def read(self, queries, keys, residues, mask):
         scores = (queries @ keys.transpose(-1, -2)).float() / math.sqrt(keys.shape[-1])
@@ -84,6 +99,14 @@ class HHSetRereadV20(nn.Module):
         return scores.softmax(-1).to(residues.dtype) @ residues
 
     def forward(self, batch):
+        if self.mode in HH_V20_CHEMICAL_MODES:
+            _, pooled = self.cnn(batch)
+            if self.mode == "chemical_cnn_fusion":
+                mask = batch["mask"]
+                residues = self.peptide(batch["esm"]) + self.position(endpoint_positions(mask))
+                _, summary = self.summarize(residues, mask)
+                pooled = pooled + self.context_summary(summary)
+            return {"logits": self.direct(pooled)}
         residues, global_state = self.encode(batch)
         logits = self.direct(global_state)
         if self.mode in ("direct", "theraset_direct"):

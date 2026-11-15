@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
 from .metrics import evaluate_metrics, evaluate_groups, format_epoch, fit_global_threshold, fit_label_thresholds
-from .models import HH_MODELS, HH_V15_RANKER, HH_V16, HH_V17, HH_V20, SEQUENCE_ONLY_MODELS
+from .models import HH_MODELS, HH_V15_RANKER, HH_V16, HH_V17, HH_V20, HH_V20_CHEMICAL_MODES, SEQUENCE_ONLY_MODELS
 from .multimodal import MultimodalData, MultimodalPeptides, collate_multimodal
 from .research_layers import observed_label_loss
 from .consistency import bernoulli_consistency, consistency_weight
@@ -556,6 +556,7 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         raise ValueError("Reconstruction gradient balancing currently supports TriRelay")
     reference_checkpoint = checkpoint or initial
     family_supervision = hh_v20 and config["model"]["mode"] in ("auxiliary", "full")
+    localize_terminals = hh_v20 and config["model"]["mode"] not in HH_V20_CHEMICAL_MODES
     sequence_only = setreread or config["model_name"] in SEQUENCE_ONLY_MODELS
     train_indices = held_indices = None
     if fold is not None:
@@ -565,7 +566,7 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
                            reference_checkpoint["statistics"] if reference_checkpoint else None,
                            config.get("min_factor_support", 20), config.get("max_factors", 32),
                            sequence_only=sequence_only, sequence_chemistry=setreread or hh_v20,
-                           train_indices=train_indices, localize_terminals=hh_v20)
+                           train_indices=train_indices, localize_terminals=localize_terminals)
     if pb and config["model"].get("stage", "A") != "A" and source.data.track in THERAPEP_TRACKS:
         raise ValueError("PB B/C need observed auxiliary inputs; use rich48 or stage A for author sequence tasks")
     if function_aux or family_supervision:
@@ -1349,7 +1350,7 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
     sequence_only = setreread or checkpoint["model_name"] in SEQUENCE_ONLY_MODELS
     source = MultimodalData(data_root, checkpoint["track"], checkpoint["statistics"],
                            sequence_only=sequence_only, sequence_chemistry=setreread or hh_v20,
-                           localize_terminals=hh_v20)
+                           localize_terminals=checkpoint["statistics"].get("localized_terminal_chemistry", False))
     dataset = MultimodalPeptides(source, feature_root, split,
                                   peptide_feature_root=peptide_feature_root or checkpoint["config"]["data"].get("peptide_features"),
                                   sequence_only=sequence_only or (checkpoint["model_name"] == "privilegedbridge" and model.stage == "A"))

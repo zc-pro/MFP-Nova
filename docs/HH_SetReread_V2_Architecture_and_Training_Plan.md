@@ -195,3 +195,46 @@ tar -czf "runs/$RUN/validation.tar.gz" -C "runs/$RUN" \
   wide_direct/{metadata.json,history.jsonl,results.json,best_validation.npz} \
   theraset_direct/{metadata.json,history.jsonl,results.json,best_validation.npz}
 ~~~
+
+## 7. 化学 CNN 与 ESM/位置融合对照
+
+`wide_direct` 和 `theraset_direct` 在首轮主干对照中分别达到 52.24% 和 51.05%。历史 TheraSet `cnn_chemical` 在同一验证集上为 57.78%，训练协议不同。本轮两组复用原 TheraSet 的全局修饰编码、128 通道卷积、逐尺度最大池化和直接头，共享 seed 157 下的 CNN 与分类头初始权重，按 V2.0 协议独立训练。`chemical_cnn` 仅从化学 CNN 读出。`chemical_cnn_fusion` 额外将 ESM150M 与由两端距离及其衰减得到的位置向量相加，按残基做均值与最大池化，投影后加到 CNN 池化向量。以两组在相同验证集的差值衡量融合贡献，同时查看首位、前五多标签覆盖和原正确集合保留数。
+
+### V100 · 两张卡并行
+
+复用上一节 V100 的启动命令，保留 `launch()` 函数和前面的设置，用以下命令替换原来的两行 `launch` 调用。
+
+~~~bash
+RUN="hh_v20_chemical_fine39_s157_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "runs/$RUN"
+launch "${GPUS[0]}" chemical_cnn chemical_cnn
+launch "${GPUS[1]}" chemical_cnn_fusion chemical_cnn_fusion
+~~~
+
+### RTX 5070 · 单卡顺序
+
+复用上一节 Windows 的目录、环境和线程设置，再执行下面的完整训练循环。
+
+~~~powershell
+$run = "hh_v20_chemical_fine39_s157_$(Get-Date -Format yyyyMMdd_HHmmss)"
+New-Item -ItemType Directory -Path "runs/$run" | Out-Null
+foreach ($mode in 'chemical_cnn', 'chemical_cnn_fusion') {
+    python -u -m mfp_nova.cli train --model hh_setreread_v20 --task fine39 `
+      --hh-v20-mode $mode --hh-v20-cnn-channels 128 `
+      --seed 157 --device cuda:0 --precision fp32 --batch-size 64 `
+      --epochs 60 --metric-suite jaccard --name "$run/$mode" 2>&1 |
+      Tee-Object -FilePath "runs/$run/$mode.log"
+    if ($LASTEXITCODE -ne 0) { break }
+}
+~~~
+
+### V100 · 验证对比与打包
+
+~~~bash
+PYTHONPATH="$PWD/src" python scripts/compare_validation_predictions.py \
+    "runs/$RUN/chemical_cnn" "runs/$RUN/chemical_cnn_fusion" | tee "runs/$RUN/paired.json"
+tar -czf "runs/$RUN/${RUN}_validation.tar.gz" -C "runs/$RUN" \
+    paired.json chemical_cnn.log chemical_cnn_fusion.log \
+    chemical_cnn/{metadata.json,history.jsonl,results.json,best_validation.npz} \
+    chemical_cnn_fusion/{metadata.json,history.jsonl,results.json,best_validation.npz}
+~~~

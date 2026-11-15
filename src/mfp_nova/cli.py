@@ -4,7 +4,7 @@ from pathlib import Path
 
 import yaml
 
-from .models import RESEARCH_MODELS, LEGACY_MODELS, HH_MODELS, HH_V15_RANKER, HH_V16, HH_V17, HH_V20
+from .models import RESEARCH_MODELS, LEGACY_MODELS, HH_MODELS, HH_V15_RANKER, HH_V16, HH_V17, HH_V20, HH_V20_CHEMICAL_MODES
 from .metric_protocol import SUITES
 from .models.hypotheses import MODELS as HYPOTHESIS_MODELS
 from .data import TRACKS
@@ -61,8 +61,9 @@ def main(argv=None):
                              help="V1.6 single component, three components, or three with fragment evidence")
             sub.add_argument("--hh-v17-actions", choices=("all", "add", "drop", "swap"),
                              help="V1.7 decision ablation; keep remains available in every mode")
-            sub.add_argument("--hh-v20-mode", choices=("direct", "theraset_direct", "auxiliary", "full"),
-                             help="V2.0 direct, TheraSet CNN/readout control, auxiliary-supervision or hierarchical readout")
+            sub.add_argument("--hh-v20-mode", choices=("direct", "theraset_direct", "auxiliary", "full",
+                                                      *HH_V20_CHEMICAL_MODES),
+                             help="V2.0 readout and supervision ablations")
             sub.add_argument("--hh-v20-cnn-channels", type=int, choices=(64, 128),
                              help="Match V2.0 (64) or TheraSet (128) CNN channels per scale")
             sub.add_argument("--hh-oof-fold", type=int, choices=range(3), help="Train a fresh Fine39 TheraSet for one held-out Train fold")

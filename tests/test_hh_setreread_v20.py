@@ -2,6 +2,7 @@ import torch
 from torch.nn import functional as F
 
 from mfp_nova.models.hh_setreread_v20 import HHSetRereadV20
+from mfp_nova.models.theraset import TheraSet
 from mfp_nova.multimodal import localize_terminal_chemistry
 
 
@@ -67,3 +68,23 @@ def test_matched_modes_padding_and_backward():
             assert net.peptide[1].weight.grad.abs().sum() > 0
         if mode == "full":
             assert net.fine_queries.grad.abs().sum() > 0
+
+    for mode in ("chemical_cnn", "chemical_cnn_fusion"):
+        with torch.random.fork_rng():
+            stats = model().statistics
+            torch.manual_seed(157)
+            reference = TheraSet(8, len(LABELS), 6, stats, cnn_channels=4, dropout=0., evidence_decoder=False)
+            torch.manual_seed(157)
+            net = model(mode).eval()
+        for name, value in reference.state_dict().items():
+            torch.testing.assert_close(net.state_dict()[name], value)
+        output = net(batch)["logits"]
+        torch.testing.assert_close(output, net(padded)["logits"])
+        if mode == "chemical_cnn":
+            torch.testing.assert_close(output, reference(batch)["logits"])
+        loss, terms = net.compute_loss(batch, settings)
+        assert set(terms) == {"classification"} and torch.isfinite(loss)
+        loss.backward()
+        assert net.cnn.convs1[0].weight.grad.abs().sum() > 0
+        if mode == "chemical_cnn_fusion":
+            assert net.context_summary.weight.grad.abs().sum() > 0
