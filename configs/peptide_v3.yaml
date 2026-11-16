@@ -1,0 +1,35 @@
+model_name: peptide_v3
+data:
+  root: data/therapeutic_2025
+  track: fine39
+  augment: false
+encoder:
+  max_length: 80
+model:
+  mode: centered
+  cnn_channels: 128
+  relation_rank: 32
+  dropout: 0.2
+loss:
+  unlabeled_weight: 0.3
+  rdrop: 0.1
+train:
+  seed: 42
+  device: cpu
+  epochs: 100
+  batch_size: 64
+  accumulation_steps: 1
+  precision: fp32
+  learning_rate: 0.0002
+  weight_decay: 0.01
+  patience: 15
+  warmup_epochs: 5
+  rdrop_start_epoch: 6
+  rdrop_ramp_epochs: 5
+  ema_decay: 0.999
+  ema_start_epoch: 6
+  gradient_clip: 5
+  num_workers: 0
+  metric_suite: jaccard
+  export_validation_predictions: true
+  output: runs

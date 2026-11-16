@@ -70,16 +70,21 @@ class MotifCNN(nn.Module):
             x = x + self.d(batch["d"]) + self.chem(batch["residue_chem"]) + global_chem[:, None]
         return x.masked_fill(~batch["mask"][..., None], 0)
 
-    def residue_maps(self, batch, inputs=None):
+    def first_maps(self, batch, inputs=None):
         mask = batch["mask"]
         x = (self.residue_inputs(batch) if inputs is None else inputs).transpose(1, 2)
-        first = [F.gelu(norm(conv(x).transpose(1, 2))).masked_fill(~mask[..., None], 0)
-                 for conv, norm in zip(self.convs1, self.norms1)]
+        return [F.gelu(norm(conv(x).transpose(1, 2))).masked_fill(~mask[..., None], 0)
+                for conv, norm in zip(self.convs1, self.norms1)]
+
+    def second_maps(self, first, mask):
         if not self.convs2:
             return [self.dropout(first[0])]
         x = self.dropout(torch.cat(first, -1)).transpose(1, 2)
         return [self.dropout(F.gelu(norm(conv(x).transpose(1, 2)))).masked_fill(~mask[..., None], 0)
                 for conv, norm in zip(self.convs2, self.norms2)]
+
+    def residue_maps(self, batch, inputs=None):
+        return self.second_maps(self.first_maps(batch, inputs), batch["mask"])
 
     def forward(self, batch):
         maps = self.residue_maps(batch)

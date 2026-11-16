@@ -11,13 +11,14 @@ from pathlib import Path
 
 import yaml
 
-from .models import RESEARCH_MODELS, LEGACY_MODELS, HH_MODELS, HH_V15_RANKER, HH_V16, HH_V17, HH_V20
+from .models import RESEARCH_MODELS, LEGACY_MODELS, HH_MODELS, HH_V15_RANKER, HH_V16, HH_V17, HH_V20, PEPTIDE_V3
 from .data import TRACKS
 from .therapep import configure_task
 
 MODELS = LEGACY_MODELS  # Preserve the original default/all five-model sweep.
-# HH starts from an explicit checkpoint and uses its own matched control runs.
-SUPPORTED_MODELS = tuple(model for model in RESEARCH_MODELS if model not in (*HH_MODELS, HH_V15_RANKER, HH_V16, HH_V17, HH_V20))
+# HH and V3 have their own matched comparison protocols.
+SUPPORTED_MODELS = tuple(model for model in RESEARCH_MODELS
+                         if model not in (*HH_MODELS, HH_V15_RANKER, HH_V16, HH_V17, HH_V20, PEPTIDE_V3))
 TASKS = ("major15", "fine39")  # Keep the existing default/all comparison cohort.
 SEEDS = (42, 101, 202, 303, 404)
 PROJECT = Path(__file__).resolve().parents[2]

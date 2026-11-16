@@ -348,11 +348,38 @@ class MultimodalData:
                    for name in sorted(set(self.source))}}
 
 
+def backbone_inputs(sequence):
+    return {"aa": torch.tensor(["ACDEFGHIKLMNPQRSTVWY".index(c.upper())+1 for c in sequence]),
+            "mask": torch.ones(len(sequence), dtype=torch.bool)}
+
+
 def sequence_inputs(data, i, esm):
-    sequence = data.sequences[i]
-    return {"esm": torch.as_tensor(esm), "aa": torch.tensor(["ACDEFGHIKLMNPQRSTVWY".index(c.upper())+1 for c in sequence]),
-            "mask": torch.ones(len(sequence), dtype=torch.bool),
+    return {"esm": torch.as_tensor(esm), **backbone_inputs(data.sequences[i]),
             "y": torch.from_numpy(data.y[i].astype(np.float32)), "row_id": torch.tensor(int(data.rows[i]))}
+
+
+class BackbonePeptides(Dataset):
+    """Original residues and labels, independent of any language-model cache."""
+
+    def __init__(self, source, split, max_length, limit=None):
+        self.source = source
+        indices = source.data.indices(split)
+        self.indices = diagnostic_indices(source, indices, limit, split == "train") if limit else indices
+        self.lengths = [len(source.data.sequences[i]) for i in self.indices]
+        if self.lengths and max(self.lengths) > max_length:
+            raise ValueError(f"{split} contains a backbone above the {max_length}-residue limit")
+        self.meta = {"name": "aa34", "resolved_revision": "project_residue_encoding", "max_length": max_length,
+                     "length_unit": "residues", "dataset": source.statistics["dataset"]}
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, position):
+        data = self.source.data
+        i, length = self.indices[position], self.lengths[position]
+        tokens = self.source.seq["canonical_tokens"][i, :length]
+        return {"aa": torch.from_numpy(tokens.astype(np.int64)), "mask": torch.ones(length, dtype=torch.bool),
+                "y": torch.from_numpy(data.y[i].astype(np.float32)), "row_id": torch.tensor(int(data.rows[i]))}
 
 
 class MultimodalPeptides(Dataset):

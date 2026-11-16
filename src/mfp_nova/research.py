@@ -16,8 +16,8 @@ from torch.utils.data import DataLoader
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
 from .metrics import evaluate_metrics, evaluate_groups, format_epoch, fit_global_threshold, fit_label_thresholds
-from .models import HH_MODELS, HH_V15_RANKER, HH_V16, HH_V17, HH_V20, HH_V20_CHEMICAL_MODES, SEQUENCE_ONLY_MODELS
-from .multimodal import MultimodalData, MultimodalPeptides, collate_multimodal
+from .models import HH_MODELS, HH_V15_RANKER, HH_V16, HH_V17, HH_V20, HH_V20_CHEMICAL_MODES, PEPTIDE_V3, SEQUENCE_ONLY_MODELS
+from .multimodal import BackbonePeptides, MultimodalData, MultimodalPeptides, backbone_inputs, collate_multimodal
 from .research_layers import observed_label_loss
 from .consistency import bernoulli_consistency, consistency_weight
 from .trainer import seed_everything, write_json
@@ -26,6 +26,9 @@ from .metric_protocol import (FIXED_THRESHOLD_SUITES, JACCARD_ORDER, protocol_de
 
 
 def make_model(name, arguments):
+    if name == PEPTIDE_V3:
+        from .models.peptide_v3 import PeptideV3
+        return PeptideV3(**arguments)
     if name == HH_V20:
         from .models.hh_setreread_v20 import HHSetRereadV20
         return HHSetRereadV20(**arguments)
@@ -376,6 +379,9 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     hh_model = hh or hh_v12
     hh_v16 = config["model_name"] == HH_V16
     hh_v20 = config["model_name"] == HH_V20
+    peptide_v3 = config["model_name"] == PEPTIDE_V3
+    if peptide_v3 and config["data"]["track"] not in ("fine39", "major15", "rich48"):
+        raise ValueError("V3 uses the project Fine39, Major15 or Rich48 split")
     if hh_v20 and config["data"]["track"] != "fine39":
         raise ValueError("HH V2.0 predicts Fine39 and uses Major15 as auxiliary supervision")
     ranker = config["model_name"] == HH_V15_RANKER
@@ -501,7 +507,7 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     if not math.isfinite(rdrop) or rdrop < 0:
         raise ValueError("R-Drop weight must be finite and nonnegative")
     if rdrop:
-        if config["model_name"] not in ("helixset", "theraset", "termiscale", "motifspan", "privilegedbridge", "hh_setreread"):
+        if config["model_name"] not in ("helixset", "theraset", "termiscale", "motifspan", "privilegedbridge", "hh_setreread", PEPTIDE_V3):
             raise ValueError("This model does not support R-Drop")
         if settings.get("rdrop_start_epoch", 6) < 1 or settings.get("rdrop_ramp_epochs", 5) < 1:
             raise ValueError("R-Drop start epoch and ramp length must be positive")
@@ -582,14 +588,17 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         train_indices, oof_scores = load_oof(source.data, settings["oof_files"], diagnostic)
     # Diagnostic optimization subsets retain full original-Train priors/statistics:
     # shrinking the subset must not erase empirical factors or prototype capacity.
-    datasets = [MultimodalPeptides(source, config["data"]["features"], "train" if fold is not None else split, limit,
-                                   config["data"].get("peptide_features"),
-                                   sequence_only=sequence_only or (pb and config["model"].get("stage", "A") == "A"),
-                                   indices=indices) for split, indices in (("train", train_indices), ("val", held_indices))]
-    validate_cache(datasets[0], config, reference_checkpoint["encoder"] if reference_checkpoint else None)
-    validate_cache(datasets[1], config, datasets[0].meta)
-    if datasets[0].meta["dataset"] != source.statistics["dataset"]:
-        raise ValueError("Cache dataset version differs from multimodal data")
+    if peptide_v3:
+        datasets = [BackbonePeptides(source, split, config["encoder"]["max_length"], limit) for split in ("train", "val")]
+    else:
+        datasets = [MultimodalPeptides(source, config["data"]["features"], "train" if fold is not None else split, limit,
+                                       config["data"].get("peptide_features"),
+                                       sequence_only=sequence_only or (pb and config["model"].get("stage", "A") == "A"),
+                                       indices=indices) for split, indices in (("train", train_indices), ("val", held_indices))]
+        validate_cache(datasets[0], config, reference_checkpoint["encoder"] if reference_checkpoint else None)
+        validate_cache(datasets[1], config, datasets[0].meta)
+        if datasets[0].meta["dataset"] != source.statistics["dataset"]:
+            raise ValueError("Cache dataset version differs from multimodal data")
     generator = torch.Generator().manual_seed(settings["seed"])
     num_workers = settings["num_workers"]
     pin_memory = device.type == "cuda" and num_workers > 0
@@ -600,9 +609,9 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
                           pin_memory=pin_memory, collate_fn=collate_multimodal, generator=generator if shuffle else None)
                for data, shuffle in ((training_data, True), (datasets[1], False))]
     print(f"DataLoader | workers={num_workers} pin_memory={pin_memory}", flush=True)
-    args = {"input_dim": datasets[0].meta["input_dim"], "num_labels": len(source.data.labels),
-            "vocab_size": len(source.statistics["chemical_vocab"])+2,
-            "statistics": source.statistics["labels"], **config["model"]}
+    args = {"num_labels": len(source.data.labels), "statistics": source.statistics["labels"], **config["model"]}
+    if not peptide_v3:
+        args.update(input_dim=datasets[0].meta["input_dim"], vocab_size=len(source.statistics["chemical_vocab"])+2)
     if hh_v16:
         args["count_support"] = v16_count_support(source.data)
     if setreread:
@@ -748,7 +757,8 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     if source.data.track == "rich48":
         metadata["label_semantics"] = "48 author functional targets; 0 is unannotated; no therapeutic flag"
         metadata["split_protocol"] = "Author positive members retained; no homology isolation imposed"
-        metadata["modality_scope"] = "Source-matched raw structure/properties and annotation masks; Train-only preprocessing"
+        metadata["modality_scope"] = ("Canonical backbone only" if peptide_v3 else
+                                      "Source-matched raw structure/properties and annotation masks; Train-only preprocessing")
     if getattr(model, "esm_tail", None) is not None:
         metadata["esm_adaptation"] = {
             "mode": "frozen_prefix_cached_trainable_tail_lora",
@@ -1351,10 +1361,13 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
     source = MultimodalData(data_root, checkpoint["track"], checkpoint["statistics"],
                            sequence_only=sequence_only, sequence_chemistry=setreread or hh_v20,
                            localize_terminals=checkpoint["statistics"].get("localized_terminal_chemistry", False))
-    dataset = MultimodalPeptides(source, feature_root, split,
-                                  peptide_feature_root=peptide_feature_root or checkpoint["config"]["data"].get("peptide_features"),
-                                  sequence_only=sequence_only or (checkpoint["model_name"] == "privilegedbridge" and model.stage == "A"))
-    validate_cache(dataset, checkpoint["config"], checkpoint["encoder"])
+    if checkpoint["model_name"] == PEPTIDE_V3:
+        dataset = BackbonePeptides(source, split, checkpoint["encoder"]["max_length"])
+    else:
+        dataset = MultimodalPeptides(source, feature_root, split,
+                                      peptide_feature_root=peptide_feature_root or checkpoint["config"]["data"].get("peptide_features"),
+                                      sequence_only=sequence_only or (checkpoint["model_name"] == "privilegedbridge" and model.stage == "A"))
+        validate_cache(dataset, checkpoint["config"], checkpoint["encoder"])
     loader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_multimodal)
     decision, predicted = None, None
     if joint:
@@ -1464,6 +1477,8 @@ def predict_inputs(checkpoint_path, input_path, device="cpu", batch_size=32, dec
         inputs = {"esm": torch.from_numpy(raw["esm"]).float(),
                   "esm_peptide": torch.from_numpy(raw["esm_peptide"]).float(),
                   "mask": torch.from_numpy(raw["mask"]).bool()}
+    elif checkpoint["model_name"] == PEPTIDE_V3:
+        inputs = {"aa": torch.from_numpy(raw["aa"]).long(), "mask": torch.from_numpy(raw["mask"]).bool()}
     elif checkpoint["model_name"] in ("setreread", HH_V20) and "chemical" not in raw:
         from .multimodal import prepare_sequence_inputs
         inputs = prepare_sequence_inputs(raw, checkpoint["statistics"])
@@ -1545,6 +1560,18 @@ def predict_sequences(checkpoint_path, sequences, device="cpu", decision_path=No
     from .multimodal import prepare_inputs, prepare_sequence_inputs
     model, checkpoint = load_model(checkpoint_path, device)
     info = checkpoint["encoder"]
+    if checkpoint["model_name"] == PEPTIDE_V3:
+        if any(not s or len(s) > info["max_length"] for s in sequences):
+            raise ValueError(f"V3 expects nonempty sequences of at most {info['max_length']} residues")
+        result = []
+        size = checkpoint["config"]["train"]["batch_size"]
+        with torch.inference_mode():
+            for start in range(0, len(sequences), size):
+                selected = sequences[start:start+size]
+                batch = collate_multimodal([backbone_inputs(s) for s in selected])
+                records = model_prediction_records(model, checkpoint, to_device(batch, device), "sequence_only", decision_path)
+                result.extend(dict(record, sequence=s) for record, s in zip(records, selected))
+        return result
     prefix = info.get("representation_layer")
     encoder = FrozenEncoder(info["name"], info["resolved_revision"], info["max_length"], device, prefix)
     peptide = info.get("peptide_encoder")

@@ -5,6 +5,7 @@ from pathlib import Path
 import yaml
 
 from .models import RESEARCH_MODELS, LEGACY_MODELS, HH_MODELS, HH_V15_RANKER, HH_V16, HH_V17, HH_V20, HH_V20_CHEMICAL_MODES
+from .models import PEPTIDE_V3, V3_MODES
 from .metric_protocol import SUITES
 from .models.hypotheses import MODELS as HYPOTHESIS_MODELS
 from .data import TRACKS
@@ -66,6 +67,7 @@ def main(argv=None):
                              help="V2.0 readout and supervision ablations")
             sub.add_argument("--hh-v20-cnn-channels", type=int, choices=(64, 128),
                              help="Match V2.0 (64) or TheraSet (128) CNN channels per scale")
+            sub.add_argument("--v3-mode", choices=V3_MODES, help="V3 sequence interaction ablation")
             sub.add_argument("--hh-oof-fold", type=int, choices=range(3), help="Train a fresh Fine39 TheraSet for one held-out Train fold")
             sub.add_argument("--hh-oof-files", nargs=3, help="Three TheraSet fold exports for HH training")
             sub.add_argument("--annotations", help="B0/H1–H8: aligned NPZ of confirmed label and observation states")
@@ -158,7 +160,7 @@ def main(argv=None):
     summarize.add_argument("--split", choices=("val", "test"), default="val")
     summarize.add_argument("--output", help="Optional JSON; otherwise print")
     gpu_check = commands.add_parser("gpu-check", help="Real-cache full-model server probes and bounded short training")
-    gpu_check.add_argument("--models", nargs="+", choices=tuple(m for m in RESEARCH_MODELS if m not in ("hh_setreread_v13", "hh_setreread_v14", HH_V15_RANKER, HH_V17)),
+    gpu_check.add_argument("--models", nargs="+", choices=tuple(m for m in RESEARCH_MODELS if m not in ("hh_setreread_v13", "hh_setreread_v14", HH_V15_RANKER, HH_V17, PEPTIDE_V3)),
                            default=list(LEGACY_MODELS))
     gpu_check.add_argument("--tasks", nargs="+", choices=TRACKS, default=["major15", "fine39"])
     gpu_check.add_argument("--esm", choices=("35m", "650m"), default="650m")
@@ -204,6 +206,12 @@ def main(argv=None):
         config_path = args.config or f"configs/{model_name}.yaml"
         config = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
         if args.command == "train":
+            if args.v3_mode is not None:
+                if model_name != PEPTIDE_V3 or args.resume:
+                    parser.error("--v3-mode requires a fresh peptide_v3 run")
+                config["model"]["mode"] = args.v3_mode
+            if model_name == PEPTIDE_V3 and (args.esm or args.feature_root or args.peptide_feature_root):
+                parser.error("peptide_v3 uses the backbone sequence directly")
             if args.theraset_b0_backbone or args.theraset_b0_local_max or args.theraset_b0_local_cnn:
                 if args.model != "theraset":
                     parser.error("TheraSet B0 comparisons require --model theraset")
@@ -396,7 +404,7 @@ def main(argv=None):
                 if value is not None:
                     config["train"][key] = value
             if args.rdrop_weight is not None:
-                if model_name not in ("helixset", "theraset", "termiscale", "motifspan", "privilegedbridge", "hh_setreread"):
+                if model_name not in ("helixset", "theraset", "termiscale", "motifspan", "privilegedbridge", "hh_setreread", PEPTIDE_V3):
                     raise ValueError("This model does not support R-Drop")
                 config["loss"]["rdrop"] = args.rdrop_weight
             if args.loss is not None:
@@ -458,7 +466,9 @@ def main(argv=None):
             from .research import evaluate
         else:
             from .inference import evaluate
-        feature_root = args.feature_root or checkpoint["config"]["data"]["features"]
+        if checkpoint.get("model_name") == PEPTIDE_V3 and (args.feature_root or args.peptide_feature_root):
+            parser.error("peptide_v3 uses the backbone sequence directly")
+        feature_root = args.feature_root or checkpoint["config"]["data"].get("features")
         batch_size = args.batch_size or checkpoint["config"]["train"].get("batch_size", 128)
         extra = {}
         if args.hh_diagnostics:
