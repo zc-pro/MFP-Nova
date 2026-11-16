@@ -13,6 +13,10 @@
 
 ## 当前研究
 
+### V4.0 · 固定组成的功能条件残基顺序
+
+`--model theraset --v4-mode baseline|background|conditional` 在原 Fine39 划分上比较强基线、顺序分支及功能条件残基监督。[V4.0 架构书与双平台训练命令](docs/MFP-Nova-V4-Architecture.md)
+
 ### HH-SetReread V2.0 · 家族监督与细标签局部证据
 
 `--model hh_setreread_v20` 从肽输入直接预测 Fine39。用家族与记录细化监督训练共享化学序列表示，独立读取家族内各具体标签的局部证据。见 [V2.0 架构与双平台训练命令](docs/HH_SetReread_V2_Architecture_and_Training_Plan.md)。

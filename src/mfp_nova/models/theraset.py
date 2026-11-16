@@ -197,13 +197,17 @@ class TheraSet(nn.Module):
                  prototype_bank=32, peptide_input_dim=0, evidence_decoder=True,
                  contextual_evidence=True, property_evidence=True, structure_evidence=True,
                  chemical_evidence=True, pair_readout=True, prototype_readout=True,
-                 label_context=True, b0_backbone=False, b0_local_max=False, b0_local_cnn=False):
+                 label_context=True, b0_backbone=False, b0_local_max=False, b0_local_cnn=False,
+                 order_evidence=False):
         super().__init__()
         self.statistics = statistics
         self.evidence_decoder = evidence_decoder
         self.contextual_evidence, self.property_evidence = contextual_evidence, property_evidence
         self.structure_evidence, self.chemical_evidence = structure_evidence, chemical_evidence
         self.pair_readout, self.prototype_readout, self.label_context = pair_readout, prototype_readout, label_context
+        self.order_evidence = None
+        if order_evidence and not evidence_decoder:
+            raise ValueError("Residue order evidence requires the TheraSet evidence decoder")
         prior = torch.tensor(statistics["observed_prior"]).clamp(1e-4, 1-1e-4).logit()
         self.b0_backbone = None
         if b0_backbone:
@@ -249,8 +253,12 @@ class TheraSet(nn.Module):
         self.correction_gate = nn.Linear(2*dim, 1)
         nn.init.zeros_(self.correction_gate.weight)
         nn.init.constant_(self.correction_gate.bias, -2.)
+        if order_evidence:
+            from .residue_order import ResidueOrderEvidence
+            self.order_evidence = ResidueOrderEvidence(statistics["support"], dim)
 
-    def forward(self, batch, return_evidence=False, return_residues=False, return_states=False):
+    def forward(self, batch, return_evidence=False, return_residues=False, return_states=False,
+                order_update=None):
         if self.b0_backbone is not None:
             logits = self.b0_backbone(batch["aa"], batch["mask"]).logits
             return {"logits": logits, "direct": logits}
@@ -306,6 +314,11 @@ class TheraSet(nn.Module):
                 query, query_mask, motifs, context, context_mask, properties, property_mask,
                 geometry, geometry_mask, reliability, residues, pairs, geometric_pairs, pair_quality,
                 mask, source_present, self.pair_readout, self.label_context)
+        if self.order_evidence is not None:
+            if order_update is None:
+                order_update, _ = self.order_evidence(batch["aa"], mask)
+            update = order_update[:, :, None, :] * self.active[None, :, :, None]
+            query = query + update.flatten(1, 2)
         states = self.output_norm(query).reshape(b, *self.active.shape, -1)
         scores = (states*self.label_weights[None, :, None]).sum(-1)
         # Normalized log-mean-exp: adding identical active prototypes cannot raise logits.
@@ -339,14 +352,21 @@ class TheraSet(nn.Module):
 
     def compute_loss(self, batch, settings, return_output=False):
         view = training_views(batch, settings.get("modality_dropout", .1), 0.)[0] if self.training else batch
-        output = self(view)
+        options, order_terms = {}, {}
+        if self.order_evidence is not None:
+            # R-Drop shares the deterministic AA-only branch across its two views.
+            order_update, totals = self.order_evidence(batch["aa"], batch["mask"], batch["y"])
+            options["order_update"] = order_update
+            order_terms = {key: numerator / denominator.clamp_min(1e-8)
+                           for key, (numerator, denominator) in totals.items()}
+        output = self(view, **options)
         def supervised(prediction):
             return self.supervised_terms(prediction, batch["y"], settings.get("unlabeled_weight", .3))
         terms = supervised(output)
         agreement = output["logits"].sum()*0
         if self.training and settings.get("rdrop", 0)>0:
             from ..consistency import bernoulli_rdrop
-            second = self(view)
+            second = self(view, **options)
             other = supervised(second)
             terms = {key: .5*(value+other[key]) for key, value in terms.items()}
             agreement = bernoulli_rdrop(output["logits"], second["logits"])
@@ -356,4 +376,7 @@ class TheraSet(nn.Module):
                 total = total + settings.get(key, default)*terms[key]
         terms["rdrop"] = agreement
         total = total + settings.get("rdrop", 0)*agreement
+        for key, value in order_terms.items():
+            total = total + settings.get(key, 0.) * value
+        terms.update(order_terms)
         return (total, terms, output) if return_output else (total, terms)

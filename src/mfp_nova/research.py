@@ -101,16 +101,24 @@ def autocast_context(device, precision="fp32"):
 
 @torch.inference_mode()
 def predict_loader(model, loader, device, precision="fp32", loss_settings=None, decode_sets=False,
-                   include_auxiliary=False):
+                   include_auxiliary=False, residue_nll=None):
     model.eval()
     targets, probabilities, decisions, count_decisions = [], [], [], []
     component_weights, component_counts = [], []
     auxiliary = []
     loss_total, rows = 0., 0
+    residue_totals = {}
     for batch in loader:
         moved = to_device(batch, device)
         with autocast_context(device, precision):
-            output = model(moved)
+            if residue_nll is None:
+                output = model(moved)
+            else:
+                update, totals = model.order_evidence(moved["aa"], moved["mask"], moved["y"])
+                output = model(moved, order_update=update)
+                for key, (numerator, denominator) in totals.items():
+                    old_numerator, old_denominator = residue_totals.get(key, (0, 0))
+                    residue_totals[key] = old_numerator + numerator, old_denominator + denominator
             if loss_settings is not None:
                 if decode_sets:
                     loss = model.set_nll(output, moved["y"]).mean()
@@ -134,6 +142,10 @@ def predict_loader(model, loader, device, precision="fp32", loss_settings=None, 
             component_counts.append((weight[..., None] * count).sum(0).cpu().numpy())
         else:
             probabilities.append(output["logits"].float().sigmoid().cpu().numpy())
+    if residue_nll is not None:
+        for key, (numerator, denominator) in residue_totals.items():
+            denominator = float(denominator)
+            residue_nll[key] = float(numerator) / denominator if denominator else None
     result = np.concatenate(targets), np.concatenate(probabilities)
     if loss_settings is not None:
         result = (*result, loss_total / rows)
@@ -808,8 +820,10 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
                          if fold is None else {})
 
     def collect_validation(candidate):
-        values = predict_loader(candidate, loaders[1], device, precision, config["loss"], decode_sets=hh_v16)
-        return values if hh_v16 else (*values, None, None, None)
+        residue_nll = {} if getattr(candidate, "order_evidence", None) is not None else None
+        values = predict_loader(candidate, loaders[1], device, precision, config["loss"],
+                                decode_sets=hh_v16, residue_nll=residue_nll)
+        return values if hh_v16 else (*values, None, None, residue_nll)
 
     epoch = checkpoint["epoch"] if checkpoint else 0
     if suite == "jaccard" and checkpoint is None and fold is None and not hh_v16:
@@ -1024,6 +1038,8 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
                            train_metrics_scope="online_auxiliary_label_logits",
                            v16_phase="frozen" if model.backbone_frozen else "joint",
                            v16_head_lr=optimizer.param_groups[-1]["lr"], joint_components=components)
+        elif components is not None:
+            history["validation_order_nll"] = components
         if getattr(model, "esm_tail", None) is not None:
             history["esm_lr"] = optimizer.param_groups[1]["lr"]
         if pb and model.stage == "C":
@@ -1171,6 +1187,10 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
                       joint_components=components)
     if setreread:
         result["correction_active"] = bool(model.correction_active)
+    if "v4_mode" in settings:
+        result["v4_mode"] = settings["v4_mode"]
+    if not hh_v16 and components is not None:
+        result["validation_order_nll"] = components
     export_predictions = settings.get("export_validation_predictions", False)
     if export_predictions:
         result["validation_predictions"] = export_validation(
@@ -1370,6 +1390,7 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
         validate_cache(dataset, checkpoint["config"], checkpoint["encoder"])
     loader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_multimodal)
     decision, predicted = None, None
+    residue_nll = {} if getattr(model, "order_evidence", None) is not None else None
     if joint:
         joint_outputs = predict_loader(model, loader, device, decode_sets=True, include_auxiliary=hh_diagnostics)
         y, probabilities, predicted, count_predicted, components = joint_outputs[:5]
@@ -1390,7 +1411,7 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
             y, probabilities = extra_outputs.pop("targets"), extra_outputs.pop("probabilities")
     else:
         extra_outputs = {}
-        y, probabilities = predict_loader(model, loader, device)
+        y, probabilities = predict_loader(model, loader, device, residue_nll=residue_nll)
     threshold = checkpoint["threshold"]
     if decision_path:
         from .decisions import apply_decision
@@ -1407,6 +1428,8 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
               "metrics": evaluate_metrics(y, probabilities, threshold, source.statistics['labels']['support'],
                   source.statistics['function_projection'], predicted), "groups": grouped,
               "annotation_based_metrics": True, "experimental_structure_group": None}
+    if residue_nll is not None:
+        result["order_nll"] = residue_nll
     if hasattr(model, "evidence_partition"):
         fusion_mode = model.evidence_partition.fusion
         ablation_scope = {

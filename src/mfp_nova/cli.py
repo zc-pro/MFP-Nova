@@ -68,6 +68,8 @@ def main(argv=None):
             sub.add_argument("--hh-v20-cnn-channels", type=int, choices=(64, 128),
                              help="Match V2.0 (64) or TheraSet (128) CNN channels per scale")
             sub.add_argument("--v3-mode", choices=V3_MODES, help="V3 sequence interaction ablation")
+            sub.add_argument("--v4-mode", choices=("baseline", "background", "conditional"),
+                             help="TheraSet V4 A/B/C: original, residue order, or function-conditioned NLL")
             sub.add_argument("--hh-oof-fold", type=int, choices=range(3), help="Train a fresh Fine39 TheraSet for one held-out Train fold")
             sub.add_argument("--hh-oof-files", nargs=3, help="Three TheraSet fold exports for HH training")
             sub.add_argument("--annotations", help="B0/H1–H8: aligned NPZ of confirmed label and observation states")
@@ -196,6 +198,8 @@ def main(argv=None):
         write_json(args.output, result)
         print(json.dumps({"original_rows": result["original_rows"], "tracks": result["tracks"]}, ensure_ascii=False, indent=2))
     elif args.command == "train" and args.model in HYPOTHESIS_MODELS:
+        if args.v4_mode is not None:
+            parser.error("--v4-mode requires --model theraset")
         if args.theraset_b0_backbone or args.theraset_b0_local_max or args.theraset_b0_local_cnn:
             parser.error("TheraSet B0 comparisons require --model theraset")
         from .hypothesis import train_from_cli
@@ -206,6 +210,18 @@ def main(argv=None):
         config_path = args.config or f"configs/{model_name}.yaml"
         config = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
         if args.command == "train":
+            if args.v4_mode is not None:
+                if (model_name != "theraset" or args.resume or args.hh_oof_fold is not None
+                        or args.initialize_from or config["train"].get("initialize_from")):
+                    parser.error("--v4-mode requires a fresh TheraSet comparison run")
+                order_evidence = args.v4_mode != "baseline"
+                config["data"]["track"] = "fine39"
+                config["model"].update(label_context=False, prototype_readout=False,
+                                       order_evidence=order_evidence)
+                config["loss"].update(order_background=.01 if order_evidence else 0.,
+                                      order_conditional=.01 if args.v4_mode == "conditional" else 0.)
+                config["train"].update(v4_mode=args.v4_mode, batch_size=64,
+                                       accumulation_steps=1, metric_suite="micro_f1")
             if args.v3_mode is not None:
                 if model_name != PEPTIDE_V3 or args.resume:
                     parser.error("--v3-mode requires a fresh peptide_v3 run")
