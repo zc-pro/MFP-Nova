@@ -40,6 +40,18 @@ def sample_jaccard(targets, prediction):
     return np.divide(intersection, union, out=np.zeros(len(targets)), where=union != 0)
 
 
+def paired_cluster_interval(differences, clusters):
+    _, indices = np.unique(clusters, return_inverse=True)
+    totals = np.bincount(indices, weights=differences)
+    counts = np.bincount(indices)
+    rng = np.random.default_rng(42)
+    resampled = []
+    for _ in range(20):
+        draw = rng.integers(len(counts), size=(100, len(counts)))
+        resampled.append(totals[draw].sum(1) / counts[draw].sum(1))
+    return (100 * np.quantile(np.concatenate(resampled), [.025, .975])).round(3).tolist()
+
+
 def rank_diagnostics(targets, a_probs, a_pred, b_probs, b_pred, projection):
     a_score = sample_jaccard(targets, a_pred)
     b_score = sample_jaccard(targets, b_pred)
@@ -84,6 +96,14 @@ def rank_diagnostics(targets, a_probs, a_pred, b_probs, b_pred, projection):
         "exact_set_matches": {"baseline": int((a_score == 1).sum()), "candidate": int((b_score == 1).sum()),
                               "preserved": int(((a_score == 1) & (b_score == 1)).sum())},
         "baseline_zero_overlap_recovered": int(((a_score == 0) & (b_score > 0)).sum()),
+        "baseline_zero_overlap_top5": {
+            "rows": int((a_score == 0).sum()),
+            "baseline_hits": int(((a_score == 0) & (a_hits[:, 4] > 0)).sum()),
+            "candidate_hits": int(((a_score == 0) & (b_hits[:, 4] > 0)).sum()),
+            "high_confidence_rows": int(((a_score == 0) & (a_probs.max(1) >= .9)).sum()),
+            "high_confidence_candidate_hits": int(((a_score == 0) & (a_probs.max(1) >= .9)
+                                                   & (b_hits[:, 4] > 0)).sum()),
+        },
         "baseline_positive_overlap_lost": int(((a_score > 0) & (b_score == 0)).sum()),
         "oracle_fixed_sets_and_top_1_to_6": percent_pair(original.mean(), expanded.mean()),
         "oracle_improved_rows": int((expanded > original).sum()),
@@ -162,6 +182,8 @@ def compare(data, baseline_run, candidate_run):
     b_mfp = independent_functions(b_pred, projection).sum(1) >= 2
     return {"baseline": str(baseline_run), "candidate": str(candidate_run), "rows": len(rows),
             "jaccard": percent_pair(a_score.mean(), b_score.mean()),
+            "jaccard_paired_cluster_95pct_interval_pp": paired_cluster_interval(
+                b_score - a_score, data.clusters[rows]),
             "macro_ap": percent_pair(np.mean(a_label_ap), np.mean(b_label_ap)),
             "micro_f1": percent_pair(f1_score(targets, a_pred, average="micro", zero_division=0),
                                      f1_score(targets, b_pred, average="micro", zero_division=0)),

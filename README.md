@@ -13,6 +13,10 @@
 
 ## 当前研究
 
+### V5.0 · 三路独立取证与功能关系查询
+
+在保留 CNN 局部特征与冻结 ESM 上下文的基础上，检验分开读出能否保留互补信息，以及功能语义邻接能否改善残基级取证。[V5.0 架构书](docs/MFP-Nova-V5-Architecture.md)
+
 ### V4.0 · 固定组成的功能条件残基顺序
 
 `--model theraset --v4-mode baseline|background|conditional` 在原 Fine39 划分上比较强基线、顺序分支及功能条件残基监督。[V4.0 架构书与双平台训练命令](docs/MFP-Nova-V4-Architecture.md)

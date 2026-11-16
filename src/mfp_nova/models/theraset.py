@@ -198,7 +198,7 @@ class TheraSet(nn.Module):
                  contextual_evidence=True, property_evidence=True, structure_evidence=True,
                  chemical_evidence=True, pair_readout=True, prototype_readout=True,
                  label_context=True, b0_backbone=False, b0_local_max=False, b0_local_cnn=False,
-                 order_evidence=False):
+                 order_evidence=False, v5_mode=None):
         super().__init__()
         self.statistics = statistics
         self.evidence_decoder = evidence_decoder
@@ -206,6 +206,9 @@ class TheraSet(nn.Module):
         self.structure_evidence, self.chemical_evidence = structure_evidence, chemical_evidence
         self.pair_readout, self.prototype_readout, self.label_context = pair_readout, prototype_readout, label_context
         self.order_evidence = None
+        self.v5_readout = None
+        if v5_mode is not None and (not evidence_decoder or order_evidence):
+            raise ValueError("V5 readouts require the evidence encoder and their own training path")
         if order_evidence and not evidence_decoder:
             raise ValueError("Residue order evidence requires the TheraSet evidence decoder")
         prior = torch.tensor(statistics["observed_prior"]).clamp(1e-4, 1-1e-4).logit()
@@ -222,9 +225,10 @@ class TheraSet(nn.Module):
                 self.b0_backbone.label_bias.copy_(prior)
             return
         self.cnn = MotifCNN(vocab_size, cnn_channels, dropout, chemical_evidence)
-        self.direct = motif_classifier(self.cnn.output_channels, num_labels, dropout)
-        with torch.no_grad():
-            self.direct[-1].bias.copy_(prior)
+        if v5_mode is None:
+            self.direct = motif_classifier(self.cnn.output_channels, num_labels, dropout)
+            with torch.no_grad():
+                self.direct[-1].bias.copy_(prior)
         if not evidence_decoder:
             return
         self.motif_projections = nn.ModuleList([nn.Linear(cnn_channels, dim) for _ in range(4)])
@@ -238,6 +242,10 @@ class TheraSet(nn.Module):
         self.global_geometry = nn.Linear(50, dim)
         self.pairs = FactorizedPairs(dim, pair_dim)
         self.residue_norm = nn.LayerNorm(dim)
+        if v5_mode is not None:
+            from .theraset_v5 import V5Readout
+            self.v5_readout = V5Readout(statistics["labels"], prior, dim, heads, pair_dim, dropout, v5_mode)
+            return
         self.label_queries = nn.Parameter(torch.randn(num_labels, dim)*.02)
         self.prototype_bank = nn.Parameter(torch.randn(prototype_bank, dim)*.1)
         self.prototype_coefficients = nn.Parameter(torch.randn(num_labels, prototype_count, prototype_bank)*.2)
@@ -257,17 +265,9 @@ class TheraSet(nn.Module):
             from .residue_order import ResidueOrderEvidence
             self.order_evidence = ResidueOrderEvidence(statistics["support"], dim)
 
-    def forward(self, batch, return_evidence=False, return_residues=False, return_states=False,
-                order_update=None):
-        if self.b0_backbone is not None:
-            logits = self.b0_backbone(batch["aa"], batch["mask"]).logits
-            return {"logits": logits, "direct": logits}
-        maps, pooled = self.cnn(batch)
-        direct = self.direct(pooled)
-        if not self.evidence_decoder:
-            return {"logits": direct, "direct": direct}
+    def encode_evidence(self, batch, maps):
         mask = batch["mask"]
-        b, length = mask.shape
+        length = mask.shape[1]
         motifs = [projection(h)*mask[..., None] for projection, h in zip(self.motif_projections, maps)]
         context_batch = batch
         if not self.chemical_evidence:
@@ -298,22 +298,41 @@ class TheraSet(nn.Module):
         mean_quality = reliability.sum(1, keepdim=True)/structural.sum(1, keepdim=True).clamp_min(1)
         reliability = torch.cat([reliability, mean_quality], 1)
         # Geometry stays separate from residues, preserving a clean sequence route.
-        residues = self.residue_norm(sum(motifs)/4 + context[:, :length])*mask[..., None]
+        residues = sum(motifs) / 4
+        if self.v5_readout is None:
+            residues = residues + context[:, :length]
+        residues = self.residue_norm(residues) * mask[..., None]
         pairs, geometric_pairs, pair_quality = self.pairs(residues, batch, structural, reliability[:, :length])
+        source_present = torch.stack([mask.any(1), context_mask.any(1), property_mask.any(1),
+                                      (reliability*geometry_mask).sum(1)>0,
+                                      (mask.sum(1)>1) & self.pair_readout], -1)
+        return (motifs, context, context_mask, properties, property_mask, geometry, geometry_mask,
+                reliability, residues, pairs, geometric_pairs, pair_quality, mask, source_present)
+
+    def forward(self, batch, return_evidence=False, return_residues=False, return_states=False,
+                order_update=None, use_relation=True, without_view=None):
+        if self.b0_backbone is not None:
+            logits = self.b0_backbone(batch["aa"], batch["mask"]).logits
+            return {"logits": logits, "direct": logits}
+        maps, pooled = self.cnn(batch)
+        if self.v5_readout is not None:
+            return self.v5_readout(self.encode_evidence(batch, maps), self.global_projection(pooled),
+                                   use_relation, without_view)
+        direct = self.direct(pooled)
+        if not self.evidence_decoder:
+            return {"logits": direct, "direct": direct}
+        memory = self.encode_evidence(batch, maps)
+        residues, mask = memory[8], memory[-2]
+        b, length = mask.shape
         prototype = self.prototype_coefficients.softmax(-1) @ self.prototype_bank
         queries = self.label_queries[:, None] + prototype
         global_state = self.global_projection(pooled)
         query = (queries[None] + global_state[:, None, None]).flatten(1, 2)
         query_mask = self.active.flatten()[None].expand(b, -1)
         query = query*query_mask[..., None]
-        source_present = torch.stack([mask.any(1), context_mask.any(1), property_mask.any(1),
-                                      (reliability*geometry_mask).sum(1)>0,
-                                      (mask.sum(1)>1) & self.pair_readout], -1)
         for block in self.decoder:
             query, scales, routing, pair_attention = block(
-                query, query_mask, motifs, context, context_mask, properties, property_mask,
-                geometry, geometry_mask, reliability, residues, pairs, geometric_pairs, pair_quality,
-                mask, source_present, self.pair_readout, self.label_context)
+                query, query_mask, *memory, self.pair_readout, self.label_context)
         if self.order_evidence is not None:
             if order_update is None:
                 order_update, _ = self.order_evidence(batch["aa"], mask)
@@ -345,7 +364,12 @@ class TheraSet(nn.Module):
 
     def supervised_terms(self, output, targets, unknown_weight):
         terms = {"classification": observed_label_loss(output["logits"], targets, self.statistics, unknown_weight)}
-        if self.evidence_decoder:
+        if self.v5_readout is not None:
+            view_targets = targets[:, None].expand_as(output["view_logits"])
+            view_mask = output["view_available"][:, :, None].expand_as(view_targets)
+            terms["views"] = observed_label_loss(output["view_logits"], view_targets, self.statistics,
+                                                 unknown_weight, view_mask)
+        elif self.evidence_decoder:
             for key, logits in (("direct", output["direct"]), ("evidence", output["evidence_logits"])):
                 terms[key] = observed_label_loss(logits, targets, self.statistics, unknown_weight)
         return terms
@@ -371,7 +395,7 @@ class TheraSet(nn.Module):
             terms = {key: .5*(value+other[key]) for key, value in terms.items()}
             agreement = bernoulli_rdrop(output["logits"], second["logits"])
         total = terms["classification"]
-        for key, default in (("direct", .2), ("evidence", .1)):
+        for key, default in (("direct", .2), ("evidence", .1), ("views", .2)):
             if key in terms:
                 total = total + settings.get(key, default)*terms[key]
         terms["rdrop"] = agreement

@@ -101,18 +101,19 @@ def autocast_context(device, precision="fp32"):
 
 @torch.inference_mode()
 def predict_loader(model, loader, device, precision="fp32", loss_settings=None, decode_sets=False,
-                   include_auxiliary=False, residue_nll=None):
+                   include_auxiliary=False, residue_nll=None, view_outputs=None, v5_forward=None):
     model.eval()
     targets, probabilities, decisions, count_decisions = [], [], [], []
     component_weights, component_counts = [], []
     auxiliary = []
     loss_total, rows = 0., 0
     residue_totals = {}
+    view_probabilities, view_available = [], []
     for batch in loader:
         moved = to_device(batch, device)
         with autocast_context(device, precision):
             if residue_nll is None:
-                output = model(moved)
+                output = model(moved, **(v5_forward or {}))
             else:
                 update, totals = model.order_evidence(moved["aa"], moved["mask"], moved["y"])
                 output = model(moved, order_update=update)
@@ -142,6 +143,13 @@ def predict_loader(model, loader, device, precision="fp32", loss_settings=None, 
             component_counts.append((weight[..., None] * count).sum(0).cpu().numpy())
         else:
             probabilities.append(output["logits"].float().sigmoid().cpu().numpy())
+        if view_outputs is not None:
+            view_probabilities.append(output["view_logits"].sigmoid().cpu().numpy())
+            view_available.append(output["view_available"].cpu().numpy())
+    if view_outputs is not None:
+        from .models.theraset_v5 import V5_VIEWS
+        view_outputs.update(view_probabilities=np.concatenate(view_probabilities),
+                            view_available=np.concatenate(view_available), view_names=np.array(V5_VIEWS))
     if residue_nll is not None:
         for key, (numerator, denominator) in residue_totals.items():
             denominator = float(denominator)
@@ -177,7 +185,7 @@ def v16_count_support(data):
 
 
 def export_validation(run, stem, source, dataset, y, probabilities, threshold, epoch, weight_source, objective,
-                      predicted=None, count_predicted=None):
+                      predicted=None, count_predicted=None, view_outputs=None):
     """Reuse collected Val predictions; no extra model forward or Test access."""
     rows = dataset.indices
     path = run/f"{stem}_validation.npz"
@@ -187,7 +195,7 @@ def export_validation(run, stem, source, dataset, y, probabilities, threshold, e
                         cluster_id=source.data.clusters[rows], targets=y, probabilities=probabilities,
                         label_names=np.array(source.data.labels), threshold=threshold, split="val",
                         task=source.data.track, epoch=epoch, weight_source=weight_source,
-                        selection_objective=objective, **extra)
+                        selection_objective=objective, **extra, **(view_outputs or {}))
     actual = y.astype(bool)
     predicted = probabilities >= threshold if predicted is None else predicted
     from .multimodal import independent_functions
@@ -819,10 +827,10 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     validation_groups = (source.groups(datasets[1].indices, source.data.y[datasets[1].indices])
                          if fold is None else {})
 
-    def collect_validation(candidate):
+    def collect_validation(candidate, view_outputs=None):
         residue_nll = {} if getattr(candidate, "order_evidence", None) is not None else None
         values = predict_loader(candidate, loaders[1], device, precision, config["loss"],
-                                decode_sets=hh_v16, residue_nll=residue_nll)
+                                decode_sets=hh_v16, residue_nll=residue_nll, view_outputs=view_outputs)
         return values if hh_v16 else (*values, None, None, residue_nll)
 
     epoch = checkpoint["epoch"] if checkpoint else 0
@@ -1154,7 +1162,8 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         torch.save(fold_checkpoint, run/"best.pt")
         return export_fold(run, selected, loaders[1], device, fold, epoch, diagnostic, time.perf_counter()-started)
     restore_model_state(model, best_state)
-    y, probabilities, validation_loss, predicted, count_predicted, components = collect_validation(model)
+    view_outputs = {} if getattr(model, "v5_readout", None) is not None else None
+    y, probabilities, validation_loss, predicted, count_predicted, components = collect_validation(model, view_outputs)
     threshold = final_threshold(y, probabilities, suite, settings.get("threshold_strategy", "global"))
     torch.save({**static, "model_state": best_state, "best_epoch": best_epoch, "threshold": threshold,
                 "weight_source": best_weights}, run/"best.pt")
@@ -1189,13 +1198,21 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         result["correction_active"] = bool(model.correction_active)
     if "v4_mode" in settings:
         result["v4_mode"] = settings["v4_mode"]
+    if "v5_mode" in settings:
+        result["v5_mode"] = settings["v5_mode"]
+    if getattr(model, "v5_readout", None) is not None and model.v5_readout.relation is not None:
+        from .models.theraset_v5 import function_adjacency
+        actual = model.v5_readout.relation.cpu().numpy() > 0
+        semantic = function_adjacency(source.data.labels)
+        result["v5_graph"] = {"undirected_edges": int(actual.sum() // 2),
+                              "overlap_with_semantic": float((actual & semantic).sum() / max(actual.sum(), 1))}
     if not hh_v16 and components is not None:
         result["validation_order_nll"] = components
     export_predictions = settings.get("export_validation_predictions", False)
     if export_predictions:
         result["validation_predictions"] = export_validation(
             run, "best", source, datasets[1], y, probabilities, threshold, best_epoch, best_weights, suite,
-            predicted=predicted, count_predicted=count_predicted)
+            predicted=predicted, count_predicted=count_predicted, view_outputs=view_outputs)
     if save_candidates and alternate_best is not None:
         candidate = alternate_best
         alternate_path = run/f"{alternate_stem}.pt"
@@ -1355,7 +1372,7 @@ def hh_v12_validation_report(y, arrays, statistics):
 
 
 def evaluate(checkpoint_path, data_root, feature_root, split, device, output, predictions=None, batch_size=32, decision_path=None,
-             without_private_evidence=False, peptide_feature_root=None, hh_diagnostics=False):
+             without_private_evidence=False, peptide_feature_root=None, hh_diagnostics=False, v5_forward=None):
     model, checkpoint = load_model(checkpoint_path, device)
     joint = checkpoint["model_name"] == HH_V16
     if joint and (decision_path or (hh_diagnostics and split != "val")):
@@ -1411,7 +1428,9 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
             y, probabilities = extra_outputs.pop("targets"), extra_outputs.pop("probabilities")
     else:
         extra_outputs = {}
-        y, probabilities = predict_loader(model, loader, device, residue_nll=residue_nll)
+        view_outputs = extra_outputs if predictions and getattr(model, "v5_readout", None) is not None else None
+        y, probabilities = predict_loader(model, loader, device, residue_nll=residue_nll,
+                                          view_outputs=view_outputs, v5_forward=v5_forward)
     threshold = checkpoint["threshold"]
     if decision_path:
         from .decisions import apply_decision
@@ -1430,6 +1449,8 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
               "annotation_based_metrics": True, "experimental_structure_group": None}
     if residue_nll is not None:
         result["order_nll"] = residue_nll
+    if v5_forward is not None:
+        result["v5_inference_ablation"] = v5_forward
     if hasattr(model, "evidence_partition"):
         fusion_mode = model.evidence_partition.fusion
         ablation_scope = {

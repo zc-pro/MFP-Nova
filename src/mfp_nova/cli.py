@@ -70,6 +70,8 @@ def main(argv=None):
             sub.add_argument("--v3-mode", choices=V3_MODES, help="V3 sequence interaction ablation")
             sub.add_argument("--v4-mode", choices=("baseline", "background", "conditional"),
                              help="TheraSet V4 A/B/C: original, residue order, or function-conditioned NLL")
+            sub.add_argument("--v5-mode", choices=("baseline", "shared", "split", "semantic", "shuffled"),
+                             help="TheraSet V5 controls and functional-graph variants")
             sub.add_argument("--hh-oof-fold", type=int, choices=range(3), help="Train a fresh Fine39 TheraSet for one held-out Train fold")
             sub.add_argument("--hh-oof-files", nargs=3, help="Three TheraSet fold exports for HH training")
             sub.add_argument("--annotations", help="B0/H1–H8: aligned NPZ of confirmed label and observation states")
@@ -146,6 +148,9 @@ def main(argv=None):
     evaluate.add_argument("--annotations", help="Sequence study: aligned annotation NPZ for evaluation")
     evaluate.add_argument("--evidence-diagnostics", action="store_true", help="H6: run keep/delete and matched random controls")
     evaluate.add_argument("--hh-diagnostics", action="store_true", help="Compare HH base, evidence and final decisions on Validation")
+    v5_ablation = evaluate.add_mutually_exclusive_group()
+    v5_ablation.add_argument("--v5-without-relation", action="store_true")
+    v5_ablation.add_argument("--v5-without-view", choices=("local", "context", "pair"))
     evaluate.add_argument("--decision", help="Validation-fitted research-model decision.json; raw ranking scores stay unchanged")
     evaluate.add_argument("--without-private-evidence", action="store_true",
                           help="Shared-private TriRelay: use shared evidence alone in both reads, retaining weights and saved threshold")
@@ -198,6 +203,8 @@ def main(argv=None):
         write_json(args.output, result)
         print(json.dumps({"original_rows": result["original_rows"], "tracks": result["tracks"]}, ensure_ascii=False, indent=2))
     elif args.command == "train" and args.model in HYPOTHESIS_MODELS:
+        if args.v5_mode is not None:
+            parser.error("--v5-mode requires --model theraset")
         if args.v4_mode is not None:
             parser.error("--v4-mode requires --model theraset")
         if args.theraset_b0_backbone or args.theraset_b0_local_max or args.theraset_b0_local_cnn:
@@ -210,6 +217,18 @@ def main(argv=None):
         config_path = args.config or f"configs/{model_name}.yaml"
         config = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
         if args.command == "train":
+            if args.v5_mode is not None:
+                if (model_name != "theraset" or args.resume or args.initialize_from or args.v4_mode
+                        or args.hh_oof_fold is not None or config["train"].get("initialize_from")
+                        or (args.task or args.track or "fine39") != "fine39"):
+                    parser.error("--v5-mode requires a fresh Fine39 TheraSet run")
+                config["data"]["track"] = "fine39"
+                config["model"].update(label_context=False, prototype_readout=False, order_evidence=False)
+                if args.v5_mode != "baseline":
+                    config["model"]["v5_mode"] = args.v5_mode
+                    config["loss"]["views"] = .2
+                config["train"].update(v5_mode=args.v5_mode, batch_size=64,
+                                       accumulation_steps=1, metric_suite="jaccard")
             if args.v4_mode is not None:
                 if (model_name != "theraset" or args.resume or args.hh_oof_fold is not None
                         or args.initialize_from or config["train"].get("initialize_from")):
@@ -466,6 +485,9 @@ def main(argv=None):
     elif args.command == "evaluate":
         import torch
         checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
+        if ((args.v5_without_relation or args.v5_without_view)
+                and not checkpoint.get("model_args", {}).get("v5_mode")):
+            parser.error("V5 inference ablations require a V5 three-head checkpoint")
         if checkpoint.get("model_name") in HYPOTHESIS_MODELS:
             from .hypothesis import evaluate
             if args.decision or args.feature_root or args.peptide_feature_root or args.without_private_evidence or args.hh_diagnostics:
@@ -487,6 +509,9 @@ def main(argv=None):
         feature_root = args.feature_root or checkpoint["config"]["data"].get("features")
         batch_size = args.batch_size or checkpoint["config"]["train"].get("batch_size", 128)
         extra = {}
+        if args.v5_without_relation or args.v5_without_view:
+            extra["v5_forward"] = {"use_relation": not args.v5_without_relation,
+                                   "without_view": args.v5_without_view}
         if args.hh_diagnostics:
             if checkpoint.get("model_name") not in (*HH_MODELS, HH_V16, HH_V17) or args.split != "val" or args.decision:
                 parser.error("--hh-diagnostics requires an HH-SetReread checkpoint, --split val and its saved decision")
