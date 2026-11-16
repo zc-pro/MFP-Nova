@@ -170,11 +170,11 @@ launch_v3() {
   shift
   nohup env CUDA_VISIBLE_DEVICES="$gpu" OMP_NUM_THREADS="$CPU_THREADS" \
     MKL_NUM_THREADS="$CPU_THREADS" PYTHONPATH="$PWD/src" \
-    MFP_RUN="$RUN" MFP_TASK="$TASK" MFP_SEED="$SEED" bash -c '
+    MFP_RUN="$RUN" MFP_TASK="$TASK" MFP_SEED="$SEED" MFP_PYTHON="$MFP_PYTHON" bash -c '
     set -e
     for mode in "$@"; do
       printf "START %s %s\n" "$mode" "$(date)"
-      python -u -m mfp_nova.cli train --model peptide_v3 --task "$MFP_TASK" \
+      "$MFP_PYTHON" -u -m mfp_nova.cli train --model peptide_v3 --task "$MFP_TASK" \
         --v3-mode "$mode" --seed "$MFP_SEED" --device cuda:0 --precision fp32 \
         --batch-size 64 --epochs 100 --metric-suite jaccard \
         --name "$MFP_RUN/$mode" > "runs/$MFP_RUN/$mode.log" 2>&1
@@ -184,7 +184,10 @@ launch_v3() {
   printf "GPU=%s PID=%s RUN=runs/%s\n" "$gpu" "$!" "$RUN"
 }
 
-if git pull --ff-only origin main && mkdir -p "runs/$RUN"; then
+if git pull --ff-only origin main &&
+   MFP_PYTHON="$(conda run -n MFP-Nova python -c 'import sys; print(sys.executable)')" &&
+   CUDA_VISIBLE_DEVICES="${GPUS[0]}" "$MFP_PYTHON" -c 'import sys, torch; print(sys.executable, torch.__version__, torch.cuda.get_device_name(0))' &&
+   mkdir -p "runs/$RUN"; then
   launch_v3 "${GPUS[0]}" cnn
   launch_v3 "${GPUS[1]}" additive
   launch_v3 "${GPUS[2]}" centered product
