@@ -33,28 +33,37 @@ def main():
     def run(arguments, log_name):
         print(f"START {log_name} {datetime.now():%Y-%m-%d %H:%M:%S}", flush=True)
         with (output / log_name).open("x", encoding="utf-8") as log:
-            subprocess.run(cli + arguments, env=environment, stdout=log,
-                           stderr=subprocess.STDOUT, check=True)
+            completed = subprocess.run(cli + arguments, env=environment, stdout=log,
+                                       stderr=subprocess.STDOUT)
+        if completed.returncode:
+            print(f"FAILED {log_name}\n" + "\n".join(
+                (output / log_name).read_text(encoding="utf-8", errors="replace").splitlines()[-40:]), flush=True)
+            completed.check_returncode()
         print(f"DONE {log_name}", flush=True)
 
     print(f"RUN={output}", flush=True)
     if not (PROJECT / "data/therapep48/labels.json").exists():
         run(["download-therapep"], "download.log")
         run(["prepare-therapep-variants"], "data.log")
-    for view, encoder in (("primary", "esm2_650m"), ("peptide", "esm2_peptide_150m")):
-        for split in ("train", "val", "test"):
-            cache = PROJECT / "features/therapep_ai" / encoder / split
-            if not (cache / "metadata.json").exists():
-                run(["features", "--config", "configs/theraset.yaml", "--track", "therapep48",
-                     "--encoder-view", view, "--splits", split, "--device", args.device,
-                     "--batch-size", "8"], f"features_{view}_{split}.log")
+    def prepare_caches(splits):
+        for view, encoder in (("primary", "esm2_650m"), ("peptide", "esm2_peptide_150m")):
+            for split in splits:
+                cache = PROJECT / "features/therapep_ai" / encoder / split
+                if not (cache / "metadata.json").exists():
+                    if cache.is_dir() and not any(cache.iterdir()):
+                        cache.rmdir()
+                    run(["features", "--config", "configs/theraset.yaml", "--track", "therapep48",
+                         "--encoder-view", view, "--splits", split, "--device", args.device,
+                         "--batch-size", "8"], f"features_{view}_{split}.log")
 
+    prepare_caches(("train", "val"))
     model = output / "model"
     run(["train", "--model", "theraset", "--task", "therapep48", "--seed", str(args.seed),
          "--ablate", "label_context", "prototype_readout", "--metric-suite", "jaccard",
          "--device", args.device, "--precision", "fp32", "--batch-size", str(args.batch_size),
          "--accumulation-steps", "1", "--num-workers", "0", "--epochs", "100",
          "--name", str(model)], "train.log")
+    prepare_caches(("test",))
     run(["evaluate", "--checkpoint", str(model / "best.pt"), "--split", "test",
          "--device", args.device, "--batch-size", str(args.batch_size),
          "--output", str(model / "test.json"),
