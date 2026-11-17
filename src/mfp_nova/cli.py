@@ -5,7 +5,7 @@ from pathlib import Path
 import yaml
 
 from .models import RESEARCH_MODELS, LEGACY_MODELS, HH_MODELS, HH_V15_RANKER, HH_V16, HH_V17, HH_V20, HH_V20_CHEMICAL_MODES
-from .models import PEPTIDE_V3, PEPTIDE_V6, V3_MODES
+from .models import PEPTIDE_V3, PEPTIDE_V6, PEPTIDE_V7, V3_MODES, V7_HEADS
 from .metric_protocol import SUITES
 from .models.hypotheses import MODELS as HYPOTHESIS_MODELS
 from .data import TRACKS
@@ -68,6 +68,7 @@ def main(argv=None):
             sub.add_argument("--hh-v20-cnn-channels", type=int, choices=(64, 128),
                              help="Match V2.0 (64) or TheraSet (128) CNN channels per scale")
             sub.add_argument("--v3-mode", choices=V3_MODES, help="V3 sequence interaction ablation")
+            sub.add_argument("--v7-head", choices=V7_HEADS, help="V7 matched flat or structured Fine39 head")
             sub.add_argument("--v4-mode", choices=("baseline", "background", "conditional"),
                              help="TheraSet V4 A/B/C: original, residue order, or function-conditioned NLL")
             sub.add_argument("--v5-mode", choices=("baseline", "shared", "split", "semantic", "shuffled"),
@@ -190,6 +191,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.command == "train" and args.setreread_interval and args.model != "setreread":
         parser.error("--setreread-interval requires --model setreread")
+    if args.command == "train" and args.v7_head is not None and (args.model != PEPTIDE_V7 or args.resume):
+        parser.error("--v7-head requires a fresh peptide_v7 run")
     if args.command == "prepare-rich48":
         from .rich48 import build_rich48
         print(json.dumps(build_rich48(args.author_root, args.source_root, args.output), ensure_ascii=False, indent=2))
@@ -254,6 +257,8 @@ def main(argv=None):
                 if model_name != PEPTIDE_V3 or args.resume:
                     parser.error("--v3-mode requires a fresh peptide_v3 run")
                 config["model"]["mode"] = args.v3_mode
+            if args.v7_head is not None:
+                config["model"]["head"] = args.v7_head
             if model_name == PEPTIDE_V3 and (args.esm or args.feature_root or args.peptide_feature_root):
                 parser.error("peptide_v3 uses the backbone sequence directly")
             if args.theraset_b0_backbone or args.theraset_b0_local_max or args.theraset_b0_local_cnn:
@@ -448,7 +453,8 @@ def main(argv=None):
                 if value is not None:
                     config["train"][key] = value
             if args.rdrop_weight is not None:
-                if model_name not in ("helixset", "theraset", "termiscale", "motifspan", "privilegedbridge", "hh_setreread", PEPTIDE_V3, PEPTIDE_V6):
+                if model_name not in ("helixset", "theraset", "termiscale", "motifspan", "privilegedbridge",
+                                       "hh_setreread", PEPTIDE_V3, PEPTIDE_V6, PEPTIDE_V7):
                     raise ValueError("This model does not support R-Drop")
                 config["loss"]["rdrop"] = args.rdrop_weight
             if args.loss is not None:

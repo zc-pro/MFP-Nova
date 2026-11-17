@@ -13,6 +13,10 @@
 
 ## 当前研究
 
+### V7.0 · Fine39 功能轴状态与细类共存
+
+`peptide_v7` 复用 AA34 CNN 和长度 80 的双 ESM 末层缓存。训练选项 `--v7-head structured` 使用八轴三态和非空细类子集，`--v7-head flat` 使用同骨干的 39 个独立 sigmoid。默认固定阈值 0.50，按 Validation 样本 Jaccard 选模。验证集评估额外给出空预测补 Top-1 的指标，结构化组还输出按轴状态混淆矩阵及逐样本状态概率（指定 `--predictions`）。默认配置见 [peptide_v7.yaml](configs/peptide_v7.yaml)。
+
 ### V5.0 · 三路独立取证与功能关系查询
 
 在保留 CNN 局部特征与冻结 ESM 上下文的基础上，检验分开读出能否保留互补信息，以及功能语义邻接能否改善残基级取证。[V5.0 架构书](docs/MFP-Nova-V5-Architecture.md)

@@ -16,7 +16,7 @@ import yaml
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
 from .multimodal import MultimodalData, MultimodalPeptides, collate_multimodal
-from .models import HH_MODELS, HH_V16, HH_V20, PEPTIDE_V6
+from .models import HH_MODELS, HH_V16, HH_V20, PEPTIDE_V6, PEPTIDE_V7
 from .research import (autocast_context, make_model, to_device, train, validate_cache,
                        load_model, predict_loader, metrics, make_optimizer, update_ema, v16_count_support)
 from .trainer import seed_everything, write_json
@@ -50,6 +50,8 @@ def inspect(feature_root, device):
 PROBES = {
     PEPTIDE_V6: ["cnn.convs.0.0.weight", "primary.1.weight", "peptide.1.weight",
                  "local.0.0.weight", "interaction.weight", "label_query"],
+    PEPTIDE_V7: ["cnn.convs.0.0.weight", "features.projection.weight",
+                 "attention.in_proj_weight", "label.weight"],
     "hh_setreread": ["backbone.sequence.plm.weight", "query", "shared_readout.weight", "private_readout.weight"],
     "hh_setreread_v12": ["residue_projection.weight", "esm_projection.weight", "peptide_projection.weight",
                        "fine_queries", "evidence_readout.2.weight"],
@@ -126,6 +128,9 @@ def profile(config, source, dataset, device, batches, precisions, measured_steps
         arguments["count_support"] = v16_count_support(source.data)
     if config["model_name"] == HH_V20:
         arguments["family_statistics"] = source.statistics["function_auxiliary"]
+    if config["model_name"] == PEPTIDE_V7 and arguments.get("head", "structured") == "structured":
+        from .models.peptide_v7 import fit_axis_counts
+        arguments["axis_counts"] = fit_axis_counts(source.data)
     if "peptide_encoder" in dataset.meta:
         arguments["peptide_input_dim"] = dataset.meta["peptide_encoder"]["input_dim"]
     samples = [dataset[i] for i in range(len(dataset))] if batch_scope == "diagnostic" else None
@@ -144,6 +149,8 @@ def profile(config, source, dataset, device, batches, precisions, measured_steps
         input_check = check_inputs(model, input_samples, device, precision)
         parameters = dict(model.named_parameters())
         probe_keys = list(PROBES[config["model_name"]])
+        if config["model_name"] == PEPTIDE_V7 and model.head == "structured":
+            probe_keys.extend(("state.weight", "child.weight"))
         if config["model_name"] == "privilegedbridge":
             if model.stage == "B":
                 probe_keys = ["teacher.residual.0.0.weight", "teacher.residual.1.0.weight"]
@@ -209,7 +216,7 @@ def profile(config, source, dataset, device, batches, precisions, measured_steps
                             module_updates[key]["updated"] = bool((before[key]!=parameters[key]).any())
                         # V1.2 and V6 already probe each encoder's separate projection in PROBES.
                         if "peptide_encoder" in dataset.meta and config["model_name"] not in ("hh_setreread_v12", PEPTIDE_V6):
-                            key = ("features.projection.weight" if config["model_name"] in ("termiscale", "motifspan") else
+                            key = ("features.projection.weight" if config["model_name"] in ("termiscale", "motifspan", PEPTIDE_V7) else
                                    "sequence.features.projection.weight" if config["model_name"] == "privilegedbridge" else
                                    "backbone.sequence.plm.weight" if config["model_name"] in ("hh_setreread", HH_V16) else
                                    "sequence.plm.weight")
@@ -284,7 +291,7 @@ def run(models, tasks, feature_root, device, output, esm="650m", batches=(2, 4, 
     for name in models:
         for task in tasks:
             config = yaml.safe_load(Path(f"configs/{name}.yaml").read_text(encoding="utf-8"))
-            if name in (HH_V20, PEPTIDE_V6) and task != "fine39":
+            if name in (HH_V20, PEPTIDE_V6, PEPTIDE_V7) and task != "fine39":
                 raise ValueError(f"Use --tasks fine39 for {name}")
             if name in (*HH_MODELS, HH_V16):
                 base = yaml.safe_load(Path("configs/theraset.yaml").read_text(encoding="utf-8"))
@@ -299,7 +306,8 @@ def run(models, tasks, feature_root, device, output, esm="650m", batches=(2, 4, 
                 config["data"]["root"] = str(data_root)
             if task not in (*THERAPEP_TRACKS, "rich48") or str(feature_root) != f"features/esm2_{esm}":
                 config["data"]["features"] = str(feature_root)
-            if peptide_feature_root is not None and name in ("helixset", "theraset", "termiscale", "motifspan", "privilegedbridge", *HH_MODELS, HH_V16, PEPTIDE_V6):
+            if peptide_feature_root is not None and name in ("helixset", "theraset", "termiscale", "motifspan",
+                                                            "privilegedbridge", *HH_MODELS, HH_V16, PEPTIDE_V6, PEPTIDE_V7):
                 config["data"]["peptide_features"] = str(peptide_feature_root)
             if name == "setreread":
                 config["train"]["correction_start_epoch"] = 1
@@ -307,7 +315,7 @@ def run(models, tasks, feature_root, device, output, esm="650m", batches=(2, 4, 
                     config["data"]["features"] = "features/esm2_peptide_150m"
             elif name != HH_V20:
                 config["encoder"]["name"] = "facebook/esm2_t33_650M_UR50D" if esm=="650m" else "facebook/esm2_t12_35M_UR50D"
-            sequence_only = name in ("termiscale", "motifspan", "setreread", HH_V20, PEPTIDE_V6)
+            sequence_only = name in ("termiscale", "motifspan", "setreread", HH_V20, PEPTIDE_V6, PEPTIDE_V7)
             source = MultimodalData(config["data"]["root"], task, sequence_only=sequence_only,
                                    sequence_chemistry=name in ("setreread", HH_V20),
                                    localize_terminals=name == HH_V20)
