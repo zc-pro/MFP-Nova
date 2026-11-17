@@ -16,7 +16,7 @@ import yaml
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
 from .multimodal import MultimodalData, MultimodalPeptides, collate_multimodal
-from .models import HH_MODELS, HH_V16, HH_V20
+from .models import HH_MODELS, HH_V16, HH_V20, PEPTIDE_V6
 from .research import (autocast_context, make_model, to_device, train, validate_cache,
                        load_model, predict_loader, metrics, make_optimizer, update_ema, v16_count_support)
 from .trainer import seed_everything, write_json
@@ -48,6 +48,8 @@ def inspect(feature_root, device):
 
 
 PROBES = {
+    PEPTIDE_V6: ["cnn.convs.0.0.weight", "primary.1.weight", "peptide.1.weight",
+                 "local.0.0.weight", "interaction.weight", "label_query"],
     "hh_setreread": ["backbone.sequence.plm.weight", "query", "shared_readout.weight", "private_readout.weight"],
     "hh_setreread_v12": ["residue_projection.weight", "esm_projection.weight", "peptide_projection.weight",
                        "fine_queries", "evidence_readout.2.weight"],
@@ -281,8 +283,8 @@ def run(models, tasks, feature_root, device, output, esm="650m", batches=(2, 4, 
     for name in models:
         for task in tasks:
             config = yaml.safe_load(Path(f"configs/{name}.yaml").read_text(encoding="utf-8"))
-            if name == HH_V20 and task != "fine39":
-                raise ValueError("Use --tasks fine39 for HH V2.0")
+            if name in (HH_V20, PEPTIDE_V6) and task != "fine39":
+                raise ValueError(f"Use --tasks fine39 for {name}")
             if name in (*HH_MODELS, HH_V16):
                 base = yaml.safe_load(Path("configs/theraset.yaml").read_text(encoding="utf-8"))
                 for key in ("encoder", "peptide_encoder"):
@@ -296,7 +298,7 @@ def run(models, tasks, feature_root, device, output, esm="650m", batches=(2, 4, 
                 config["data"]["root"] = str(data_root)
             if task not in (*THERAPEP_TRACKS, "rich48") or str(feature_root) != f"features/esm2_{esm}":
                 config["data"]["features"] = str(feature_root)
-            if peptide_feature_root is not None and name in ("helixset", "theraset", "termiscale", "motifspan", "privilegedbridge", *HH_MODELS, HH_V16):
+            if peptide_feature_root is not None and name in ("helixset", "theraset", "termiscale", "motifspan", "privilegedbridge", *HH_MODELS, HH_V16, PEPTIDE_V6):
                 config["data"]["peptide_features"] = str(peptide_feature_root)
             if name == "setreread":
                 config["train"]["correction_start_epoch"] = 1
@@ -304,7 +306,7 @@ def run(models, tasks, feature_root, device, output, esm="650m", batches=(2, 4, 
                     config["data"]["features"] = "features/esm2_peptide_150m"
             elif name != HH_V20:
                 config["encoder"]["name"] = "facebook/esm2_t33_650M_UR50D" if esm=="650m" else "facebook/esm2_t12_35M_UR50D"
-            sequence_only = name in ("termiscale", "motifspan", "setreread", HH_V20)
+            sequence_only = name in ("termiscale", "motifspan", "setreread", HH_V20, PEPTIDE_V6)
             source = MultimodalData(config["data"]["root"], task, sequence_only=sequence_only,
                                    sequence_chemistry=name in ("setreread", HH_V20),
                                    localize_terminals=name == HH_V20)
@@ -352,10 +354,11 @@ def run(models, tasks, feature_root, device, output, esm="650m", batches=(2, 4, 
             restored = train(continued, f"{name}_{task}_resume", resume=root/f"{name}_{task}"/"last.pt")
             model, checkpoint = load_model(root/f"{name}_{task}_resume"/"best.pt", device)
             source = MultimodalData(config["data"]["root"], task, checkpoint["statistics"],
-                                   sequence_only=name in ("setreread", HH_V20),
+                                   sequence_only=sequence_only,
                                    sequence_chemistry=name in ("setreread", HH_V20),
                                    localize_terminals=name == HH_V20)
-            val = MultimodalPeptides(source, task_features, "val", min(samples, 64), config["data"].get("peptide_features"))
+            val = MultimodalPeptides(source, task_features, "val", min(samples, 64),
+                                     config["data"].get("peptide_features"), sequence_only=sequence_only)
             loader = torch.utils.data.DataLoader(val, batch_size=chosen["batch_size"], collate_fn=collate_multimodal)
             y, p = predict_loader(model, loader, device, chosen["precision"])
             evaluation = metrics(y, p, source.statistics, checkpoint["threshold"])

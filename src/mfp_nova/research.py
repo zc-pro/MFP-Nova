@@ -16,7 +16,8 @@ from torch.utils.data import DataLoader
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
 from .metrics import evaluate_metrics, evaluate_groups, format_epoch, fit_global_threshold, fit_label_thresholds
-from .models import HH_MODELS, HH_V15_RANKER, HH_V16, HH_V17, HH_V20, HH_V20_CHEMICAL_MODES, PEPTIDE_V3, SEQUENCE_ONLY_MODELS
+from .models import (HH_MODELS, HH_V15_RANKER, HH_V16, HH_V17, HH_V20, HH_V20_CHEMICAL_MODES,
+                     PEPTIDE_V3, PEPTIDE_V6, SEQUENCE_ONLY_MODELS)
 from .multimodal import BackbonePeptides, MultimodalData, MultimodalPeptides, backbone_inputs, collate_multimodal
 from .research_layers import observed_label_loss
 from .consistency import bernoulli_consistency, consistency_weight
@@ -29,6 +30,11 @@ def make_model(name, arguments):
     if name == PEPTIDE_V3:
         from .models.peptide_v3 import PeptideV3
         return PeptideV3(**arguments)
+    if name == PEPTIDE_V6:
+        from .models.peptide_v6 import PeptideV6
+        arguments = dict(arguments)
+        arguments.pop("vocab_size", None)
+        return PeptideV6(**arguments)
     if name == HH_V20:
         from .models.hh_setreread_v20 import HHSetRereadV20
         return HHSetRereadV20(**arguments)
@@ -101,7 +107,7 @@ def autocast_context(device, precision="fp32"):
 
 @torch.inference_mode()
 def predict_loader(model, loader, device, precision="fp32", loss_settings=None, decode_sets=False,
-                   include_auxiliary=False, residue_nll=None, view_outputs=None, v5_forward=None):
+                   include_auxiliary=False, residue_nll=None, view_outputs=None, v5_forward=None, v6_outputs=None):
     model.eval()
     targets, probabilities, decisions, count_decisions = [], [], [], []
     component_weights, component_counts = [], []
@@ -109,10 +115,16 @@ def predict_loader(model, loader, device, precision="fp32", loss_settings=None, 
     loss_total, rows = 0., 0
     residue_totals = {}
     view_probabilities, view_available = [], []
+    if v6_outputs is not None:
+        from .models.peptide_v6 import DIAGNOSTIC_NAMES, EVIDENCE_NAMES
+        v6_batches = {f"{name}_probabilities": [] for name in DIAGNOSTIC_NAMES}
+        v6_batches["evidence_weights"] = []
     for batch in loader:
         moved = to_device(batch, device)
         with autocast_context(device, precision):
-            if residue_nll is None:
+            if v6_outputs is not None:
+                output = model(moved, diagnostics=True)
+            elif residue_nll is None:
                 output = model(moved, **(v5_forward or {}))
             else:
                 update, totals = model.order_evidence(moved["aa"], moved["mask"], moved["y"])
@@ -146,6 +158,13 @@ def predict_loader(model, loader, device, precision="fp32", loss_settings=None, 
         if view_outputs is not None:
             view_probabilities.append(output["view_logits"].sigmoid().cpu().numpy())
             view_available.append(output["view_available"].cpu().numpy())
+        if v6_outputs is not None:
+            for name in DIAGNOSTIC_NAMES:
+                v6_batches[f"{name}_probabilities"].append(output[name].sigmoid().cpu().numpy())
+            v6_batches["evidence_weights"].append(output["evidence_weights"].cpu().numpy())
+    if v6_outputs is not None:
+        v6_outputs.update({key: np.concatenate(batches) for key, batches in v6_batches.items()})
+        v6_outputs["evidence_names"] = np.array(EVIDENCE_NAMES)
     if view_outputs is not None:
         from .models.theraset_v5 import V5_VIEWS
         view_outputs.update(view_probabilities=np.concatenate(view_probabilities),
@@ -402,6 +421,8 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     peptide_v3 = config["model_name"] == PEPTIDE_V3
     if peptide_v3 and config["data"]["track"] not in ("fine39", "major15", "rich48"):
         raise ValueError("V3 uses the project Fine39, Major15 or Rich48 split")
+    if config["model_name"] == PEPTIDE_V6 and config["data"]["track"] != "fine39":
+        raise ValueError("V6 uses the project Fine39 split")
     if hh_v20 and config["data"]["track"] != "fine39":
         raise ValueError("HH V2.0 predicts Fine39 and uses Major15 as auxiliary supervision")
     ranker = config["model_name"] == HH_V15_RANKER
@@ -533,7 +554,7 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     if not math.isfinite(rdrop) or rdrop < 0:
         raise ValueError("R-Drop weight must be finite and nonnegative")
     if rdrop:
-        if config["model_name"] not in ("helixset", "theraset", "termiscale", "motifspan", "privilegedbridge", "hh_setreread", PEPTIDE_V3):
+        if config["model_name"] not in ("helixset", "theraset", "termiscale", "motifspan", "privilegedbridge", "hh_setreread", PEPTIDE_V3, PEPTIDE_V6):
             raise ValueError("This model does not support R-Drop")
         if settings.get("rdrop_start_epoch", 6) < 1 or settings.get("rdrop_ramp_epochs", 5) < 1:
             raise ValueError("R-Drop start epoch and ramp length must be positive")
@@ -818,7 +839,9 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
             "coefficient": rdrop, "start_epoch": settings.get("rdrop_start_epoch", 6),
             "ramp_epochs": settings.get("rdrop_ramp_epochs", 5),
             "objective": "mean supervised loss of two dropout forwards + symmetric Bernoulli KL over all labels",
-            "inputs": "same modality-dropout view; independent ordinary network dropout masks",
+            "inputs": ("same sequence and cached residues; independent ordinary network dropout masks"
+                       if config["model_name"] == PEPTIDE_V6 else
+                       "same modality-dropout view; independent ordinary network dropout masks"),
             "train_metrics": "first stochastic forward only", "validation": "single clean forward; main ASL only"}
     metadata["phys_missing_values"] = "zero_after_scaling" if source.statistics["phys"].get("zero_missing", False) else "legacy_median_after_scaling"
     if save_candidates:
@@ -1389,8 +1412,12 @@ def hh_v12_validation_report(y, arrays, statistics):
 
 
 def evaluate(checkpoint_path, data_root, feature_root, split, device, output, predictions=None, batch_size=32, decision_path=None,
-             without_private_evidence=False, peptide_feature_root=None, hh_diagnostics=False, v5_forward=None):
+             without_private_evidence=False, peptide_feature_root=None, hh_diagnostics=False, v5_forward=None,
+             v6_diagnostics=False):
     model, checkpoint = load_model(checkpoint_path, device)
+    if v6_diagnostics and (checkpoint["model_name"] != PEPTIDE_V6 or model.mode != "interaction"
+                           or split != "val" or decision_path):
+        raise ValueError("V6 diagnostics require a V6 interaction checkpoint, Validation and the saved threshold")
     joint = checkpoint["model_name"] == HH_V16
     if joint and (decision_path or (hh_diagnostics and split != "val")):
         raise ValueError("HH V1.6 uses its joint expected-Jaccard decoder; auxiliary diagnostics use Validation")
@@ -1447,7 +1474,8 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
         extra_outputs = {}
         view_outputs = extra_outputs if predictions and getattr(model, "v5_readout", None) is not None else None
         y, probabilities = predict_loader(model, loader, device, residue_nll=residue_nll,
-                                          view_outputs=view_outputs, v5_forward=v5_forward)
+                                          view_outputs=view_outputs, v5_forward=v5_forward,
+                                          v6_outputs=extra_outputs if v6_diagnostics else None)
     threshold = checkpoint["threshold"]
     if decision_path:
         from .decisions import apply_decision
@@ -1468,6 +1496,16 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
         result["order_nll"] = residue_nll
     if v5_forward is not None:
         result["v5_inference_ablation"] = v5_forward
+    if v6_diagnostics:
+        from .models.peptide_v6 import DIAGNOSTIC_NAMES
+        support = source.statistics["labels"]["support"]
+        projection = source.statistics["function_projection"]
+        result["v6_diagnostics"] = {
+            "mean_evidence_weights": dict(zip(extra_outputs["evidence_names"].tolist(),
+                                              extra_outputs["evidence_weights"].mean(axis=(0, 2)).tolist())),
+            **{name: evaluate_metrics(y, extra_outputs[f"{name}_probabilities"], threshold, support, projection)
+               for name in DIAGNOSTIC_NAMES},
+        }
     if hasattr(model, "evidence_partition"):
         fusion_mode = model.evidence_partition.fusion
         ablation_scope = {
@@ -1540,6 +1578,10 @@ def predict_inputs(checkpoint_path, input_path, device="cpu", batch_size=32, dec
                   "mask": torch.from_numpy(raw["mask"]).bool()}
     elif checkpoint["model_name"] == PEPTIDE_V3:
         inputs = {"aa": torch.from_numpy(raw["aa"]).long(), "mask": torch.from_numpy(raw["mask"]).bool()}
+    elif checkpoint["model_name"] == PEPTIDE_V6:
+        inputs = {"aa": torch.from_numpy(raw["aa"]).long(), "mask": torch.from_numpy(raw["mask"]).bool(),
+                  "esm": torch.from_numpy(raw["esm"]).float(),
+                  "esm_peptide": torch.from_numpy(raw["esm_peptide"]).float()}
     elif checkpoint["model_name"] in ("setreread", HH_V20) and "chemical" not in raw:
         from .multimodal import prepare_sequence_inputs
         inputs = prepare_sequence_inputs(raw, checkpoint["statistics"])
@@ -1666,7 +1708,7 @@ def predict_sequences(checkpoint_path, sequences, device="cpu", decision_path=No
         if prefix is not None:
             raw["esm_cls"] = states[:, 0].half().float().cpu().numpy()
             raw["esm_eos"] = torch.stack([states[i, len(s) + 1] for i, s in enumerate(selected)]).half().float().cpu().numpy()
-        prepare = prepare_sequence_inputs if checkpoint["model_name"] in ("setreread", HH_V15_RANKER, HH_V20) else prepare_inputs
+        prepare = prepare_sequence_inputs if checkpoint["model_name"] in ("setreread", HH_V15_RANKER, HH_V20, PEPTIDE_V6) else prepare_inputs
         inputs = prepare(raw, checkpoint["statistics"])
         scope = "sequence_only" if checkpoint["model_name"] in (*SEQUENCE_ONLY_MODELS, "privilegedbridge") else "sequence_and_stereochemistry_only"
         with torch.inference_mode():

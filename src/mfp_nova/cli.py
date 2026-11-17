@@ -5,7 +5,7 @@ from pathlib import Path
 import yaml
 
 from .models import RESEARCH_MODELS, LEGACY_MODELS, HH_MODELS, HH_V15_RANKER, HH_V16, HH_V17, HH_V20, HH_V20_CHEMICAL_MODES
-from .models import PEPTIDE_V3, V3_MODES
+from .models import PEPTIDE_V3, PEPTIDE_V6, V3_MODES
 from .metric_protocol import SUITES
 from .models.hypotheses import MODELS as HYPOTHESIS_MODELS
 from .data import TRACKS
@@ -153,6 +153,8 @@ def main(argv=None):
     v5_ablation = evaluate.add_mutually_exclusive_group()
     v5_ablation.add_argument("--v5-without-relation", action="store_true")
     v5_ablation.add_argument("--v5-without-view", choices=("local", "context", "pair"))
+    evaluate.add_argument("--v6-diagnostics", action="store_true",
+                          help="V6 Validation: compare saved weights with interaction removed and context shifted")
     evaluate.add_argument("--decision", help="Validation-fitted research-model decision.json; raw ranking scores stay unchanged")
     evaluate.add_argument("--without-private-evidence", action="store_true",
                           help="Shared-private TriRelay: use shared evidence alone in both reads, retaining weights and saved threshold")
@@ -446,7 +448,7 @@ def main(argv=None):
                 if value is not None:
                     config["train"][key] = value
             if args.rdrop_weight is not None:
-                if model_name not in ("helixset", "theraset", "termiscale", "motifspan", "privilegedbridge", "hh_setreread", PEPTIDE_V3):
+                if model_name not in ("helixset", "theraset", "termiscale", "motifspan", "privilegedbridge", "hh_setreread", PEPTIDE_V3, PEPTIDE_V6):
                     raise ValueError("This model does not support R-Drop")
                 config["loss"]["rdrop"] = args.rdrop_weight
             if args.loss is not None:
@@ -492,6 +494,9 @@ def main(argv=None):
     elif args.command == "evaluate":
         import torch
         checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
+        if args.v6_diagnostics and (checkpoint.get("model_name") != PEPTIDE_V6 or args.split != "val"
+                                     or args.decision or checkpoint["model_args"]["mode"] != "interaction"):
+            parser.error("--v6-diagnostics requires a V6 interaction checkpoint and --split val")
         if ((args.v5_without_relation or args.v5_without_view)
                 and not checkpoint.get("model_args", {}).get("v5_mode")):
             parser.error("V5 inference ablations require a V5 three-head checkpoint")
@@ -516,6 +521,8 @@ def main(argv=None):
         feature_root = args.feature_root or checkpoint["config"]["data"].get("features")
         batch_size = args.batch_size or checkpoint["config"]["train"].get("batch_size", 128)
         extra = {}
+        if args.v6_diagnostics:
+            extra["v6_diagnostics"] = True
         if args.v5_without_relation or args.v5_without_view:
             extra["v5_forward"] = {"use_relation": not args.v5_without_relation,
                                    "without_view": args.v5_without_view}

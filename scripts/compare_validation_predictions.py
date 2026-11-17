@@ -71,6 +71,24 @@ def rank_diagnostics(targets, a_probs, a_pred, b_probs, b_pred, projection):
 
     a_hits, a_best_prefix = prefix_hits(a_probs)
     b_hits, b_best_prefix = prefix_hits(b_probs)
+    nonempty_zero = (a_score == 0) & a_pred.any(1)
+    function_count = independent_functions(targets, projection).sum(1)
+    multifunction_coverage = {}
+    for name, mask in (("two_functions", function_count == 2),
+                       ("three_or_more_functions", function_count >= 3)):
+        if mask.any():
+            positives = int(targets[mask].sum())
+            multifunction_coverage[name] = {
+                "rows": int(mask.sum()),
+                "positive_labels": positives,
+                "jaccard": percent_pair(a_score[mask].mean(), b_score[mask].mean()),
+                "top5_label_coverage": percent_pair(a_hits[mask, 4].sum()/positives,
+                                                      b_hits[mask, 4].sum()/positives),
+                "label_recall": percent_pair((a_pred[mask] & targets[mask]).sum()/positives,
+                                               (b_pred[mask] & targets[mask]).sum()/positives),
+                "extra_unannotated": {"baseline": int((a_pred[mask] & ~targets[mask]).sum()),
+                                      "candidate": int((b_pred[mask] & ~targets[mask]).sum())},
+            }
     original = np.maximum(a_score, a_best_prefix)
     expanded = np.maximum.reduce([original, b_score, b_best_prefix])
     coverage = {}
@@ -96,6 +114,9 @@ def rank_diagnostics(targets, a_probs, a_pred, b_probs, b_pred, projection):
         "exact_set_matches": {"baseline": int((a_score == 1).sum()), "candidate": int((b_score == 1).sum()),
                               "preserved": int(((a_score == 1) & (b_score == 1)).sum())},
         "baseline_zero_overlap_recovered": int(((a_score == 0) & (b_score > 0)).sum()),
+        "baseline_nonempty_zero_overlap": {
+            "rows": int(nonempty_zero.sum()), "recovered": int((nonempty_zero & (b_score > 0)).sum())},
+        "independent_multifunction_coverage": multifunction_coverage,
         "baseline_zero_overlap_top5": {
             "rows": int((a_score == 0).sum()),
             "baseline_hits": int(((a_score == 0) & (a_hits[:, 4] > 0)).sum()),
