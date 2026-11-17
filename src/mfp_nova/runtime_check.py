@@ -207,7 +207,8 @@ def profile(config, source, dataset, device, batches, precisions, measured_steps
                     if step==1:
                         for key in before:
                             module_updates[key]["updated"] = bool((before[key]!=parameters[key]).any())
-                        if "peptide_encoder" in dataset.meta and config["model_name"] != "hh_setreread_v12":
+                        # V1.2 and V6 already probe each encoder's separate projection in PROBES.
+                        if "peptide_encoder" in dataset.meta and config["model_name"] not in ("hh_setreread_v12", PEPTIDE_V6):
                             key = ("features.projection.weight" if config["model_name"] in ("termiscale", "motifspan") else
                                    "sequence.features.projection.weight" if config["model_name"] == "privilegedbridge" else
                                    "backbone.sequence.plm.weight" if config["model_name"] in ("hh_setreread", HH_V16) else
