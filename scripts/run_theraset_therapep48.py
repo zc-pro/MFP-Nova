@@ -24,7 +24,7 @@ def main():
     os.chdir(PROJECT)
     output = args.output or Path("runs") / f"theraset_therapep48_s{args.seed}_{datetime.now():%Y%m%d_%H%M%S}"
     output = output.resolve()
-    output.mkdir(parents=True, exist_ok=False)
+    output.mkdir(parents=True, exist_ok=True)
     environment = os.environ.copy()
     environment.update(OMP_NUM_THREADS=str(args.cpu_threads), MKL_NUM_THREADS=str(args.cpu_threads),
                        PYTHONPATH=str(PROJECT / "src"), PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
@@ -32,7 +32,7 @@ def main():
 
     def run(arguments, log_name):
         print(f"START {log_name} {datetime.now():%Y-%m-%d %H:%M:%S}", flush=True)
-        with (output / log_name).open("w", encoding="utf-8") as log:
+        with (output / log_name).open("x", encoding="utf-8") as log:
             subprocess.run(cli + arguments, env=environment, stdout=log,
                            stderr=subprocess.STDOUT, check=True)
         print(f"DONE {log_name}", flush=True)
