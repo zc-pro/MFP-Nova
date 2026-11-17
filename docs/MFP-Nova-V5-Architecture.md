@@ -223,3 +223,92 @@ tail -F "$RUN"/{baseline,shared,split}.log
   ls -lh "$RUN/$report.tar.gz"
 )
 ```
+
+## 8. 原 TheraSet 的 Gram 正例重加权对照
+
+使用原 Fine39 划分和同批原 TheraSet `baseline` 作为 A。B/C 都从头训练原 TheraSet，保持关闭标签上下文和单活跃原型。用户当前使用的 A 位于 `runs/v5_fine39_s42_20261116_235947/baseline`，按固定 0.50 的验证 ACC 选出的结果为 61.2704%。
+
+每个 Gram 标签分别计算正例权重。若该标签有 \(N\) 个 Train 正例、\(K\) 个正例簇，且样本所在簇有 \(n_k\) 个该标签的正例，B 的倍率为 \(0.5+0.5N/(K n_k)\)。C 取 B 与一组标注背景均衡权重的平均。计算背景均衡权重时，分别将 B 的单侧记录正例和双侧记录正例缩放到 \(N/2\)，保留组内的相对权重。两种倍率均按完整原 Train 计算，并与 Train 样本索引对齐。
+
+乘数只作用于两个 Gram 标签已标注正位的 ASL 正项，包括主分类、直接头和证据头。所有组沿用原未标注弱权重。验证和推理沿用原损失和决策。训练终端、metadata 和 results 中记录各标签的正例、序列簇、单侧正例权重占比与最大倍率。
+
+| 模式 | Gram+ 单侧正例权重 | Gram− 单侧正例权重 |
+|---|---:|---:|
+| A 原模型 | 12.17% | 15.67% |
+| B `cluster` | 12.54% | 14.67% |
+| C `cluster_context` | 31.27% | 32.33% |
+
+### V100 两卡启动
+
+```bash
+cd ~/wuzhencheng/projects/MFP-Nova
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate MFP-Nova
+PY="$CONDA_PREFIX/bin/python"
+RUN="runs/gram_weight_fine39_s42_$(date +%Y%m%d_%H%M%S)"
+GPUS=(2 3)
+modes=(cluster cluster_context)
+
+if git pull --ff-only origin main && mkdir -p runs && mkdir "$RUN"; then
+  for i in "${!modes[@]}"; do
+    mode="${modes[$i]}"
+    nohup env CUDA_VISIBLE_DEVICES="${GPUS[$i]}" OMP_NUM_THREADS=6 MKL_NUM_THREADS=6 \
+      PYTHONPATH="$PWD/src" "$PY" -u -m mfp_nova.cli train \
+      --model theraset --task fine39 --seed 42 --gram-positive-weighting "$mode" \
+      --device cuda:0 --precision fp32 --batch-size 64 --accumulation-steps 1 \
+      --num-workers 0 --epochs 100 --metric-suite jaccard --name "${RUN#runs/}/$mode" \
+      > "$RUN/$mode.log" 2>&1 < /dev/null &
+    printf '%s GPU=%s PID=%s log=%s\n' "$mode" "${GPUS[$i]}" "$!" "$RUN/$mode.log"
+  done
+  printf 'RUN=%s\n' "$RUN"
+fi
+```
+
+### RTX 5070 单卡顺序训练
+
+```powershell
+conda activate MFP-Nova
+$MfpPython = Join-Path $env:CONDA_PREFIX 'python.exe'
+$env:PYTHONPATH = Join-Path $PWD.Path 'src'
+$env:CUDA_VISIBLE_DEVICES = '0'
+$env:OMP_NUM_THREADS = '6'
+$env:MKL_NUM_THREADS = '6'
+$RunName = 'gram_weight_fine39_s42_' + (Get-Date -Format 'yyyyMMdd_HHmmss')
+$Run = Join-Path 'runs' $RunName
+New-Item -ItemType Directory -Path $Run -ErrorAction Stop | Out-Null
+foreach ($Mode in 'cluster','cluster_context') {
+    & $MfpPython -u -m mfp_nova.cli train --model theraset --task fine39 --seed 42 `
+        --gram-positive-weighting $Mode --device cuda:0 --precision fp32 --batch-size 64 `
+        --accumulation-steps 1 --num-workers 0 --epochs 100 --metric-suite jaccard `
+        --name "$RunName/$Mode" 2>&1 | Tee-Object -FilePath (Join-Path $Run "$Mode.log")
+    if ($LASTEXITCODE -ne 0) { throw "Gram weighting run failed for $Mode" }
+}
+```
+
+### 查看与验收
+
+```bash
+tail -F "$RUN"/{cluster,cluster_context}.log
+```
+
+完成后比较 A/B/C。逐样本报告增加抗菌三标签状态级完全匹配、对应全标签 Jaccard，以及每个抗菌标签的漏标和额外预测未标注位。总体的 ACC、配对簇区间、完全匹配保留和多功能指标沿用现有比较工具。
+
+```bash
+(
+  set -e
+  BASE=runs/v5_fine39_s42_20261116_235947/baseline
+  report="acceptance_$(date +%Y%m%d_%H%M%S)"
+  mkdir "$RUN/$report"
+  export PYTHONPATH="$PWD/src"
+  PY="$CONDA_PREFIX/bin/python"
+  "$PY" scripts/compare_validation_predictions.py "$BASE" "$RUN/cluster" \
+    > "$RUN/$report/baseline_vs_cluster.json"
+  "$PY" scripts/compare_validation_predictions.py "$BASE" "$RUN/cluster_context" \
+    > "$RUN/$report/baseline_vs_cluster_context.json"
+  "$PY" scripts/compare_validation_predictions.py "$RUN/cluster" "$RUN/cluster_context" \
+    > "$RUN/$report/cluster_vs_cluster_context.json"
+  tar -czf "$RUN/$report.tar.gz" -C "$RUN" \
+    {cluster,cluster_context}/{results.json,metadata.json,history.jsonl,best_validation.npz} "$report"
+  ls -lh "$RUN/$report.tar.gz"
+)
+```

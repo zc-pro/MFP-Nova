@@ -9,7 +9,7 @@ from sklearn.metrics import average_precision_score, f1_score
 from sklearn.model_selection import GroupKFold
 
 from mfp_nova.data import PeptideData
-from mfp_nova.multimodal import function_projection, independent_functions
+from mfp_nova.multimodal import GRAM_LABELS, function_projection, independent_functions
 
 
 def read_validation(run, data, rows):
@@ -180,6 +180,27 @@ def compare(data, baseline_run, candidate_run):
     actual_mfp = independent_functions(targets, projection).sum(1) >= 2
     a_mfp = independent_functions(a_pred, projection).sum(1) >= 2
     b_mfp = independent_functions(b_pred, projection).sum(1) >= 2
+    gram_cols = [data.labels.index(label) for label in (*GRAM_LABELS, "antibacterial__unknown")]
+    gram_truth = targets[:, gram_cols]
+    a_gram, b_gram = a_pred[:, gram_cols], b_pred[:, gram_cols]
+    gram_states = {}
+    for name, state in (("no_record", (0, 0, 0)), ("gram_plus_only", (1, 0, 0)),
+                        ("gram_minus_only", (0, 1, 0)), ("dual_recorded", (1, 1, 0)),
+                        ("unresolved", (0, 0, 1))):
+        mask = (gram_truth == state).all(1)
+        if mask.any():
+            gram_states[name] = {"rows": int(mask.sum()),
+                "gram_exact_match": percent_pair((a_gram[mask] == gram_truth[mask]).all(1).mean(),
+                                                 (b_gram[mask] == gram_truth[mask]).all(1).mean()),
+                "whole_set_jaccard": percent_pair(a_score[mask].mean(), b_score[mask].mean())}
+    gram_label_errors = {}
+    for label, actual, original, candidate in zip((*GRAM_LABELS, "antibacterial__unknown"),
+                                                    gram_truth.T, a_gram.T, b_gram.T):
+        gram_label_errors[label] = {
+            "baseline_missed_positives": int((actual & ~original).sum()),
+            "candidate_missed_positives": int((actual & ~candidate).sum()),
+            "baseline_extra_unannotated": int((~actual & original).sum()),
+            "candidate_extra_unannotated": int((~actual & candidate).sum())}
     return {"baseline": str(baseline_run), "candidate": str(candidate_run), "rows": len(rows),
             "jaccard": percent_pair(a_score.mean(), b_score.mean()),
             "jaccard_paired_cluster_95pct_interval_pp": paired_cluster_interval(
@@ -192,6 +213,8 @@ def compare(data, baseline_run, candidate_run):
             "independent_multifunction_detection_f1": percent_pair(f1_score(actual_mfp, a_mfp, zero_division=0),
                                                                   f1_score(actual_mfp, b_mfp, zero_division=0)),
             "groups_jaccard": by_group,
+            "gram_states": gram_states,
+            "gram_label_errors": gram_label_errors,
             "candidate_ranking": rank_diagnostics(targets, a_probs, a_pred, b_probs, b_pred, projection),
             "keep_and_add": addition_diagnostics(targets, a_pred, a_probs, b_probs, data.clusters[rows]),
             "label_ap_largest_gains": [row for row in per_label if row["delta_pp"] > 0][:5],

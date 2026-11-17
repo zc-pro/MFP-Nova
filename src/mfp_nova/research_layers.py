@@ -406,13 +406,15 @@ def unlabeled_weights(targets, statistics, unknown_weight=.3):
     return weak_weight
 
 
-def observed_label_loss(logits, targets, statistics, unknown_weight=.3, mask=None):
+def observed_label_loss(logits, targets, statistics, unknown_weight=.3, mask=None, positive_multiplier=None):
     """ASL with explicitly weak unlabeled terms; no confirmed-negative claim."""
     logits = logits.float()
     positive_weight = torch.as_tensor(statistics["positive_weights"], device=logits.device)
     p = logits.sigmoid()
     negative = (1-p+.03).clamp(max=1)
     pos = -F.logsigmoid(logits)*targets*positive_weight
+    if positive_multiplier is not None:
+        pos = pos * positive_multiplier
     weak_weight = unlabeled_weights(targets, statistics, unknown_weight)
     neg = -negative.clamp_min(1e-8).log()*(1-negative).square().detach()*(1-targets)*weak_weight
     values = pos+neg

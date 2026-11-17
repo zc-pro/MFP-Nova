@@ -495,6 +495,12 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
             if key not in ("device", "output", "epochs", "num_workers", "max_steps"):
                 settings[key] = value
     suite = settings.get("metric_suite", "task_specific")
+    gram_weighting = settings.get("gram_positive_weighting")
+    if gram_weighting is not None and (
+            gram_weighting not in ("cluster", "cluster_context") or config["model_name"] != "theraset"
+            or config["data"]["track"] != "fine39" or settings.get("v5_mode") != "baseline"
+            or config["model"].get("v5_mode") is not None or fold is not None):
+        raise ValueError("Gram positive weighting requires the Fine39 TheraSet baseline")
     if hh_model and (config["data"]["track"] != "fine39" or suite != "jaccard"
                      or config["encoder"]["max_length"] != 80):
         raise ValueError("HH requires Fine39, max_length=80 and the fixed-threshold jaccard protocol")
@@ -623,6 +629,12 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     num_workers = settings["num_workers"]
     pin_memory = device.type == "cuda" and num_workers > 0
     training_data = datasets[0]
+    gram_weight_summary = None
+    if gram_weighting is not None:
+        from .multimodal import gram_positive_multipliers
+        multipliers, gram_weight_summary = gram_positive_multipliers(source.data, gram_weighting)
+        training_data.positive_multipliers = torch.from_numpy(multipliers[training_data.indices])
+        print(f"Gram positive weighting | {gram_weighting} | {json.dumps(gram_weight_summary)}", flush=True)
     if use_oof:
         training_data = ScoredPeptides(training_data, oof_scores[np.searchsorted(train_indices, training_data.indices)])
     loaders = [DataLoader(data, batch_size=settings["batch_size"], shuffle=shuffle, num_workers=num_workers,
@@ -768,6 +780,8 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
                 "resume": str(resume) if resume else None, "diagnostic_subset": diagnostic,
                 "monitor_threshold": .5, "train_metrics_scope": "online_augmented_changing_weights",
                 "validation_loss_scope": "main_classification_clean_eval; no stochastic auxiliary reconstruction"}
+    if gram_weight_summary is not None:
+        metadata["gram_positive_weights"] = gram_weight_summary
     if source.data.track in THERAPEP_TRACKS:
         metadata["label_semantics"] = ("Positive-only 48 functional targets; 0 is unannotated; no therapeutic flag"
             if source.data.track == "therapep48" else
@@ -1200,6 +1214,9 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         result["v4_mode"] = settings["v4_mode"]
     if "v5_mode" in settings:
         result["v5_mode"] = settings["v5_mode"]
+    if gram_weight_summary is not None:
+        result["gram_positive_weighting"] = gram_weighting
+        result["gram_positive_weights"] = gram_weight_summary
     if getattr(model, "v5_readout", None) is not None and model.v5_readout.relation is not None:
         from .models.theraset_v5 import function_adjacency
         actual = model.v5_readout.relation.cpu().numpy() > 0

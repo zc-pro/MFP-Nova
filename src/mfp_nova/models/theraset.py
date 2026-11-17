@@ -362,8 +362,9 @@ class TheraSet(nn.Module):
                  *prototype_weights[..., None, None]).sum(2))
         return output
 
-    def supervised_terms(self, output, targets, unknown_weight):
-        terms = {"classification": observed_label_loss(output["logits"], targets, self.statistics, unknown_weight)}
+    def supervised_terms(self, output, targets, unknown_weight, positive_multiplier=None):
+        terms = {"classification": observed_label_loss(output["logits"], targets, self.statistics, unknown_weight,
+                                                        positive_multiplier=positive_multiplier)}
         if self.v5_readout is not None:
             view_targets = targets[:, None].expand_as(output["view_logits"])
             view_mask = output["view_available"][:, :, None].expand_as(view_targets)
@@ -371,7 +372,8 @@ class TheraSet(nn.Module):
                                                  unknown_weight, view_mask)
         elif self.evidence_decoder:
             for key, logits in (("direct", output["direct"]), ("evidence", output["evidence_logits"])):
-                terms[key] = observed_label_loss(logits, targets, self.statistics, unknown_weight)
+                terms[key] = observed_label_loss(logits, targets, self.statistics, unknown_weight,
+                                                 positive_multiplier=positive_multiplier)
         return terms
 
     def compute_loss(self, batch, settings, return_output=False):
@@ -385,7 +387,8 @@ class TheraSet(nn.Module):
                            for key, (numerator, denominator) in totals.items()}
         output = self(view, **options)
         def supervised(prediction):
-            return self.supervised_terms(prediction, batch["y"], settings.get("unlabeled_weight", .3))
+            return self.supervised_terms(prediction, batch["y"], settings.get("unlabeled_weight", .3),
+                                         batch.get("positive_multiplier") if self.training else None)
         terms = supervised(output)
         agreement = output["logits"].sum()*0
         if self.training and settings.get("rdrop", 0)>0:

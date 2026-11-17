@@ -72,6 +72,38 @@ def label_statistics(y, clusters, labels, min_support=20, max_factors=32):
             "observed_prior": ((support + 1)/(len(y)+2)).tolist(), "labels": labels}
 
 
+GRAM_LABELS = ("anti_gram+", "anti_gram_")
+
+
+def gram_positive_multipliers(data, mode):
+    """Compute Gram positive weights from the full original Train cohort."""
+    columns = [data.labels.index(label) for label in GRAM_LABELS]
+    train = data.indices("train")
+    targets = data.y[train][:, columns].astype(bool)
+    multipliers = np.ones(data.y.shape, dtype=np.float32)
+    summary = {}
+    for i, (label, column) in enumerate(zip(GRAM_LABELS, columns)):
+        positive_rows = train[targets[:, i]]
+        dual = targets[targets[:, i], 1 - i]
+        _, inverse, counts = np.unique(data.clusters[positive_rows], return_inverse=True, return_counts=True)
+        n = len(positive_rows)
+        if not n or (mode == "cluster_context" and (dual.all() or not dual.any())):
+            raise ValueError(f"Insufficient Train annotation contexts for {label} and {mode}")
+        # Equal cluster mass, normalized to the label's original positive mass.
+        cluster_weight = (n / len(counts)) / counts[inverse]
+        weights = .5 + .5 * cluster_weight
+        if mode == "cluster_context":
+            balanced = weights.copy()
+            for group in (dual, ~dual):
+                balanced[group] *= (n / 2) / weights[group].sum()
+            weights = .5 * (weights + balanced)
+        multipliers[positive_rows, column] = weights
+        summary[label] = {"positives": n, "clusters": len(counts), "single_recorded": int((~dual).sum()),
+                          "single_weight_fraction": float(weights[~dual].sum() / n),
+                          "maximum_multiplier": float(weights.max())}
+    return multipliers, summary
+
+
 def function_projection(labels, track):
     """Independent-function groups. Antimicrobial is generic evidence, not another function."""
     if track in (*THERAPEP_TRACKS, "rich48"):
@@ -385,6 +417,7 @@ class BackbonePeptides(Dataset):
 class MultimodalPeptides(Dataset):
     def __init__(self, source, feature_root, split, limit=None, peptide_feature_root=None, sequence_only=False, indices=None):
         self.source = source
+        self.positive_multipliers = None
         self.sequence_only = sequence_only
         self.cache = CachedPeptides(source.data, feature_root, split)
         pool = self.cache.indices if indices is None else indices
@@ -419,6 +452,8 @@ class MultimodalPeptides(Dataset):
         if hasattr(self.source, "aux_mask"):
             sample["aux_y"] = torch.from_numpy(self.source.aux_y[i].astype(np.float32))
             sample["aux_mask"] = torch.tensor(bool(self.source.aux_mask[i]))
+        if self.positive_multipliers is not None:
+            sample["positive_multiplier"] = self.positive_multipliers[index]
         return sample
 
 

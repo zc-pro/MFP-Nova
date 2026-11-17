@@ -72,6 +72,8 @@ def main(argv=None):
                              help="TheraSet V4 A/B/C: original, residue order, or function-conditioned NLL")
             sub.add_argument("--v5-mode", choices=("baseline", "shared", "split", "semantic", "shuffled"),
                              help="TheraSet V5 controls and functional-graph variants")
+            sub.add_argument("--gram-positive-weighting", choices=("cluster", "cluster_context"),
+                             help="Fine39 TheraSet: rebalance recorded Gram positives across Train clusters and contexts")
             sub.add_argument("--hh-oof-fold", type=int, choices=range(3), help="Train a fresh Fine39 TheraSet for one held-out Train fold")
             sub.add_argument("--hh-oof-files", nargs=3, help="Three TheraSet fold exports for HH training")
             sub.add_argument("--annotations", help="B0/H1–H8: aligned NPZ of confirmed label and observation states")
@@ -203,8 +205,8 @@ def main(argv=None):
         write_json(args.output, result)
         print(json.dumps({"original_rows": result["original_rows"], "tracks": result["tracks"]}, ensure_ascii=False, indent=2))
     elif args.command == "train" and args.model in HYPOTHESIS_MODELS:
-        if args.v5_mode is not None:
-            parser.error("--v5-mode requires --model theraset")
+        if args.v5_mode is not None or args.gram_positive_weighting is not None:
+            parser.error("--v5-mode and --gram-positive-weighting require --model theraset")
         if args.v4_mode is not None:
             parser.error("--v4-mode requires --model theraset")
         if args.theraset_b0_backbone or args.theraset_b0_local_max or args.theraset_b0_local_cnn:
@@ -217,6 +219,11 @@ def main(argv=None):
         config_path = args.config or f"configs/{model_name}.yaml"
         config = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
         if args.command == "train":
+            if args.gram_positive_weighting is not None:
+                if args.v5_mode not in (None, "baseline"):
+                    parser.error("--gram-positive-weighting uses the V5 TheraSet baseline architecture")
+                args.v5_mode = "baseline"
+                config["train"]["gram_positive_weighting"] = args.gram_positive_weighting
             if args.v5_mode is not None:
                 if (model_name != "theraset" or args.resume or args.initialize_from or args.v4_mode
                         or args.hh_oof_fold is not None or config["train"].get("initialize_from")
