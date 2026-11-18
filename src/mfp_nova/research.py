@@ -17,7 +17,7 @@ from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
 from .metrics import evaluate_metrics, evaluate_groups, format_epoch, fit_global_threshold, fit_label_thresholds
 from .models import (HH_MODELS, HH_V15_RANKER, HH_V16, HH_V17, HH_V20, HH_V20_CHEMICAL_MODES,
-                     PEPTIDE_V3, PEPTIDE_V6, PEPTIDE_V7, SEQUENCE_ONLY_MODELS, XBRIDGE)
+                     PEPTIDE_V3, PEPTIDE_V6, PEPTIDE_V7, SEQUENCE_ONLY_MODELS, XBRIDGE, THERASET_BRIDGE)
 from .multimodal import BackbonePeptides, MultimodalData, MultimodalPeptides, backbone_inputs, collate_multimodal
 from .research_layers import observed_label_loss
 from .consistency import bernoulli_consistency, consistency_weight
@@ -27,6 +27,9 @@ from .metric_protocol import (FIXED_THRESHOLD_SUITES, JACCARD_ORDER, protocol_de
 
 
 def make_model(name, arguments):
+    if name == THERASET_BRIDGE:
+        from .models.theraset_bridge import TheraSetBridge
+        return TheraSetBridge(**arguments)
     if name == XBRIDGE:
         from .models.xbridge import XBridge
         return XBridge(**arguments)
@@ -290,10 +293,12 @@ def validate_cache(dataset, config, reference=None):
     settings = config.get("peptide_encoder")
     if (peptide is None) != (settings is None):
         raise ValueError("Peptide encoder configuration and cache must be supplied together")
-    if config.get("model_name") in (PEPTIDE_V7, XBRIDGE) and peptide is None:
+    if config.get("model_name") in (PEPTIDE_V7, XBRIDGE, THERASET_BRIDGE) and peptide is None:
         raise ValueError(f"{config['model_name']} requires both frozen ESM caches")
     if peptide is not None:
-        if config["model_name"] not in ("helixset", "theraset", "privilegedbridge", *SEQUENCE_ONLY_MODELS, *HH_MODELS, HH_V16, HH_V17, XBRIDGE):
+        if config["model_name"] not in (
+                "helixset", "theraset", "privilegedbridge", *SEQUENCE_ONLY_MODELS,
+                *HH_MODELS, HH_V16, HH_V17, XBRIDGE, THERASET_BRIDGE):
             raise ValueError("This architecture does not support dual frozen encoders")
         if peptide["name"] != settings["name"] or peptide["max_length"] != settings["max_length"]:
             raise ValueError("Configured peptide encoder differs from cache")
@@ -333,6 +338,9 @@ def epoch_loss_settings(config, epoch):
         for key in ("bridge", "axis_coverage"):
             if key in loss:
                 loss[key] *= ramp
+    if config.get("model_name") == THERASET_BRIDGE:
+        start = settings.get("warmup_epochs", 5)
+        loss["bridge"] = loss.get("bridge", 0.) * min(1., max(0., (epoch - start) / 5))
     if config.get("model_name") == "setreread" and epoch < settings.get("correction_start_epoch", 6):
         loss.update(edit_gain=0., recovery=0.)
     if config.get("model_name") == "privilegedbridge" and config["model"].get("stage") == "C":
@@ -571,6 +579,17 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
                 settings[key] = value
         inner_fold = original["train"].get("xbridge_inner_fold")
     suite = settings.get("metric_suite", "task_specific")
+    theraset_bridge = config["loss"].get("theraset_bridge")
+    if config["model_name"] == THERASET_BRIDGE:
+        if (config["data"]["track"] != "fine39" or suite != "jaccard"
+                or theraset_bridge not in ("off", "align", "positive")):
+            raise ValueError("TheraSet-Bridge requires Fine39, fixed-.50 Jaccard and an explicit bridge mode")
+        weight = config["loss"].get("bridge", 0.)
+        if (not math.isfinite(weight) or (weight > 0.) != (theraset_bridge != "off") or weight < 0.
+                or not -1 < config["loss"].get("bridge_margin", .5) < 1):
+            raise ValueError("Set a nonnegative bridge weight matching its mode and a margin in (-1, 1)")
+    elif theraset_bridge is not None:
+        raise ValueError("The bridge experiment uses model_name theraset_bridge")
     gram_weighting = settings.get("gram_positive_weighting")
     if gram_weighting is not None and (
             gram_weighting not in ("cluster", "cluster_context") or config["model_name"] != "theraset"
@@ -610,7 +629,7 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         raise ValueError("R-Drop weight must be finite and nonnegative")
     if rdrop:
         if config["model_name"] not in ("helixset", "theraset", "termiscale", "motifspan", "privilegedbridge",
-                                       "hh_setreread", PEPTIDE_V3, PEPTIDE_V6, PEPTIDE_V7):
+                                       "hh_setreread", PEPTIDE_V3, PEPTIDE_V6, PEPTIDE_V7, THERASET_BRIDGE):
             raise ValueError("This model does not support R-Drop")
         if settings.get("rdrop_start_epoch", 6) < 1 or settings.get("rdrop_ramp_epochs", 5) < 1:
             raise ValueError("R-Drop start epoch and ramp length must be positive")
@@ -672,8 +691,9 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         from .data import PeptideData
         from .hypothesis_data import family_folds
 
-        if config["model_name"] not in (XBRIDGE, "theraset") or config["data"]["track"] != "fine39" or inner_fold not in range(5):
-            raise ValueError("The internal Fine39 holdout requires XBridge or TheraSet and fold 0–4")
+        if (config["model_name"] not in (XBRIDGE, "theraset", THERASET_BRIDGE)
+                or config["data"]["track"] != "fine39" or inner_fold not in range(5)):
+            raise ValueError("The internal holdout requires a Fine39 XBridge or TheraSet model and fold 0–4")
         data = PeptideData(config["data"]["root"], "fine39")
         pool = data.indices("train")
         held = family_folds(data.clusters[pool], 5) == inner_fold
@@ -731,13 +751,13 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         training_data = ScoredPeptides(training_data, oof_scores[np.searchsorted(train_indices, training_data.indices)])
     loader_settings = dict(num_workers=num_workers, pin_memory=pin_memory, collate_fn=collate_multimodal)
     batch_sampler = None
-    if xbridge:
+    if xbridge or theraset_bridge is not None:
         from .xbridge_data import BridgePeptides, PositivePairBatches
 
         rows = datasets[0].indices
         clusters = source.data.clusters[rows]
         training_data = BridgePeptides(training_data, clusters)
-        if settings.get("xbridge_pair_batches"):
+        if theraset_bridge is not None or settings.get("xbridge_pair_batches"):
             batch_sampler = PositivePairBatches(source.data.y[rows], clusters, settings["batch_size"], generator)
     train_loader = (DataLoader(training_data, batch_sampler=batch_sampler, **loader_settings)
                     if batch_sampler is not None else DataLoader(training_data, batch_size=settings["batch_size"],
@@ -1237,6 +1257,11 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
             print(f"V1.6 | Phase={history['v16_phase']} BackboneLR={history['lr']:.3g} "
                   f"HeadLR={history['v16_head_lr']:.3g}", flush=True)
         print(f"Timing | Train={train_seconds:.1f}s DataWait={data_wait_seconds:.1f}s Val={validation_seconds:.1f}s", flush=True)
+        if theraset_bridge is not None and "bridge" in history["losses"]:
+            terms = history["losses"]
+            print(f"Bridge | mode={theraset_bridge} weight={loss_settings['bridge']:.4f} "
+                  f"loss={terms['bridge']:.6f} cluster_pairs={terms['bridge_cluster_pairs']:.1f} "
+                  f"active={terms['bridge_active']:.1%}", flush=True)
         if "metric_suite" in settings:
             print(f"Selection | suite={suite} key={key} best={best_key}@{best_epoch} "
                   f"threshold={selection_threshold} | {format_primary(suite, selection_report)}", flush=True)
@@ -1348,10 +1373,13 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     validation_split = "train_inner" if inner_fold is not None else "val"
     if inner_fold is not None:
         result.update(validation_scope=validation_split, internal_fold=inner_fold)
-    if xbridge:
+    if theraset_bridge is not None:
+        result["theraset_bridge"] = theraset_bridge
+    if xbridge or theraset_bridge is not None:
         from .xbridge_data import evidence_report
 
-        result["xbridge_diagnostics"] = evidence_report(y, probabilities, xbridge_outputs, source.statistics)
+        key = "xbridge_diagnostics" if xbridge else "theraset_bridge_diagnostics"
+        result[key] = evidence_report(y, probabilities, xbridge_outputs or {}, source.statistics)
     export_predictions = settings.get("export_validation_predictions", False)
     if export_predictions:
         result["validation_predictions"] = export_validation(
@@ -1603,10 +1631,13 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
               "annotation_based_metrics": True, "experimental_structure_group": None}
     if residue_nll is not None:
         result["order_nll"] = residue_nll
-    if checkpoint["model_name"] == XBRIDGE:
+    if checkpoint["model_name"] in (XBRIDGE, THERASET_BRIDGE):
         from .xbridge_data import evidence_report
 
-        result["xbridge_diagnostics"] = evidence_report(y, probabilities, extra_outputs, source.statistics)
+        key = "xbridge_diagnostics" if checkpoint["model_name"] == XBRIDGE else "theraset_bridge_diagnostics"
+        result[key] = evidence_report(y, probabilities, extra_outputs, source.statistics)
+        if checkpoint["model_name"] == THERASET_BRIDGE:
+            result["theraset_bridge"] = checkpoint["config"]["loss"]["theraset_bridge"]
         extra_outputs["cluster_id"] = source.data.clusters[dataset.indices]
     if v5_forward is not None:
         result["v5_inference_ablation"] = v5_forward

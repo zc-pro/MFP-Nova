@@ -13,6 +13,10 @@
 
 ## 当前研究
 
+### TheraSet-Bridge · 跨簇证据迁移
+
+`theraset_bridge` 复用 TheraSet 的多模态取证骨干，独立实现按簇对均衡的单向证据迁移。三组训练模式为 `off`、`align` 和 `positive`。[独立配置](configs/theraset_bridge.yaml) · [设计与训练说明](docs/XBridge-MFP.md#theraset-bridge-跨簇融合设计)
+
 ### XBridge-MFP · Fine39 跨簇功能取证
 
 `xbridge` 使用双 ESM 残基特征和化学标记，以独立查询读取每个 Fine39 标签的证据。支持在线 Peptide ESM LoRA、跨簇阳性桥接、逐轴覆盖消融和基于折外分数的冻结 TheraSet 残差。[模型配置](configs/xbridge.yaml) · [设计、验证与双平台训练方法](docs/XBridge-MFP.md)

@@ -1,0 +1,67 @@
+model_name: theraset_bridge
+data:
+  root: data/therapeutic_2025
+  track: fine39
+  features: features/esm2_650m
+  peptide_features: features/esm2_peptide_150m
+  augment: false
+encoder:
+  name: facebook/esm2_t33_650M_UR50D
+  revision: 08e4846e537177426273712802403f7ba8261b6c
+  max_length: 80
+  batch_size: 8
+peptide_encoder:
+  name: jiahuizhang/esm-150m-peptide-fine-tune
+  revision: 6d8cebf74c53b1032b6f5917e75e3253cb70f575
+  max_length: 80
+  batch_size: 8
+model:
+  dim: 256
+  heads: 8
+  dropout: 0.2
+  cnn_channels: 128
+  context_depth: 1
+  property_depth: 1
+  pair_dim: 32
+  decoder_depth: 2
+  factor_count: 8
+  prototype_count: 4
+  prototype_bank: 32
+  evidence_decoder: true
+  contextual_evidence: true
+  property_evidence: true
+  structure_evidence: true
+  chemical_evidence: true
+  pair_readout: true
+  prototype_readout: false
+  label_context: false
+loss:
+  unlabeled_weight: 0.3
+  direct: 0.2
+  evidence: 0.1
+  modality_dropout: 0.1
+  rdrop: 0.1
+  theraset_bridge: align
+  bridge: 0.025
+  bridge_margin: 0.5
+train:
+  device: cpu
+  seed: 42
+  epochs: 20
+  batch_size: 64
+  accumulation_steps: 1
+  precision: fp32
+  learning_rate: 0.0002
+  weight_decay: 0.01
+  patience: 0
+  warmup_epochs: 5
+  aux_warmup_epochs: 5
+  rdrop_start_epoch: 6
+  rdrop_ramp_epochs: 5
+  gradient_clip: 5
+  num_workers: 0
+  ema_decay: 0.999
+  ema_start_epoch: 6
+  metric_suite: jaccard
+  export_validation_predictions: true
+  output: runs

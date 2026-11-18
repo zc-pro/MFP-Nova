@@ -5,7 +5,7 @@ from pathlib import Path
 import yaml
 
 from .models import RESEARCH_MODELS, LEGACY_MODELS, HH_MODELS, HH_V15_RANKER, HH_V16, HH_V17, HH_V20, HH_V20_CHEMICAL_MODES
-from .models import PEPTIDE_V3, PEPTIDE_V6, PEPTIDE_V7, V3_MODES, V7_HEADS, XBRIDGE
+from .models import PEPTIDE_V3, PEPTIDE_V6, PEPTIDE_V7, V3_MODES, V7_HEADS, XBRIDGE, THERASET_BRIDGE
 from .metric_protocol import SUITES
 from .models.hypotheses import MODELS as HYPOTHESIS_MODELS
 from .data import TRACKS
@@ -84,6 +84,8 @@ def main(argv=None):
             sub.add_argument("--xbridge-oof", nargs=3, help="Three matching cluster-held-out TheraSet logit exports")
             sub.add_argument("--xbridge-bridge-weight", type=float, help="Set to zero for the same-pair-budget control")
             sub.add_argument("--xbridge-axis-weight", type=float, help="Set to zero for the axis coverage control")
+            sub.add_argument("--theraset-bridge", choices=("off", "align", "positive"),
+                             help="TheraSet-Bridge training arm with matched cross-cluster batches")
             sub.add_argument("--annotations", help="B0/H1–H8: aligned NPZ of confirmed label and observation states")
             sub.add_argument("--unlabeled-weight", type=float, help="Sequence study: optional weak BCE weight for unannotated zero bits")
             sub.add_argument("--fold-dir", help="Sequence study: share training-only B0 fold checkpoints")
@@ -179,7 +181,8 @@ def main(argv=None):
     summarize.add_argument("--split", choices=("val", "test"), default="val")
     summarize.add_argument("--output", help="Optional JSON; otherwise print")
     gpu_check = commands.add_parser("gpu-check", help="Real-cache full-model server probes and bounded short training")
-    gpu_check.add_argument("--models", nargs="+", choices=tuple(m for m in RESEARCH_MODELS if m not in ("hh_setreread_v13", "hh_setreread_v14", HH_V15_RANKER, HH_V17, PEPTIDE_V3, XBRIDGE)),
+    gpu_check.add_argument("--models", nargs="+", choices=tuple(m for m in RESEARCH_MODELS if m not in (
+        "hh_setreread_v13", "hh_setreread_v14", HH_V15_RANKER, HH_V17, PEPTIDE_V3, XBRIDGE, THERASET_BRIDGE)),
                            default=list(LEGACY_MODELS))
     gpu_check.add_argument("--tasks", nargs="+", choices=TRACKS, default=["major15", "fine39"])
     gpu_check.add_argument("--esm", choices=("35m", "650m"), default="650m")
@@ -231,6 +234,12 @@ def main(argv=None):
         config_path = args.config or f"configs/{model_name}.yaml"
         config = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
         if args.command == "train":
+            if args.theraset_bridge is not None:
+                if model_name != THERASET_BRIDGE or args.resume:
+                    parser.error("--theraset-bridge selects an arm of a fresh --model theraset_bridge run")
+                weight = config["loss"].get("bridge", .025) or .025
+                config["loss"].update(theraset_bridge=args.theraset_bridge,
+                                      bridge=0. if args.theraset_bridge == "off" else weight)
             if args.gram_positive_weighting is not None:
                 if args.v5_mode not in (None, "baseline"):
                     parser.error("--gram-positive-weighting uses the V5 TheraSet baseline architecture")
@@ -477,7 +486,7 @@ def main(argv=None):
                     config["train"][key] = value
             if args.rdrop_weight is not None:
                 if model_name not in ("helixset", "theraset", "termiscale", "motifspan", "privilegedbridge",
-                                       "hh_setreread", PEPTIDE_V3, PEPTIDE_V6, PEPTIDE_V7):
+                                       "hh_setreread", PEPTIDE_V3, PEPTIDE_V6, PEPTIDE_V7, THERASET_BRIDGE):
                     raise ValueError("This model does not support R-Drop")
                 config["loss"]["rdrop"] = args.rdrop_weight
             if args.loss is not None:
