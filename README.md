@@ -13,6 +13,10 @@
 
 ## 当前研究
 
+### XBridge-MFP · Fine39 跨簇功能取证
+
+`xbridge` 使用双 ESM 残基特征和化学标记，以独立查询读取每个 Fine39 标签的证据。支持在线 Peptide ESM LoRA、跨簇阳性桥接、逐轴覆盖消融和基于折外分数的冻结 TheraSet 残差。[模型配置](configs/xbridge.yaml) · [设计、验证与双平台训练方法](docs/XBridge-MFP.md)
+
 ### V7.0 · Fine39 功能轴状态与细类共存
 
 `peptide_v7` 复用 AA34 CNN 和长度 80 的双 ESM 末层缓存。训练选项 `--v7-head structured` 使用八轴三态和非空细类子集，`--v7-head flat` 使用同骨干的 39 个独立 sigmoid。默认固定阈值 0.50，按 Validation 样本 Jaccard 选模。验证集评估额外给出空预测补 Top-1 的指标，结构化组还输出按轴状态混淆矩阵及逐样本状态概率（指定 `--predictions`）。默认配置见 [peptide_v7.yaml](configs/peptide_v7.yaml)。

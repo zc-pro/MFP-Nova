@@ -21,9 +21,9 @@ NAME = "hh_setreread_v13"
 THRESHOLDS = (0., .005, .01, .02, .03, .05, .075, .10)
 
 
-def fold_indices(root, fold):
+def fold_indices(root, fold, pool=None):
     data = PeptideData(root, "fine39")
-    train = data.indices("train")
+    train = data.indices("train") if pool is None else pool
     held = family_folds(data.clusters[train], 3) == fold
     return train[~held], train[held]
 
@@ -48,8 +48,8 @@ def export_fold(run, model, loader, device, fold, epoch, diagnostic, elapsed):
     return result
 
 
-def load_oof(data, files, diagnostic=False):
-    train = data.indices("train")
+def load_oof(data, files, diagnostic=False, pool=None):
+    train = data.indices("train") if pool is None else pool
     folds = family_folds(data.clusters[train], 3)
     logits = np.empty((len(train), len(data.labels)), dtype=np.float32)
     filled = np.zeros(len(train), dtype=bool)

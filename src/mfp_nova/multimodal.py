@@ -135,7 +135,10 @@ def function_projection(labels, track):
 
 
 def independent_functions(y, projection):
-    result = (np.asarray(y) @ np.asarray(projection)) > 0
+    return suppress_generic_antimicrobial((np.asarray(y) @ np.asarray(projection)) > 0)
+
+
+def suppress_generic_antimicrobial(result):
     # Antibacterial/fungal/parasitic/viral evidence subsumes generic antimicrobial evidence.
     result[:, 4] &= ~result[:, :4].any(1)
     return result

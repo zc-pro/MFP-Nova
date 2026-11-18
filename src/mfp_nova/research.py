@@ -17,7 +17,7 @@ from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
 from .metrics import evaluate_metrics, evaluate_groups, format_epoch, fit_global_threshold, fit_label_thresholds
 from .models import (HH_MODELS, HH_V15_RANKER, HH_V16, HH_V17, HH_V20, HH_V20_CHEMICAL_MODES,
-                     PEPTIDE_V3, PEPTIDE_V6, PEPTIDE_V7, SEQUENCE_ONLY_MODELS)
+                     PEPTIDE_V3, PEPTIDE_V6, PEPTIDE_V7, SEQUENCE_ONLY_MODELS, XBRIDGE)
 from .multimodal import BackbonePeptides, MultimodalData, MultimodalPeptides, backbone_inputs, collate_multimodal
 from .research_layers import observed_label_loss
 from .consistency import bernoulli_consistency, consistency_weight
@@ -27,6 +27,9 @@ from .metric_protocol import (FIXED_THRESHOLD_SUITES, JACCARD_ORDER, protocol_de
 
 
 def make_model(name, arguments):
+    if name == XBRIDGE:
+        from .models.xbridge import XBridge
+        return XBridge(**arguments)
     if name == PEPTIDE_V3:
         from .models.peptide_v3 import PeptideV3
         return PeptideV3(**arguments)
@@ -113,7 +116,7 @@ def autocast_context(device, precision="fp32"):
 @torch.inference_mode()
 def predict_loader(model, loader, device, precision="fp32", loss_settings=None, decode_sets=False,
                    include_auxiliary=False, residue_nll=None, view_outputs=None, v5_forward=None,
-                   v6_outputs=None, v7_outputs=None):
+                   v6_outputs=None, v7_outputs=None, xbridge_outputs=None):
     model.eval()
     targets, probabilities, decisions, count_decisions = [], [], [], []
     component_weights, component_counts = [], []
@@ -127,6 +130,8 @@ def predict_loader(model, loader, device, precision="fp32", loss_settings=None, 
         v6_batches["evidence_weights"] = []
     if v7_outputs is not None:
         state_probabilities = []
+    if xbridge_outputs is not None:
+        xbridge_batches = {key: [] for key in ("auxiliary_logits", "reference_logits")}
     for batch in loader:
         moved = to_device(batch, device)
         with autocast_context(device, precision):
@@ -172,6 +177,12 @@ def predict_loader(model, loader, device, precision="fp32", loss_settings=None, 
             v6_batches["evidence_weights"].append(output["evidence_weights"].cpu().numpy())
         if v7_outputs is not None:
             state_probabilities.append(output["state_logits"].softmax(-1).cpu().numpy())
+        if xbridge_outputs is not None:
+            for key, batches in xbridge_batches.items():
+                if key in output:
+                    batches.append(output[key].float().cpu().numpy())
+    if xbridge_outputs is not None:
+        xbridge_outputs.update({key: np.concatenate(batches) for key, batches in xbridge_batches.items() if batches})
     if v7_outputs is not None:
         from .models.peptide_v7 import AXIS_NAMES, STATE_NAMES
         v7_outputs.update(state_probabilities=np.concatenate(state_probabilities),
@@ -218,7 +229,7 @@ def v16_count_support(data):
 
 
 def export_validation(run, stem, source, dataset, y, probabilities, threshold, epoch, weight_source, objective,
-                      predicted=None, count_predicted=None, view_outputs=None):
+                      predicted=None, count_predicted=None, view_outputs=None, split="val"):
     """Reuse collected Val predictions; no extra model forward or Test access."""
     rows = dataset.indices
     path = run/f"{stem}_validation.npz"
@@ -226,7 +237,7 @@ def export_validation(run, stem, source, dataset, y, probabilities, threshold, e
                                          "count_predicted": count_predicted}
     np.savez_compressed(path, row_id=source.data.rows[rows], ID=source.data.ids[rows],
                         cluster_id=source.data.clusters[rows], targets=y, probabilities=probabilities,
-                        label_names=np.array(source.data.labels), threshold=threshold, split="val",
+                        label_names=np.array(source.data.labels), threshold=threshold, split=split,
                         task=source.data.track, epoch=epoch, weight_source=weight_source,
                         selection_objective=objective, **extra, **(view_outputs or {}))
     actual = y.astype(bool)
@@ -234,7 +245,7 @@ def export_validation(run, stem, source, dataset, y, probabilities, threshold, e
     from .multimodal import independent_functions
     projection = source.statistics["function_projection"]
     summary = {
-        "split": "val", "epoch": epoch, "weight_source": weight_source, "selection_objective": objective,
+        "split": split, "epoch": epoch, "weight_source": weight_source, "selection_objective": objective,
         "threshold": threshold, "rows": len(y), "empty_predictions": int((~predicted.any(1)).sum()),
         "mean_predicted_labels": float(predicted.sum(1).mean()),
         "mean_observed_labels": float(actual.sum(1).mean()),
@@ -279,10 +290,10 @@ def validate_cache(dataset, config, reference=None):
     settings = config.get("peptide_encoder")
     if (peptide is None) != (settings is None):
         raise ValueError("Peptide encoder configuration and cache must be supplied together")
-    if config["model_name"] == PEPTIDE_V7 and peptide is None:
-        raise ValueError("V7 requires both frozen ESM caches")
+    if config.get("model_name") in (PEPTIDE_V7, XBRIDGE) and peptide is None:
+        raise ValueError(f"{config['model_name']} requires both frozen ESM caches")
     if peptide is not None:
-        if config["model_name"] not in ("helixset", "theraset", "privilegedbridge", *SEQUENCE_ONLY_MODELS, *HH_MODELS, HH_V16, HH_V17):
+        if config["model_name"] not in ("helixset", "theraset", "privilegedbridge", *SEQUENCE_ONLY_MODELS, *HH_MODELS, HH_V16, HH_V17, XBRIDGE):
             raise ValueError("This architecture does not support dual frozen encoders")
         if peptide["name"] != settings["name"] or peptide["max_length"] != settings["max_length"]:
             raise ValueError("Configured peptide encoder differs from cache")
@@ -318,6 +329,10 @@ def epoch_loss_settings(config, epoch):
         start = settings.get("rdrop_start_epoch", 6)
         duration = settings.get("rdrop_ramp_epochs", 5)
         loss["rdrop"] *= min(1., max(0., (epoch-start+1)/duration))
+    if config.get("model_name") == XBRIDGE:
+        for key in ("bridge", "axis_coverage"):
+            if key in loss:
+                loss[key] *= ramp
     if config.get("model_name") == "setreread" and epoch < settings.get("correction_start_epoch", 6):
         loss.update(edit_gain=0., recovery=0.)
     if config.get("model_name") == "privilegedbridge" and config["model"].get("stage") == "C":
@@ -350,7 +365,7 @@ def update_ema(ema, model, epoch, start_epoch, skipped):
 def frozen_tail_keys(model):
     """Pretrained tail tensors are reloaded by revision, not saved per checkpoint."""
     return {key for key, _ in model.named_parameters()
-            if key.removeprefix("module.").startswith("esm_tail.") and ".lora_" not in key}
+            if key.removeprefix("module.").startswith(("esm_tail.", "peptide_lora.encoder.")) and ".lora_" not in key}
 
 
 def checkpoint_state(model, cpu=False):
@@ -382,9 +397,10 @@ def make_optimizer(model, settings):
                   {"params": [p for key, p in parameters if key.startswith("bridges.")],
                    "lr": settings.get("bridge_learning_rate", 2e-4)}]
         groups = [g for g in groups if g["params"]]
-    elif getattr(model, "esm_tail", None) is not None:
-        groups = [{"params": [p for key, p in parameters if not key.startswith("esm_tail.")]},
-                  {"params": [p for key, p in parameters if key.startswith("esm_tail.")],
+    elif getattr(model, "esm_tail", None) is not None or getattr(model, "peptide_lora", None) is not None:
+        prefix = ("esm_tail.", "peptide_lora.")
+        groups = [{"params": [p for key, p in parameters if not key.startswith(prefix)]},
+                  {"params": [p for key, p in parameters if key.startswith(prefix)],
                    "lr": settings.get("esm_learning_rate", 1e-5)}]
     else:
         groups = [p for _, p in parameters]
@@ -434,11 +450,33 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     hh_model = hh or hh_v12
     hh_v16 = config["model_name"] == HH_V16
     hh_v20 = config["model_name"] == HH_V20
+    xbridge = config["model_name"] == XBRIDGE
+    inner_fold = settings.get("xbridge_inner_fold")
     peptide_v3 = config["model_name"] == PEPTIDE_V3
     if peptide_v3 and config["data"]["track"] not in ("fine39", "major15", "rich48"):
         raise ValueError("V3 uses the project Fine39, Major15 or Rich48 split")
-    if config["model_name"] in (PEPTIDE_V6, PEPTIDE_V7) and config["data"]["track"] != "fine39":
+    if config["model_name"] in (PEPTIDE_V6, PEPTIDE_V7, XBRIDGE) and config["data"]["track"] != "fine39":
         raise ValueError(f"{config['model_name']} uses the project Fine39 split")
+    anchor = None
+    if xbridge:
+        anchor_path = settings.get("xbridge_reference")
+        for key in ("bridge", "axis_coverage", "evidence_classification"):
+            value = config["loss"].get(key, 0.3 if key == "evidence_classification" else 0.)
+            if not math.isfinite(value) or value < 0 or (anchor_path and key == "evidence_classification" and value == 0):
+                raise ValueError(f"Invalid XBridge loss weight: {key}")
+        if not 0 < config["loss"].get("axis_temperature", .2) < math.inf or not -1 < config["loss"].get("bridge_margin", .5) < 1:
+            raise ValueError("Use a positive axis temperature and cosine margin in (-1, 1)")
+        if bool(anchor_path) != bool(settings.get("oof_files")):
+            raise ValueError("XBridge residual training requires a frozen TheraSet and all three OOF exports")
+        if anchor_path and checkpoint is None:
+            anchor = torch.load(anchor_path, map_location="cpu", weights_only=True)
+            if (anchor["model_name"] != "theraset" or anchor["track"] != "fine39"
+                    or anchor["config"]["train"].get("hh_oof_fold") is not None
+                    or anchor["config"]["train"].get("xbridge_inner_fold") != inner_fold):
+                raise ValueError("The frozen reference must be the full TheraSet for the current Fine39 training scope")
+        online = config["model"].get("online_encoder")
+        if online and any(online[key] != config["peptide_encoder"][key] for key in ("name", "revision", "max_length")):
+            raise ValueError("XBridge online ESM must match the peptide cache tokenizer and revision")
     if hh_v20 and config["data"]["track"] != "fine39":
         raise ValueError("HH V2.0 predicts Fine39 and uses Major15 as auxiliary supervision")
     ranker = config["model_name"] == HH_V15_RANKER
@@ -531,6 +569,7 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         for key, value in original["train"].items():
             if key not in ("device", "output", "epochs", "num_workers", "max_steps"):
                 settings[key] = value
+        inner_fold = original["train"].get("xbridge_inner_fold")
     suite = settings.get("metric_suite", "task_specific")
     gram_weighting = settings.get("gram_positive_weighting")
     if gram_weighting is not None and (
@@ -624,14 +663,25 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         raise ValueError("Use reconstruction_gradient=sum/cap/project and a finite nonnegative gradient ratio")
     if reconstruction_gradient != "sum" and config["model_name"] != "trirelay":
         raise ValueError("Reconstruction gradient balancing currently supports TriRelay")
-    reference_checkpoint = checkpoint or initial
+    reference_checkpoint = checkpoint or initial or anchor
     family_supervision = hh_v20 and config["model"]["mode"] in ("auxiliary", "full")
     localize_terminals = hh_v20 and config["model"]["mode"] not in HH_V20_CHEMICAL_MODES
     sequence_only = setreread or config["model_name"] in SEQUENCE_ONLY_MODELS
     train_indices = held_indices = None
+    if inner_fold is not None:
+        from .data import PeptideData
+        from .hypothesis_data import family_folds
+
+        if config["model_name"] not in (XBRIDGE, "theraset") or config["data"]["track"] != "fine39" or inner_fold not in range(5):
+            raise ValueError("The internal Fine39 holdout requires XBridge or TheraSet and fold 0–4")
+        data = PeptideData(config["data"]["root"], "fine39")
+        pool = data.indices("train")
+        held = family_folds(data.clusters[pool], 5) == inner_fold
+        train_indices, held_indices = pool[~held], pool[held]
+    oof_pool = train_indices
     if fold is not None:
         from .hh_v13 import fold_indices
-        train_indices, held_indices = fold_indices(config["data"]["root"], fold)
+        train_indices, held_indices = fold_indices(config["data"]["root"], fold, oof_pool)
     source = MultimodalData(config["data"]["root"], config["data"]["track"],
                            reference_checkpoint["statistics"] if reference_checkpoint else None,
                            config.get("min_factor_support", 20), config.get("max_factors", 32),
@@ -641,21 +691,25 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         raise ValueError("PB B/C need observed auxiliary inputs; use rich48 or stage A for author sequence tasks")
     if function_aux or family_supervision:
         source.enable_function_auxiliary()
+    if anchor is not None and list(anchor["labels"]) != list(source.data.labels):
+        raise ValueError("Reference label order differs from Fine39")
     limit = settings.get("limit_samples")
     diagnostic = bool(limit or settings.get("max_steps") or (checkpoint and checkpoint["config"]["train"].get("max_steps")))
-    use_oof = bool(hard_weight or (hh_v16 and
+    if anchor is not None and not diagnostic and any(anchor["config"]["train"].get(key) for key in ("limit_samples", "max_steps")):
+        raise ValueError("Full-scope XBridge requires a full-scope reference checkpoint")
+    use_oof = bool((xbridge and settings.get("oof_files")) or hard_weight or (hh_v16 and
                    (config["loss"].get("hard_row_weight", 0.) or config["loss"].get("retain", 0.))))
     if use_oof:
         if len(settings.get("oof_files", ())) != 3:
-            raise ValueError("HH V1.6 requires three TheraSet --hh-oof-files")
+            raise ValueError("Provide three TheraSet OOF exports")
         from .hh_v13 import ScoredPeptides, load_oof
-        train_indices, oof_scores = load_oof(source.data, settings["oof_files"], diagnostic)
+        train_indices, oof_scores = load_oof(source.data, settings["oof_files"], diagnostic, oof_pool)
     # Diagnostic optimization subsets retain full original-Train priors/statistics:
     # shrinking the subset must not erase empirical factors or prototype capacity.
     if peptide_v3:
         datasets = [BackbonePeptides(source, split, config["encoder"]["max_length"], limit) for split in ("train", "val")]
     else:
-        datasets = [MultimodalPeptides(source, config["data"]["features"], "train" if fold is not None else split, limit,
+        datasets = [MultimodalPeptides(source, config["data"]["features"], "train" if (fold is not None or inner_fold is not None) else split, limit,
                                        config["data"].get("peptide_features"),
                                        sequence_only=sequence_only or (pb and config["model"].get("stage", "A") == "A"),
                                        indices=indices) for split, indices in (("train", train_indices), ("val", held_indices))]
@@ -675,15 +729,30 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         print(f"Gram positive weighting | {gram_weighting} | {json.dumps(gram_weight_summary)}", flush=True)
     if use_oof:
         training_data = ScoredPeptides(training_data, oof_scores[np.searchsorted(train_indices, training_data.indices)])
-    loaders = [DataLoader(data, batch_size=settings["batch_size"], shuffle=shuffle, num_workers=num_workers,
-                          pin_memory=pin_memory, collate_fn=collate_multimodal, generator=generator if shuffle else None)
-               for data, shuffle in ((training_data, True), (datasets[1], False))]
+    loader_settings = dict(num_workers=num_workers, pin_memory=pin_memory, collate_fn=collate_multimodal)
+    batch_sampler = None
+    if xbridge:
+        from .xbridge_data import BridgePeptides, PositivePairBatches
+
+        rows = datasets[0].indices
+        clusters = source.data.clusters[rows]
+        training_data = BridgePeptides(training_data, clusters)
+        if settings.get("xbridge_pair_batches"):
+            batch_sampler = PositivePairBatches(source.data.y[rows], clusters, settings["batch_size"], generator)
+    train_loader = (DataLoader(training_data, batch_sampler=batch_sampler, **loader_settings)
+                    if batch_sampler is not None else DataLoader(training_data, batch_size=settings["batch_size"],
+                                                                shuffle=True, generator=generator, **loader_settings))
+    loaders = [train_loader, DataLoader(datasets[1], batch_size=settings["batch_size"], **loader_settings)]
     print(f"DataLoader | workers={num_workers} pin_memory={pin_memory}", flush=True)
     args = {"num_labels": len(source.data.labels), "statistics": source.statistics["labels"], **config["model"]}
     if not peptide_v3:
         args.update(input_dim=datasets[0].meta["input_dim"], vocab_size=len(source.statistics["chemical_vocab"])+2)
     if hh_v16:
         args["count_support"] = v16_count_support(source.data)
+    if xbridge:
+        args["function_projection"] = source.statistics["function_projection"]
+        args["reference_args"] = (checkpoint["model_args"]["reference_args"] if checkpoint else
+                                  anchor["model_args"] if anchor is not None else None)
     if config["model_name"] == PEPTIDE_V7 and args.get("head", "structured") == "structured":
         from .models.peptide_v7 import fit_axis_counts
         args["axis_counts"] = checkpoint["model_args"]["axis_counts"] if checkpoint else fit_axis_counts(source.data)
@@ -699,6 +768,9 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     if family_supervision:
         args["family_statistics"] = source.statistics["function_auxiliary"]
     model = make_model(config["model_name"], args).to(device)
+    if anchor is not None:
+        restore_model_state(model.reference, anchor["model_state"])
+        del anchor
     if initial is not None and not pb:
         restore_model_state(model.backbone if hh_model or hh_v16 else model, initial["model_state"])
         del initial
@@ -869,6 +941,9 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
                                             "tracking_start_epoch": candidate_start,
                                             "stopping": "primary suite only; one shared optimizer trajectory"}
     if not resume_in_place or checkpoint is None:
+        if inner_fold is not None:
+            metadata["validation_scope"] = "internal_fine39_train_clusters"
+            metadata["internal_fold"] = inner_fold
         if fold is not None:
             metadata["val_rows"] = 0
             metadata["held_rows"] = len(datasets[1])
@@ -884,10 +959,11 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     validation_groups = (source.groups(datasets[1].indices, source.data.y[datasets[1].indices])
                          if fold is None else {})
 
-    def collect_validation(candidate, view_outputs=None):
+    def collect_validation(candidate, view_outputs=None, xbridge_outputs=None):
         residue_nll = {} if getattr(candidate, "order_evidence", None) is not None else None
         values = predict_loader(candidate, loaders[1], device, precision, config["loss"],
-                                decode_sets=hh_v16, residue_nll=residue_nll, view_outputs=view_outputs)
+                                decode_sets=hh_v16, residue_nll=residue_nll, view_outputs=view_outputs,
+                                xbridge_outputs=xbridge_outputs)
         return values if hh_v16 else (*values, None, None, residue_nll)
 
     epoch = checkpoint["epoch"] if checkpoint else 0
@@ -1220,7 +1296,8 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         return export_fold(run, selected, loaders[1], device, fold, epoch, diagnostic, time.perf_counter()-started)
     restore_model_state(model, best_state)
     view_outputs = {} if getattr(model, "v5_readout", None) is not None else None
-    y, probabilities, validation_loss, predicted, count_predicted, components = collect_validation(model, view_outputs)
+    xbridge_outputs = {} if xbridge else None
+    y, probabilities, validation_loss, predicted, count_predicted, components = collect_validation(model, view_outputs, xbridge_outputs)
     threshold = final_threshold(y, probabilities, suite, settings.get("threshold_strategy", "global"))
     torch.save({**static, "model_state": best_state, "best_epoch": best_epoch, "threshold": threshold,
                 "weight_source": best_weights}, run/"best.pt")
@@ -1268,11 +1345,19 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
                               "overlap_with_semantic": float((actual & semantic).sum() / max(actual.sum(), 1))}
     if not hh_v16 and components is not None:
         result["validation_order_nll"] = components
+    validation_split = "train_inner" if inner_fold is not None else "val"
+    if inner_fold is not None:
+        result.update(validation_scope=validation_split, internal_fold=inner_fold)
+    if xbridge:
+        from .xbridge_data import evidence_report
+
+        result["xbridge_diagnostics"] = evidence_report(y, probabilities, xbridge_outputs, source.statistics)
     export_predictions = settings.get("export_validation_predictions", False)
     if export_predictions:
         result["validation_predictions"] = export_validation(
             run, "best", source, datasets[1], y, probabilities, threshold, best_epoch, best_weights, suite,
-            predicted=predicted, count_predicted=count_predicted, view_outputs=view_outputs)
+            predicted=predicted, count_predicted=count_predicted, view_outputs=xbridge_outputs or view_outputs,
+            split=validation_split)
     if save_candidates and alternate_best is not None:
         candidate = alternate_best
         alternate_path = run/f"{alternate_stem}.pt"
@@ -1294,7 +1379,7 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         if export_predictions:
             result["alternate_selection"]["validation_predictions"] = export_validation(
                 run, alternate_stem, source, datasets[1], alternate_y, alternate_p, candidate["threshold"],
-                candidate["epoch"], candidate["weight_source"], alternate_suite)
+                candidate["epoch"], candidate["weight_source"], alternate_suite, split=validation_split)
     if ema is not None:
         restore_model_state(model, online_best_state)
         raw_y, raw_p, raw_loss = predict_loader(model, loaders[1], device, precision, config["loss"])
@@ -1498,7 +1583,8 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
         y, probabilities = predict_loader(model, loader, device, residue_nll=residue_nll,
                                           view_outputs=view_outputs, v5_forward=v5_forward,
                                           v6_outputs=extra_outputs if v6_diagnostics else None,
-                                          v7_outputs=v7_outputs)
+                                          v7_outputs=v7_outputs,
+                                          xbridge_outputs=extra_outputs if checkpoint["model_name"] == XBRIDGE else None)
     threshold = checkpoint["threshold"]
     if decision_path:
         from .decisions import apply_decision
@@ -1517,6 +1603,11 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
               "annotation_based_metrics": True, "experimental_structure_group": None}
     if residue_nll is not None:
         result["order_nll"] = residue_nll
+    if checkpoint["model_name"] == XBRIDGE:
+        from .xbridge_data import evidence_report
+
+        result["xbridge_diagnostics"] = evidence_report(y, probabilities, extra_outputs, source.statistics)
+        extra_outputs["cluster_id"] = source.data.clusters[dataset.indices]
     if v5_forward is not None:
         result["v5_inference_ablation"] = v5_forward
     if v6_diagnostics:

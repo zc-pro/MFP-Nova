@@ -5,7 +5,7 @@ from pathlib import Path
 import yaml
 
 from .models import RESEARCH_MODELS, LEGACY_MODELS, HH_MODELS, HH_V15_RANKER, HH_V16, HH_V17, HH_V20, HH_V20_CHEMICAL_MODES
-from .models import PEPTIDE_V3, PEPTIDE_V6, PEPTIDE_V7, V3_MODES, V7_HEADS
+from .models import PEPTIDE_V3, PEPTIDE_V6, PEPTIDE_V7, V3_MODES, V7_HEADS, XBRIDGE
 from .metric_protocol import SUITES
 from .models.hypotheses import MODELS as HYPOTHESIS_MODELS
 from .data import TRACKS
@@ -77,6 +77,13 @@ def main(argv=None):
                              help="Fine39 TheraSet: rebalance recorded Gram positives across Train clusters and contexts")
             sub.add_argument("--hh-oof-fold", type=int, choices=range(3), help="Train a fresh Fine39 TheraSet for one held-out Train fold")
             sub.add_argument("--hh-oof-files", nargs=3, help="Three TheraSet fold exports for HH training")
+            sub.add_argument("--xbridge-inner-fold", type=int, choices=range(5),
+                             help="Hold out a cluster fold inside original Fine39 Train")
+            sub.add_argument("--xbridge-online", action="store_true", help="Adapt the last four peptide ESM layers with LoRA")
+            sub.add_argument("--xbridge-reference", help="Frozen Fine39 TheraSet checkpoint for residual training")
+            sub.add_argument("--xbridge-oof", nargs=3, help="Three matching cluster-held-out TheraSet logit exports")
+            sub.add_argument("--xbridge-bridge-weight", type=float, help="Set to zero for the same-pair-budget control")
+            sub.add_argument("--xbridge-axis-weight", type=float, help="Set to zero for the axis coverage control")
             sub.add_argument("--annotations", help="B0/H1–H8: aligned NPZ of confirmed label and observation states")
             sub.add_argument("--unlabeled-weight", type=float, help="Sequence study: optional weak BCE weight for unannotated zero bits")
             sub.add_argument("--fold-dir", help="Sequence study: share training-only B0 fold checkpoints")
@@ -172,7 +179,7 @@ def main(argv=None):
     summarize.add_argument("--split", choices=("val", "test"), default="val")
     summarize.add_argument("--output", help="Optional JSON; otherwise print")
     gpu_check = commands.add_parser("gpu-check", help="Real-cache full-model server probes and bounded short training")
-    gpu_check.add_argument("--models", nargs="+", choices=tuple(m for m in RESEARCH_MODELS if m not in ("hh_setreread_v13", "hh_setreread_v14", HH_V15_RANKER, HH_V17, PEPTIDE_V3)),
+    gpu_check.add_argument("--models", nargs="+", choices=tuple(m for m in RESEARCH_MODELS if m not in ("hh_setreread_v13", "hh_setreread_v14", HH_V15_RANKER, HH_V17, PEPTIDE_V3, XBRIDGE)),
                            default=list(LEGACY_MODELS))
     gpu_check.add_argument("--tasks", nargs="+", choices=TRACKS, default=["major15", "fine39"])
     gpu_check.add_argument("--esm", choices=("35m", "650m"), default="650m")
@@ -400,6 +407,22 @@ def main(argv=None):
             if args.model != "sequence":
                 from .research import train
                 config["model_name"] = args.model
+                if args.xbridge_inner_fold is not None:
+                    config["train"]["xbridge_inner_fold"] = args.xbridge_inner_fold
+                xbridge_options = (args.xbridge_reference, args.xbridge_oof,
+                                   args.xbridge_bridge_weight, args.xbridge_axis_weight)
+                if args.xbridge_online or any(value is not None for value in xbridge_options):
+                    if args.model != XBRIDGE or args.resume:
+                        parser.error("XBridge options require a fresh --model xbridge run")
+                    if args.xbridge_online:
+                        encoder = config["peptide_encoder"]
+                        config["model"]["online_encoder"] = {key: encoder[key] for key in ("name", "revision", "max_length")}
+                    for key, value in zip(("xbridge_reference", "oof_files"), xbridge_options[:2]):
+                        if value is not None:
+                            config["train"][key] = value
+                    for key, value in zip(("bridge", "axis_coverage"), xbridge_options[2:]):
+                        if value is not None:
+                            config["loss"][key] = value
                 if args.latent_depth is not None:
                     if args.model != "helixset" or args.latent_depth < 1:
                         raise ValueError("--latent-depth requires HelixSet and a positive depth")
