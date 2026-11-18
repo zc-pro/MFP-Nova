@@ -490,6 +490,17 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     ranker = config["model_name"] == HH_V15_RANKER
     initial = None
     initialize = settings.get("initialize_from")
+    helix_recovery = checkpoint is None and config["model_name"] == "helixset" and initialize
+    if helix_recovery:
+        initial = torch.load(initialize, map_location="cpu", weights_only=True)
+        original_args = initial["model_args"]
+        if (initial["model_name"] != "helixset" or initial["track"] != "fine39"
+                or config["data"]["track"] != "fine39" or original_args.get("latent_depth") != 6
+                or original_args.get("decoder_depth") != 3 or original_args.get("evidence_readout")):
+            raise ValueError("HelixSet recovery requires the original Fine39 6-latent/3-decoder checkpoint")
+        config["model"] = {key: value for key, value in original_args.items()
+                           if key not in ("input_dim", "peptide_input_dim", "vocab_size", "num_labels", "statistics")}
+        config["model"]["decoder_depth"] = 2
     if checkpoint is None and (hh_model or hh_v16 or (config["model_name"] == "theraset" and initialize)):
         if not initialize:
             raise ValueError("HH-SetReread requires --initialize-from pointing to the Fine39 TheraSet best.pt")
@@ -579,6 +590,10 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
                 settings[key] = value
         inner_fold = original["train"].get("xbridge_inner_fold")
     suite = settings.get("metric_suite", "task_specific")
+    fixed_threshold = settings.get("fixed_threshold", .5)
+    if fixed_threshold != .5 and (config["model_name"] != "helixset" or suite != "jaccard"
+                                  or not 0 < fixed_threshold < 1):
+        raise ValueError("Custom fixed threshold requires HelixSet with the Jaccard suite")
     theraset_bridge = config["loss"].get("theraset_bridge")
     if config["model_name"] == THERASET_BRIDGE:
         if (config["data"]["track"] != "fine39" or suite != "jaccard"
@@ -633,7 +648,7 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
             raise ValueError("This model does not support R-Drop")
         if settings.get("rdrop_start_epoch", 6) < 1 or settings.get("rdrop_ramp_epochs", 5) < 1:
             raise ValueError("R-Drop start epoch and ramp length must be positive")
-    protocol = protocol_description(suite, settings.get("threshold_strategy", "global"))
+    protocol = protocol_description(suite, settings.get("threshold_strategy", "global"), fixed_threshold)
     if hh_v16:
         protocol = joint_set_protocol()
     setreread_start = settings.get("correction_start_epoch", 6) if setreread else 1
@@ -792,6 +807,11 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         restore_model_state(model.reference, anchor["model_state"])
         del anchor
     if initial is not None and not pb:
+        if helix_recovery:
+            if list(initial["labels"]) != list(source.data.labels):
+                raise ValueError("HelixSet initialization labels differ from Fine39")
+            initial["model_state"] = {name: value for name, value in initial["model_state"].items()
+                                      if not name.startswith("decoder.2.")}
         restore_model_state(model.backbone if hh_model or hh_v16 else model, initial["model_state"])
         del initial
     elif initial is not None:
@@ -911,7 +931,7 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
                 "label_semantics": "Observed annotations; 0 is unannotated, not experimentally confirmed negative",
                 "statistics_train_rows": source.statistics["train_rows"],
                 "resume": str(resume) if resume else None, "diagnostic_subset": diagnostic,
-                "monitor_threshold": .5, "train_metrics_scope": "online_augmented_changing_weights",
+                "monitor_threshold": fixed_threshold, "train_metrics_scope": "online_augmented_changing_weights",
                 "validation_loss_scope": "main_classification_clean_eval; no stochastic auxiliary reconstruction"}
     if gram_weight_summary is not None:
         metadata["gram_positive_weights"] = gram_weight_summary
@@ -989,14 +1009,16 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     epoch = checkpoint["epoch"] if checkpoint else 0
     if suite == "jaccard" and checkpoint is None and fold is None and not hh_v16:
         y, probabilities, validation_loss, _, _, _ = collect_validation(model)
-        report = metrics(y, probabilities, source.statistics)
-        best_key, best_selection_threshold, _ = selection(y, probabilities, report, suite, "fixed_0_5")
+        report = metrics(y, probabilities, source.statistics, fixed_threshold)
+        best_key, best_selection_threshold, _ = selection(y, probabilities, report, suite, protocol["threshold_strategy"],
+                                                           fixed_threshold)
         phase_best = best_key[0]
         best_ranking = (report["macro_ap"], report["micro_ap"])
         best_state = checkpoint_state(model, cpu=True)
         online_best_state, online_best_key = best_state, best_key
         if save_candidates:
-            alternate_best = {"key": [report["micro_f1"]], "epoch": 0, "threshold": .5,
+            alternate_report = report if fixed_threshold == .5 else metrics(y, probabilities, source.statistics)
+            alternate_best = {"key": [alternate_report["micro_f1"]], "epoch": 0, "threshold": .5,
                               "weight_source": "online", "validation_loss": validation_loss,
                               "model_state": best_state, "targets": torch.from_numpy(y),
                               "probabilities": torch.from_numpy(probabilities)}
@@ -1117,15 +1139,16 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
             if settings.get("max_steps") and global_step >= settings["max_steps"]:
                 break
             continue
-        train_report = metrics(np.concatenate(online_targets), np.concatenate(online_probabilities), source.statistics)
+        train_report = metrics(np.concatenate(online_targets), np.concatenate(online_probabilities), source.statistics,
+                               fixed_threshold)
         del online_targets, online_probabilities
         validation_start = time.perf_counter()
         y, probabilities, validation_loss, predicted, _, components = collect_validation(model)
-        report = metrics(y, probabilities, source.statistics, predicted=predicted)
+        report = metrics(y, probabilities, source.statistics, fixed_threshold, predicted=predicted)
         selected_model, validation_weights = model, "online"
         online_report, online_loss = report, validation_loss
         if ema is not None:
-            online_selection = selection(y, probabilities, report, suite, protocol["threshold_strategy"])
+            online_selection = selection(y, probabilities, report, suite, protocol["threshold_strategy"], fixed_threshold)
             online_key = online_selection[0]
             if online_key > online_best_key:
                 online_best_key, online_best_epoch = online_key, epoch
@@ -1137,15 +1160,15 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
                 # zero workers. Preserve it so this observation does not change Train RNG.
                 with torch.random.fork_rng(devices=[]):
                     y, probabilities, validation_loss, predicted, _, components = collect_validation(selected_model)
-                report = metrics(y, probabilities, source.statistics, predicted=predicted)
-        groups = evaluate_groups(y, probabilities, validation_groups, .5, source.statistics["labels"]["support"],
+                report = metrics(y, probabilities, source.statistics, fixed_threshold, predicted=predicted)
+        groups = evaluate_groups(y, probabilities, validation_groups, fixed_threshold, source.statistics["labels"]["support"],
                                  source.statistics["function_projection"], predicted)
         validation_seconds = time.perf_counter() - validation_start
         if report["macro_ap"] is None:
             raise ValueError("No positive Validation labels for checkpoint selection")
         key, selection_threshold, selection_report = (
             online_selection if ema is not None and selected_model is model
-            else selection(y, probabilities, report, suite, protocol["threshold_strategy"]))
+            else selection(y, probabilities, report, suite, protocol["threshold_strategy"], fixed_threshold))
         if hh_v16:
             selection_threshold = None
         if key>best_key:
@@ -1165,8 +1188,9 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
             else:
                 stale += 1
         if save_candidates:
+            alternate_report = report if fixed_threshold == .5 else metrics(y, probabilities, source.statistics)
             alternate_key, alternate_threshold, _ = selection(
-                y, probabilities, report, alternate_suite, protocol["threshold_strategy"])
+                y, probabilities, alternate_report, alternate_suite, protocol["threshold_strategy"])
             if alternate_best is None or alternate_key > tuple(alternate_best["key"]):
                 if alternate_threshold is None:
                     alternate_threshold = (fit_label_thresholds(y, probabilities)
@@ -1187,7 +1211,7 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
                    "train": train_report, "train_rows": count, "train_metrics_scope": "online_augmented_changing_weights",
                    "validation": report, "validation_loss": validation_loss,
                    "validation_loss_scope": "main_classification_clean_eval; no stochastic auxiliary reconstruction",
-                   "validation_rows": len(y), "validation_groups": groups, "monitor_threshold": .5,
+                   "validation_rows": len(y), "validation_groups": groups, "monitor_threshold": fixed_threshold,
                    "best_macro_ap": best_ranking[0], "best_micro_ap": best_ranking[1], "best_epoch": best_epoch,
                    "early_stopping_count": stale, "peak_cuda_memory_bytes": epoch_peak}
         if hh:
@@ -1323,7 +1347,7 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     view_outputs = {} if getattr(model, "v5_readout", None) is not None else None
     xbridge_outputs = {} if xbridge else None
     y, probabilities, validation_loss, predicted, count_predicted, components = collect_validation(model, view_outputs, xbridge_outputs)
-    threshold = final_threshold(y, probabilities, suite, settings.get("threshold_strategy", "global"))
+    threshold = final_threshold(y, probabilities, suite, settings.get("threshold_strategy", "global"), fixed_threshold)
     torch.save({**static, "model_state": best_state, "best_epoch": best_epoch, "threshold": threshold,
                 "weight_source": best_weights}, run/"best.pt")
     if device.type=="cuda":
@@ -1340,8 +1364,8 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
               "validation_loss": validation_loss, "validation_loss_scope": "main_classification_clean_eval",
               "validation_groups": evaluate_groups(y, probabilities, validation_groups, threshold,
                   source.statistics["labels"]["support"], source.statistics["function_projection"], predicted),
-              "labels": source.data.labels, "monitor_threshold": .5,
-              "final_metrics_scope": ("best_checkpoint_at_fixed_0_5" if suite in FIXED_THRESHOLD_SUITES
+              "labels": source.data.labels, "monitor_threshold": fixed_threshold,
+              "final_metrics_scope": (f"best_checkpoint_at_{protocol['threshold_strategy']}" if suite in FIXED_THRESHOLD_SUITES
                                       else "best_checkpoint_with_validation_fitted_threshold"),
               "annotation_based_metrics": True,
               "checkpoint": str(run/"best.pt")}
@@ -1411,7 +1435,7 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     if ema is not None:
         restore_model_state(model, online_best_state)
         raw_y, raw_p, raw_loss = predict_loader(model, loaders[1], device, precision, config["loss"])
-        raw_threshold = final_threshold(raw_y, raw_p, suite, settings.get("threshold_strategy", "global"))
+        raw_threshold = final_threshold(raw_y, raw_p, suite, settings.get("threshold_strategy", "global"), fixed_threshold)
         torch.save({**static, "model_state": online_best_state, "best_epoch": online_best_epoch,
                     "threshold": raw_threshold, "weight_source": "online"}, run/"online_best.pt")
         result.update(weight_source=best_weights, ema_updates=int(ema.n_averaged),
@@ -1687,7 +1711,8 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
         result["therapep"] = published_metrics(y, probabilities, threshold)
     settings = checkpoint["config"]["train"]
     suite = checkpoint.get("selection_suite", settings.get("metric_suite", "task_specific"))
-    result["metric_protocol"] = protocol_description(suite, settings.get("threshold_strategy", "global"))
+    result["metric_protocol"] = protocol_description(
+        suite, settings.get("threshold_strategy", "global"), settings.get("fixed_threshold", .5))
     if joint:
         result["metric_protocol"] = joint_set_protocol()
         result["joint_components"] = components

@@ -18,16 +18,17 @@ def primary_metrics(report, suite):
     return {name: report[name] for name in fields if name in report}
 
 
-def protocol_description(suite, strategy):
+def protocol_description(suite, strategy, fixed_threshold=0.5):
     if suite not in SUITES:
         raise ValueError(f"metric_suite must be one of {SUITES}")
     if suite in FIXED_THRESHOLD_SUITES:
         order = JACCARD_ORDER if suite == "jaccard" else ("micro_f1",)
+        suffix = str(fixed_threshold).replace(".", "_")
         return {"metric_suite": suite,
-                "selection": [f"val_{key}_at_0_5" for key in order] + ["earlier_epoch"],
-                "threshold_strategy": "fixed_0_5", "threshold_objective": None,
-                "threshold_fit_split": None, "selection_threshold": 0.5,
-                "monitor_threshold": 0.5, "absolute_false_direction": "minimize"}
+                "selection": [f"val_{key}_at_{suffix}" for key in order] + ["earlier_epoch"],
+                "threshold_strategy": f"fixed_{suffix}", "threshold_objective": None,
+                "threshold_fit_split": None, "selection_threshold": fixed_threshold,
+                "monitor_threshold": fixed_threshold, "absolute_false_direction": "minimize"}
     return {
         "metric_suite": suite,
         "selection": (["val_fitted_accuracy", "val_fitted_absolute_true", "earlier_epoch"]
@@ -41,12 +42,12 @@ def protocol_description(suite, strategy):
     }
 
 
-def selection(y, probabilities, report, suite, strategy):
+def selection(y, probabilities, report, suite, strategy, fixed_threshold=0.5):
     """Reuse the epoch's predictions; never run another neural forward pass."""
     if suite == "micro_f1":
-        return (report["micro_f1"],), 0.5, primary_metrics(report, suite)
+        return (report["micro_f1"],), fixed_threshold, primary_metrics(report, suite)
     if suite == "jaccard":
-        return tuple(report[key] for key in JACCARD_ORDER), 0.5, primary_metrics(report, suite)
+        return tuple(report[key] for key in JACCARD_ORDER), fixed_threshold, primary_metrics(report, suite)
     if suite == "task_specific":
         return (report["macro_ap"], report["micro_ap"]), None, primary_metrics(report, suite)
     threshold = (fit_label_thresholds(y, probabilities) if strategy == "per_label"
@@ -65,9 +66,9 @@ def selection(y, probabilities, report, suite, strategy):
     return (fitted["accuracy"], fitted["absolute_true"]), threshold, fitted
 
 
-def final_threshold(y, probabilities, suite, strategy):
+def final_threshold(y, probabilities, suite, strategy, fixed_threshold=0.5):
     if suite in FIXED_THRESHOLD_SUITES:
-        return 0.5
+        return fixed_threshold
     return (fit_label_thresholds(y, probabilities) if strategy == "per_label"
             else fit_global_threshold(y, probabilities))
 
