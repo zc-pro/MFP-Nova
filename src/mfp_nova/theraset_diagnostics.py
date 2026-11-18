@@ -32,7 +32,7 @@ def transitions(y, direct, final, threshold):
 
 
 @torch.inference_mode()
-def diagnose(directory, device='cpu', batch_size=None, cpu_threads=4):
+def diagnose(directory, device='cpu', batch_size=None, cpu_threads=4, output_dir=None):
     torch.set_num_threads(cpu_threads)
     directory = Path(directory).resolve()
     model, checkpoint = load_model(directory/'best.pt', device)
@@ -50,6 +50,7 @@ def diagnose(directory, device='cpu', batch_size=None, cpu_threads=4):
     for step, batch in enumerate(loader, 1):
         out = model(to_device(batch, device), return_evidence=True)
         values = {'row_id': batch['row_id'], 'targets': batch['y'],
+                  'direct_logits': out['direct'].float(), 'logits': out['logits'].float(),
                   'direct_probabilities': out['direct'].float().sigmoid(),
                   'probabilities': out['logits'].float().sigmoid()}
         if model.evidence_decoder:
@@ -101,12 +102,15 @@ def diagnose(directory, device='cpu', batch_size=None, cpu_threads=4):
         report['mean_source_weights_per_label'] = collected['source_weights'].mean(0).tolist()
         report['mean_scale_weights_per_label'] = collected['scale_weights'].mean(0).tolist()
         report['active_prototypes_per_label'] = model.active.sum(-1).cpu().tolist()
-    np.savez_compressed(directory/'evidence_validation.npz', **collected,
+    output = Path(output_dir) if output_dir is not None else directory
+    if output_dir is not None:
+        output.mkdir(parents=True)
+    np.savez_compressed(output/'evidence_validation.npz', **collected,
                         label_names=np.array(source.data.labels), ID=source.data.ids[dataset.indices],
                         cluster_id=source.data.clusters[dataset.indices], threshold=threshold,
                         epoch=checkpoint['best_epoch'], split='val')
-    write_json(directory/'evidence_diagnostics.json', report)
-    print(f"Saved {directory/'evidence_diagnostics.json'}", flush=True)
+    write_json(output/'evidence_diagnostics.json', report)
+    print(f"Saved {output/'evidence_diagnostics.json'}", flush=True)
     return report
 
 
@@ -116,8 +120,9 @@ def main():
     parser.add_argument('--device', default='cuda:0')
     parser.add_argument('--batch-size', type=int)
     parser.add_argument('--cpu-threads', type=int, default=4)
+    parser.add_argument('--output-dir', type=Path, help='Write diagnostics in a separate new directory')
     args = parser.parse_args()
-    diagnose(args.run, args.device, args.batch_size, args.cpu_threads)
+    diagnose(args.run, args.device, args.batch_size, args.cpu_threads, args.output_dir)
 
 
 if __name__ == '__main__':
