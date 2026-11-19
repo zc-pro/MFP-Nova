@@ -13,6 +13,10 @@
 
 ## 当前研究
 
+### TriEvidence-MFP · Fine39 三路独立取证
+
+共享原始肽输入及双 ESM 缓存，分别读取强 TheraSet、独立 AA34 CNN 和 HelixSet latent-direct 的标签证据。首轮只训练 CNN，使用 Validation 校准并把三路和融合阈值保存到同一个检查点。[架构与双平台命令](docs/TriEvidence-MFP.md)
+
 ### TheraSet-Bridge · 跨簇证据迁移
 
 `theraset_bridge` 复用 TheraSet 的多模态取证骨干，独立实现按簇对均衡的单向证据迁移。三组训练模式为 `off`、`align` 和 `positive`。[独立配置](configs/theraset_bridge.yaml) · [设计与训练说明](docs/XBridge-MFP.md#theraset-bridge-跨簇融合设计)

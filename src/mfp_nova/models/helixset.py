@@ -324,9 +324,12 @@ class HelixSet(nn.Module):
                  pair_readout=True, fine_evidence=True, geometry_depth=4,
                  geometry_context=True, geometry_quality=True, distance_multiscale=True,
                  scale_balance=True, pair_interactions=True, structure_evidence=True,
-                 esm_tail=None, evidence_readout=False, peptide_input_dim=0):
+                 esm_tail=None, evidence_readout=False, peptide_input_dim=0, direct_only=False):
         super().__init__()
+        if direct_only and evidence_readout:
+            raise ValueError("The latent-only exit does not use the early evidence decoder")
         self.statistics = statistics
+        self.direct_only = direct_only
         self.esm_tail = None
         self.triangles, self.label_context = triangles, label_context
         self.pair_readout, self.fine_evidence = pair_readout, fine_evidence
@@ -355,14 +358,13 @@ class HelixSet(nn.Module):
         self.latent_blocks = nn.ModuleList([
             LatentFusionBlock(dim, heads, dropout) for _ in range(latent_depth)
         ])
-        self.label_queries = nn.Parameter(torch.randn(num_labels, dim) * .02)
-        self.decoder = nn.ModuleList([SetDecoderBlock(dim, heads, dropout, pair_dim) for _ in range(decoder_depth)])
-        self.output_norm = nn.LayerNorm(dim)
-        self.label_weights = nn.Parameter(torch.randn(num_labels, dim) / math.sqrt(dim))
-        self.label_bias = nn.Parameter(torch.zeros(num_labels))
         prior = torch.tensor(statistics["observed_prior"]).clamp(1e-4, 1 - 1e-4)
-        with torch.no_grad():
-            self.label_bias.copy_(torch.logit(prior))
+        if not direct_only:
+            self.label_queries = nn.Parameter(torch.randn(num_labels, dim) * .02)
+            self.decoder = nn.ModuleList([SetDecoderBlock(dim, heads, dropout, pair_dim) for _ in range(decoder_depth)])
+            self.output_norm = nn.LayerNorm(dim)
+            self.label_weights = nn.Parameter(torch.randn(num_labels, dim) / math.sqrt(dim))
+            self.label_bias = nn.Parameter(torch.logit(prior))
         # A pooled latent head teaches the bottleneck without reconstruction losses.
         self.latent_classifier = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, num_labels))
         with torch.no_grad():
@@ -429,8 +431,9 @@ class HelixSet(nn.Module):
         seq, seq_mask = self.sequence(batch)
         prop, prop_mask = self.properties(batch)
         mask = batch["mask"]
-        labels = self.label_queries[None].expand(mask.shape[0], -1, -1)
-        label_mask = torch.ones(labels.shape[:2], dtype=torch.bool, device=mask.device)
+        if not self.direct_only:
+            labels = self.label_queries[None].expand(mask.shape[0], -1, -1)
+            label_mask = torch.ones(labels.shape[:2], dtype=torch.bool, device=mask.device)
         if hasattr(self, "early_evidence"):
             early, modality_weights = self.early_evidence(labels, label_mask, seq, seq_mask, prop, prop_mask)
             early_logits = (self.output_norm(early) * self.label_weights).sum(-1) + self.label_bias
@@ -477,6 +480,9 @@ class HelixSet(nn.Module):
         latent_mask = torch.ones(latent.shape[:2], dtype=torch.bool, device=mask.device)
         for block in self.latent_blocks:
             latent = block(latent, latent_mask, memories, masks, reliability, motif_weights)
+        direct = self.latent_classifier(latent.mean(1))
+        if self.direct_only:
+            return {"logits": direct, "direct": direct}
         intermediate = []
         for block in self.decoder:
             labels, pair_attention = block(
@@ -485,7 +491,7 @@ class HelixSet(nn.Module):
                 self.label_context, self.pair_readout, self.fine_evidence, self.pair_interactions,
             )
             intermediate.append((self.output_norm(labels) * self.label_weights).sum(-1) + self.label_bias)
-        output = {"logits": intermediate[-1], "direct": self.latent_classifier(latent.mean(1)),
+        output = {"logits": intermediate[-1], "direct": direct,
                   "decoder_logits": intermediate[:-1]}
         if hasattr(self, "early_evidence"):
             length = mask.sum(1).clamp_min(1)

@@ -1,0 +1,358 @@
+"""Train the AA34 reader and evaluate a packed TriEvidence-MFP checkpoint."""
+
+import argparse
+import json
+import subprocess
+import time
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+
+from mfp_nova.metrics import evaluate_metrics
+from evaluate_fine39_fixed_fusion import logit, read_theraset
+from mfp_nova.models.trievidence import AA34Reader, TriEvidence, center_evidence, empty_top10, fuse_evidence
+from mfp_nova.multimodal import BackbonePeptides, MultimodalData, MultimodalPeptides, collate_multimodal
+from mfp_nova.research import to_device, validate_cache
+from mfp_nova.research_layers import observed_label_loss
+from mfp_nova.trainer import seed_everything, write_json
+
+
+MODEL_NAME = "trievidence"
+
+
+def read_anchor(path, expected):
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    if (checkpoint["model_name"] != expected or checkpoint["track"] != "fine39"
+            or "peptide_encoder" not in checkpoint["config"]
+            or checkpoint["model_args"].get("esm_tail") is not None
+            or checkpoint["config"]["data"].get("augment")):
+        raise ValueError(f"Use the original Fine39 dual-cache {expected} checkpoint: {path}")
+    return checkpoint
+
+
+def initialize(theraset_path, helixset_path, channels, dropout):
+    anchors = [read_anchor(path, name) for path, name in
+               ((theraset_path, "theraset"), (helixset_path, "helixset"))]
+    theraset, helixset = anchors
+    stats, helix_stats = (anchor["statistics"] for anchor in anchors)
+    shared_inputs = ("dataset", "phys", "nodes", "structure_global", "chemical_vocab",
+                     "localized_terminal_chemistry")
+    if theraset["labels"] != helixset["labels"] or any(
+            stats.get(key) != helix_stats.get(key) for key in shared_inputs):
+        raise ValueError("The anchors require different label orders or input preprocessing")
+    if helixset["model_args"].get("evidence_readout"):
+        raise ValueError("Use standard HelixSet with its supervised latent-direct head")
+    arguments = {"theraset_args": theraset["model_args"], "helixset_args": helixset["model_args"],
+                 "cnn_channels": channels, "cnn_dropout": dropout}
+    model = TriEvidence(**arguments)
+    model.theraset.load_state_dict(theraset["model_state"])
+    # Only keys belonging to the latent-only architecture go into the packed model.
+    model.helixset.load_state_dict({key: helixset["model_state"][key] for key in model.helixset.state_dict()})
+    model.offsets[[0, 2]] = torch.logit(torch.tensor([float(theraset["threshold"]), float(helixset["threshold"])]))
+    return model, arguments, anchors
+
+
+def open_data(args, split, checkpoint):
+    stats = checkpoint["statistics"]
+    source = MultimodalData(args.data_root, "fine39", stats,
+                            localize_terminals=stats.get("localized_terminal_chemistry", False))
+    if len(source.data.indices("train")) != stats["train_rows"]:
+        raise ValueError("Checkpoint must have been fitted on the full original Fine39 Train")
+    dataset = MultimodalPeptides(source, args.features, split, peptide_feature_root=args.peptide_features)
+    validate_cache(dataset, checkpoint["config"], checkpoint["encoder"])
+    return source, dataset
+
+
+def batches(dataset, batch_size, shuffle=False):
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_multimodal)
+
+
+def align_saved(export, source, dataset, score):
+    rows = dataset.indices
+    order = np.argsort(export["row_id"])
+    np.testing.assert_array_equal(export["row_id"][order], source.data.rows[rows])
+    np.testing.assert_array_equal(export["targets"][order], source.data.y[rows])
+    np.testing.assert_array_equal(export["cluster_id"][order], source.data.clusters[rows])
+    np.testing.assert_array_equal(export["label_names"], source.data.labels)
+    if "ID" in export:
+        np.testing.assert_array_equal(export["ID"][order].astype(str), source.data.ids[rows].astype(str))
+    if "split" in export and str(export["split"]) != "val":
+        raise ValueError("The reader may only use original Validation anchor predictions")
+    return torch.from_numpy(logit(export[score][order]).astype(np.float32))
+
+
+@torch.inference_mode()
+def collect(read, loader, device, progress=False):
+    parts = []
+    for step, batch in enumerate(loader, 1):
+        parts.append(tuple(t.float().cpu() for t in read(to_device(batch, device))))
+        if progress and (step == 1 or step % 64 == 0 or step == len(loader)):
+            print(f"Evidence batch {step}/{len(loader)}", flush=True)
+    return tuple(torch.cat(tensors) for tensors in zip(*parts))
+
+
+def row_jaccard(y, keep):
+    return (y & keep).sum(1) / (y | keep).sum(1).clamp_min(1)
+
+
+def tune_cnn_offset(y, theraset, aa34, latent, offsets):
+    # One global AA34 cutoff, with both pretrained offsets and the equal weights fixed.
+    candidates = torch.logit(torch.arange(4, 37, dtype=torch.float32) / 40)
+    best = None
+    trial = offsets.clone()
+    for offset in candidates:
+        trial[1] = offset
+        logits = fuse_evidence(theraset, aa34, latent, trial)
+        score = float(row_jaccard(y, logits >= 0).mean())
+        key = (score, -abs(float(offset)))
+        if best is None or key > best[0]:
+            best = key, offset
+    key, offset = best
+    trial[1] = offset
+    return key, trial, fuse_evidence(theraset, aa34, latent, trial)
+
+
+def pass_train(reader, loader, device, optimizer, statistics, unlabeled_weight):
+    reader.train()
+    loss_sum = 0.
+    for batch in loader:
+        batch = to_device(batch, device)
+        optimizer.zero_grad(set_to_none=True)
+        loss = observed_label_loss(reader(batch), batch["y"], statistics, unlabeled_weight)
+        loss.backward()
+        optimizer.step()
+        loss_sum += float(loss.detach()) * len(batch["y"])
+    return loss_sum / len(loader.dataset)
+
+
+def diagnostics(source, dataset, theraset, aa34, latent, offsets, split, output):
+    y = source.data.y[dataset.indices].astype(bool)
+    truth = torch.from_numpy(y)
+    mixed = fuse_evidence(theraset, aa34, latent, offsets)
+    two = center_evidence(torch.stack((theraset, latent)), offsets[[0, 2]]).mean(0)
+    raw, rescued = mixed >= 0, empty_top10(mixed, theraset)
+    order = theraset.argsort(dim=1, descending=True, stable=True)
+    missed_top5 = ~truth.gather(1, order[:, :5]).any(1)
+    low_ranks = torch.zeros_like(truth).scatter_(1, order[:, 5:10], True)
+    reference = theraset >= offsets[0]
+    reference_hit = truth & reference
+    support = source.statistics["labels"]["support"]
+    projection = source.statistics["function_projection"]
+
+    def summary(logits, predicted):
+        result = evaluate_metrics(y, logits.sigmoid().numpy(), train_support=support,
+                                  function_projection=projection, predicted=predicted.numpy())
+        hit = truth & predicted
+        result.update(zero_hit_rows=int((~hit.any(1)).sum()),
+                      empty_rows=int((~predicted.any(1)).sum()),
+                      top5_miss_rescues=int((hit.any(1) & missed_top5).sum()),
+                      new_labels_at_theraset_6_10=int((hit & low_ranks & ~reference_hit).sum()),
+                      lost_theraset_true_labels=int((reference_hit & ~hit).sum()))
+        return result
+
+    results = {
+        "theraset": summary(theraset, reference),
+        "aa34": summary(aa34, aa34 >= offsets[1]),
+        "helixset_latent": summary(latent, latent >= offsets[2]),
+        "theraset_helixset": summary(two, two >= 0),
+        "theraset_helixset_empty_top10": summary(two, empty_top10(two, theraset)),
+        "fusion": summary(mixed, raw),
+        "fusion_empty_top10": summary(mixed, rescued),
+    }
+    indices = dataset.indices
+    np.savez_compressed(output / f"{split}_predictions.npz",
+                        row_id=source.data.rows[indices], ID=source.data.ids[indices],
+                        cluster_id=source.data.clusters[indices], label_names=source.data.labels,
+                        targets=y, split=split, probabilities=mixed.sigmoid().numpy(), threshold=.5,
+                        predicted=rescued.numpy(), predicted_raw=raw.numpy(),
+                        theraset_logits=theraset.numpy(), aa34_logits=aa34.numpy(), latent_logits=latent.numpy())
+    report = {"model": MODEL_NAME, "split": split, "rows": len(y), "theraset_top5_misses": int(missed_top5.sum()),
+              "branch_thresholds": offsets.sigmoid().tolist(), "arms": results}
+    for name in ("theraset", "theraset_helixset", "fusion", "fusion_empty_top10"):
+        print(f"{name} ACC={results[name]['sample_jaccard']:.4%} "
+              f"ZeroHit={results[name]['zero_hit_rows']}", flush=True)
+    return report
+
+
+def fit_aa34(args, reader, source, backbone, val_backbone, a, h, offsets):
+    # DataLoader initialization for the live anchors consumes RNG state.
+    seed_everything(args.seed)
+    stats = source.statistics["labels"]
+    y = torch.from_numpy(source.data.y[val_backbone.indices].astype(bool))
+    train_loader = batches(backbone, args.cnn_batch_size, shuffle=True)
+    val_loader = batches(val_backbone, args.cnn_batch_size)
+    optimizer = torch.optim.AdamW(reader.parameters(), lr=args.learning_rate, weight_decay=.01)
+    schedule = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs)
+    best, history = None, []
+    for epoch in range(1, args.epochs + 1):
+        tick = time.perf_counter()
+        loss = pass_train(reader, train_loader, args.device, optimizer, stats, args.unlabeled_weight)
+        schedule.step()
+        reader.eval()
+        b, = collect(lambda batch: (reader(batch),), val_loader, args.device)
+        key, chosen, fused = tune_cnn_offset(y, a, b, h, offsets)
+        record = {"epoch": epoch, "train_loss": loss, "raw_val_acc": key[0], "cnn_threshold": float(chosen[1].sigmoid()),
+                  "fallback_val_acc": float(row_jaccard(y, empty_top10(fused, a)).mean()),
+                  "seconds": time.perf_counter() - tick}
+        history.append(record)
+        print(json.dumps(record), flush=True)
+        if best is None or key > best[0]:
+            weights = {k: v.detach().cpu().clone() for k, v in reader.state_dict().items()}
+            best = key, chosen, b, epoch, weights
+
+    _, chosen, b, epoch, weights = best
+    reader.load_state_dict(weights)
+    return chosen, b, epoch, history
+
+
+def train(args, output):
+    seed_everything(args.seed)
+    started = time.perf_counter()
+    model, model_args, anchors = initialize(args.theraset, args.helixset, args.channels, args.dropout)
+    theraset, helixset = anchors
+    source, validation = open_data(args, "val", theraset)
+    validate_cache(validation, helixset["config"], helixset["encoder"])
+    if helixset["statistics"]["train_rows"] != theraset["statistics"]["train_rows"]:
+        raise ValueError("The anchors must use the same Fine39 Train")
+    backbone = BackbonePeptides(source, "train", validation.meta["max_length"])
+    val_backbone = BackbonePeptides(source, "val", validation.meta["max_length"])
+    np.testing.assert_array_equal(val_backbone.indices, validation.indices)
+    anchor_paths = (args.theraset, args.helixset)
+    origin = [{"checkpoint": str(path), "epoch": anchor.get("epoch"), "threshold": anchor["threshold"],
+               "weight_source": anchor.get("weight_source")} for path, anchor in zip(anchor_paths, anchors)]
+    static = {"model_name": MODEL_NAME, "model_args": model_args, "track": "fine39",
+              "config": theraset["config"], "encoder": theraset["encoder"], "statistics": source.statistics,
+              "labels": source.data.labels, "anchors": origin}
+    del theraset, helixset, anchors
+
+    model.to(args.device)
+    device = torch.device(args.device)
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    print(f"Validation | rows={len(validation)} | collecting the two frozen branches once", flush=True)
+    a, h = collect(model.anchor_logits, batches(validation, args.batch_size), args.device, progress=True)
+    offsets = model.offsets.cpu()
+    if args.reader is not None:
+        cached = torch.load(args.reader, map_location="cpu", weights_only=True)
+        if (cached["labels"] != source.data.labels or cached["dataset"] != source.statistics["dataset"]
+                or cached["channels"] != args.channels):
+            raise ValueError("Reader settings differ from the current Fine39 labels, dataset or channel count")
+        torch.testing.assert_close(cached["offsets"][[0, 2]], offsets[[0, 2]])
+        model.aa34.load_state_dict(cached["model_state"])
+        model.eval()
+        b, = collect(lambda batch: (model.aa34(batch),), batches(val_backbone, args.cnn_batch_size), args.device)
+        chosen, epoch, history = cached["offsets"], cached["epoch"], []
+    else:
+        chosen, b, epoch, history = fit_aa34(args, model.aa34, source, backbone, val_backbone, a, h, offsets)
+    model.offsets.copy_(chosen)
+    torch.save(dict(static, epoch=epoch, model_state=model.state_dict()), output / "best.pt")
+    report = diagnostics(source, validation, a, b, h, chosen, "val", output)
+    report.update(best_epoch=epoch, anchors=origin, history=history, train_rows=len(backbone),
+                  source_reader=str(args.reader) if args.reader else None,
+                  seed=args.seed, elapsed_seconds=time.perf_counter() - started,
+                  cnn_parameters=sum(p.numel() for p in model.aa34.parameters()),
+                  total_parameters=sum(p.numel() for p in model.parameters()),
+                  peak_cuda_memory_bytes=torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None,
+                  git_commit=subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+                  torch=str(torch.__version__), device=args.device, cnn_batch_size=args.cnn_batch_size,
+                  inference_batch_size=args.batch_size, learning_rate=args.learning_rate,
+                  unlabeled_weight=args.unlabeled_weight, dataset=source.statistics["dataset"])
+    write_json(output / "results.json", report)
+
+
+def train_cached(args, output):
+    seed_everything(args.seed)
+    started = time.perf_counter()
+    source = MultimodalData(args.data_root, "fine39", sequence_only=True)
+    backbone = BackbonePeptides(source, "train", 80)
+    validation = BackbonePeptides(source, "val", 80)
+    thera = read_theraset(args.theraset_val, "val")
+    with np.load(args.helix_exits) as exits:
+        a = align_saved(thera, source, validation, "probabilities")
+        h = align_saved(exits, source, validation, "direct")
+    offsets = torch.tensor([float(thera["threshold"]), .5, args.helix_threshold]).logit()
+    reader = AA34Reader(source.statistics["labels"], args.channels, args.dropout).to(args.device)
+    print(f"Cached evidence | Train={len(backbone)} Validation={len(validation)}", flush=True)
+    chosen, b, epoch, history = fit_aa34(args, reader, source, backbone, validation, a, h, offsets)
+    torch.save({"model_state": reader.state_dict(), "offsets": chosen, "epoch": epoch, "channels": args.channels,
+                "labels": source.data.labels, "dataset": source.statistics["dataset"]}, output / "reader.pt")
+    report = diagnostics(source, validation, a, b, h, chosen, "val", output)
+    report.update(best_epoch=epoch, history=history, train_rows=len(backbone), seed=args.seed,
+                  theraset_export=str(args.theraset_val), helixset_export=str(args.helix_exits),
+                  elapsed_seconds=time.perf_counter() - started, device=args.device, torch=str(torch.__version__),
+                  cnn_channels=args.channels, cnn_batch_size=args.cnn_batch_size, dropout=args.dropout,
+                  learning_rate=args.learning_rate, unlabeled_weight=args.unlabeled_weight,
+                  dataset=source.statistics["dataset"],
+                  git_commit=subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip())
+    write_json(output / "results.json", report)
+
+
+def evaluate(args, output):
+    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
+    if checkpoint["model_name"] != MODEL_NAME:
+        raise ValueError("Use the packed TriEvidence-MFP best.pt")
+    source, dataset = open_data(args, args.split, checkpoint)
+    model = TriEvidence(**checkpoint["model_args"])
+    model.load_state_dict(checkpoint["model_state"])
+    model.to(args.device).eval()
+
+    def read(batch):
+        result = model(batch)
+        return result["theraset_logits"], result["aa34_logits"], result["latent_logits"]
+
+    a, b, h = collect(read, batches(dataset, args.batch_size), args.device, progress=True)
+    report = diagnostics(source, dataset, a, b, h, model.offsets.cpu(), args.split, output)
+    report.update(checkpoint=str(args.checkpoint), best_epoch=checkpoint["epoch"], anchors=checkpoint["anchors"])
+    write_json(output / "results.json", report)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    fit = commands.add_parser("train", help="Fit the independent CNN and select on original Validation")
+    fit.add_argument("--theraset", type=Path, required=True)
+    fit.add_argument("--helixset", type=Path, required=True)
+    fit.add_argument("--reader", type=Path, help="Pack a previously fitted reader and replay Validation")
+    cached = commands.add_parser("train-cached", help="Train only the reader using saved original Validation scores")
+    cached.add_argument("--theraset-val", type=Path, required=True)
+    cached.add_argument("--helix-exits", type=Path, required=True)
+    cached.add_argument("--helix-threshold", type=float, default=.64)
+    for command in (fit, cached):
+        command.add_argument("--epochs", type=int, default=25)
+        command.add_argument("--seed", type=int, default=42)
+        command.add_argument("--cnn-batch-size", type=int, default=128)
+        command.add_argument("--learning-rate", type=float, default=3e-4)
+        command.add_argument("--unlabeled-weight", type=float, default=.3)
+        command.add_argument("--channels", type=int, default=128)
+        command.add_argument("--dropout", type=float, default=.2)
+    score = commands.add_parser("evaluate", help="Evaluate a packed checkpoint with its saved cutoff")
+    score.add_argument("checkpoint", type=Path)
+    score.add_argument("--split", choices=("val", "test"), default="val")
+    for command in (fit, cached, score):
+        command.add_argument("--data-root", type=Path, default=Path("data/therapeutic_2025"))
+        command.add_argument("--device", default="cuda:0")
+        command.add_argument("--output", type=Path, help="Fresh run directory")
+    for command in (fit, score):
+        command.add_argument("--features", type=Path, default=Path("features/esm2_650m"))
+        command.add_argument("--peptide-features", type=Path, default=Path("features/esm2_peptide_150m"))
+        command.add_argument("--batch-size", type=int, default=16, help="Frozen branch inference batch size")
+    args = parser.parse_args()
+    if args.command != "evaluate" and args.epochs < 1:
+        parser.error("--epochs must be positive")
+    suffix = args.command.replace("-", "_") if args.command != "evaluate" else args.split
+    output = args.output or Path("runs") / datetime.now().strftime(f"trievidence_{suffix}_%Y%m%d_%H%M%S_%f")
+    output.mkdir(parents=True, exist_ok=False)
+    print(f"TriEvidence-MFP | output={output}", flush=True)
+    if args.command == "train":
+        train(args, output)
+    elif args.command == "train-cached":
+        train_cached(args, output)
+    else:
+        evaluate(args, output)
+
+
+if __name__ == "__main__":
+    main()
