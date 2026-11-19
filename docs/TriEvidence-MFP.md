@@ -115,3 +115,180 @@ tail -n 8 -F "${run%/}"/seed_{42,101,202}/train.log
 ```
 
 优先比较各 seed 的 `reader/results.json` 中两路与三路的 ACC、零命中和第 6–10 名新命中数。用 `fusion/results.json` 的 `nonempty_add_fixed` 检验固定规则的跨 seed 表现。规则只为非空预测最多补一个标签，要求它位于 TheraSet 第 6–10 名和 AA34 前 5 名，已过 AA34 自身 cutoff，且等权融合分离最终 cutoff 的差距不超过 1 logit。逐簇重选规则的对照同时保留。
+
+## 局部与背景对照读出
+
+AA34 的 `--reader-head contrast` 用现有 CNN 残基特征预测每个标签的局部分数。分别算出高响应位置的平均分与整条肽的平均分，取两者之差作为全局 logits 的残差。每条肽选取的高响应位置数为向上取整的一半长度，最多三个。弱权重未标注项损失、数据划分和等权融合沿用原设置。
+
+首轮对照用同一个 seed、相同的 25 轮和同一套 Validation 缓存。三臂分别为 `global` 原全局池化、`local` 加标签级局部读出、`contrast` 加标签级局部读出并减肽内背景。后两臂参数相同。对照聚焦兜底前 ACC、独立多功能样本 Jaccard、第 6–10 位新增正确标签和原命中丢失数。现有 RTX 5070 与 V100 命令均支持 `--reader-head`，打包时沿用训练所用的选项。此消融在 Validation 上进行。
+
+## 架构精简计划
+
+精简以已验证的 seed 42 TriEvidence-MFP 为性能基线。原始 Validation 的兜底前和兜底后 ACC 分别为 62.3032% 和 63.0487%，原始 Test 为 63.2046% 和 64.0934%。结构改变的候选在同一批 Validation 上同时比较兜底前和兜底后 ACC，要求两项均保持现有水平，并查看配对的按簇置信区间、零命中和独立多功能样本 Jaccard。置信区间跨零时按证据不足解释。候选和阈值在 Validation 上确定，再固定设置做一次 Test 复验。实际可部署的模型还要在同设备上体现参数、延迟或峰值显存收益。
+
+现版从同一批张量读两套 ESM 缓存。TheraSet 和 HelixSet 随后独立执行双 ESM 归一化与投影、残基化学编码、理化属性编码以及几何和残基对处理。HelixSet 的 latent-direct 省去标签解码器，仍使用序列块、结构块、残基对块和潜变量层。用原配置和当前 Fine39 词表构造模型，下游参数为 TheraSet 10,404,206、HelixSet latent-direct 56,283,879、AA34 CNN 2,844,903。两套冻结的 ESM 权重未计入。
+
+固定同一个本机 AA34 检查点的阈值，在 8,529 条原始 Validation 上移除一条分支。三路的样本 Jaccard 为 62.2807%。去掉 AA34 后为 61.7520%，去掉 HelixSet 后为 61.4268%。结果表明 HelixSet 提供的补充证据值得保留。AA34 是成本较低、输入约束不同的一条路，适合作为第一阶段的固定对照。
+
+### 1. 等价复用与成本实测
+
+在原 seed 42 检查点上先测基线推理。使用同一设备、相同精度与 batch，记录预热后的中位延迟、P95 延迟和峰值显存。两条分支可以共用等价的双 ESM 无参数归一化和拼接，各自的学习型投影与读出保持原权重。用同一批输入比较逐标签 logits 及预测集合，确认浮点差异没有改变决策。同样记录只计下游和包含数据读入的耗时，区分模型计算与缓存 I/O 的收益。
+
+依据已有 logits 的裁剪上下界，在本机参考 Validation 上，8,529 条里只有 3 条可在完全不计算 HelixSet 时保证全部标签阈值判断相同且输出非空。两路加入 HelixSet 后实际改变了 1,633 条样本的至少一个标签决定，因此全分支的置信度跳过不作为首轮方案。
+
+### 2. 先裁剪 HelixSet latent-direct 的现有潜变量层
+
+在同一原始检查点上，使用 `scripts/screen_helixset_depth.py` 导出潜变量深度 6、5、4 的 `direct` 分数。对齐 V100 整模型的原始 Validation 逐样本输出，保持 TheraSet、AA34、三路阈值及融合和兜底规则一致，逐路替换 HelixSet 分数。六层用于验证导出能重现基线。五层可减少 399.7 万下游参数，整模型约 6,554 万。四层可减少 799.3 万，整模型约 6,154 万。每次只改潜变量层数，保留序列、几何和残基对处理。
+
+如果较浅候选仍有互补性但出现小幅下降，优先恢复表现更好的那一组。先仅在原 Train 用实际标签监督 latent 分类头和最后一层保留的潜变量块，做少量轮次短训，再用相同协议复核。若恢复后仍低于基线，继续采用更深版本。等价预处理与裁剪分开计时，实测用 latent-direct 前向。
+
+### 3. 共享骨干作为更大幅度精简的候选
+
+目标结构是 **一个多模态骨干、两个独立多模态读出和一个轻量 AA34 分支**。沿用 TheraSet 骨干和原读出。在同一次 `encode_evidence` 调用中取得残基状态、序列残基对、可用几何残基对与质量掩码，供两个多模态读出复用。把残基状态投影到 128 维做一次残基注意力，将现有残基对投影为注意力偏置，并用质量掩码控制几何偏置。随后通过独立标签查询读出 39 维 logits。关系读出的参数预算为 100 万以内，整模型下游参数目标约 1,425 万以内。
+
+原始 Train 只训练新读出，复用已有弱权重未标注项损失。三组对照为原两路、加共享状态读出、加带残基对偏置的共享读出。同时看相对两路找回的正确标签和原三路保住的标签数。利用这组对照判断共享骨干剩余的表示是否足以补回 HelixSet 的信息，再决定是否继续投入。
+
+首轮继续保留 AA34 独立分支。TheraSet 的 CNN 在卷积前注入化学信息，AA34 只读标准残基。若要进一步共享 CNN，可让序列读出从化学注入前的共同卷积分出，再在 TheraSet 路径补入化学信息。这会改变现有权重的输入，需要另做重训和验证。
+
+## 深度精简实验与验收命令
+
+本流程从已验证的打包目录启动。该目录的 `model/` 内同时需要有 `best.pt` 和同一次运行导出的 `val_predictions.npz`。一次记录中，`epoch=0` 表示直接裁剪的权重。启用恢复训练后，保留组内兜底前后 ACC 相对基线的较小差值最大的轮次。三路阈值固定为原 checkpoint 的值。只在 Validation 选定候选，随后各跑一次基线和候选的 Test。
+
+### V100 Ubuntu Bash
+
+先在同一个 Bash 终端执行以下准备和三卡筛选。改 `gpus` 为三个空闲卡号。
+
+```bash
+project="$HOME/wuzhencheng/projects/MFP-Nova"
+base="$project/runs/trievidence_packed_s42_20261119_155453/model"
+gpus=(2 3 4)
+cpu_threads=4
+stamp=$(date +%Y%m%d_%H%M%S)
+work="$project/runs/trievidence_depth_$stamp"
+code="$(dirname "$project")/MFP-Nova-depth-$stamp"
+
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate MFP-Nova
+py="$CONDA_PREFIX/bin/python"
+
+(
+  set -e
+  git -C "$project" fetch origin refs/heads/codex/trievidence-mfp
+  git -C "$project" worktree add --detach "$code" FETCH_HEAD
+  mkdir "$work"
+)
+cd "$code"
+export PYTHONPATH="$code/src"
+common=(--data-root "$project/data/therapeutic_2025"
+        --features "$project/features/esm2_650m"
+        --peptide-features "$project/features/esm2_peptide_150m"
+        --device cuda:0 --batch-size 16)
+
+depth_job() {
+  local arm="$1" gpu="$2" depth="$3" epochs="$4"
+  nohup env CUDA_VISIBLE_DEVICES="$gpu" OMP_NUM_THREADS="$cpu_threads" MKL_NUM_THREADS="$cpu_threads" \
+    "$py" -u scripts/refine_trievidence_depth.py "$base/best.pt" "${common[@]}" \
+    --depth "$depth" --epochs "$epochs" --output "$work/$arm" \
+    >"$work/$arm.log" 2>&1 </dev/null &
+  printf '%s GPU=%s PID=%s 日志=%s\n' "$arm" "$gpu" "$!" "$work/$arm.log"
+}
+
+depth_job depth6 "${gpus[0]}" 6 0
+depth_job depth5 "${gpus[1]}" 5 0
+depth_job depth4 "${gpus[2]}" 4 0
+tail -n 8 -F "$work"/depth{6,5,4}.log
+```
+
+三组完成后按 `Ctrl+C` 退出日志，并运行：
+
+```bash
+for arm in depth6 depth5 depth4; do
+  "$py" scripts/compare_trievidence.py "$base" "$work/$arm" | tee "$work/compare_$arm.json"
+done
+
+# 若较浅版本需要恢复，按筛选结果改 depth 为 5 或 4。全量原 Train 跑三轮。
+depth=5
+depth_job "recover$depth" "${gpus[0]}" "$depth" 3
+tail -n 10 -F "$work/recover$depth.log"
+```
+
+六层对照应重现原 Validation。较浅版本若已达到兜底前后两项基线，可以直接选其 `best.pt`。恢复训练结束可用同一比较命令核对，例如 `"$py" scripts/compare_trievidence.py "$base" "$work/recover5"`。选好单个候选后，用**同一张卡顺序**复跑实际整模型前向并计时：
+
+```bash
+chosen="$work/depth5"   # 在 Validation 上选定，按实际结果改为 depth4 或 recover5 等
+(
+  set -eo pipefail
+  export CUDA_VISIBLE_DEVICES="${gpus[0]}" OMP_NUM_THREADS="$cpu_threads" MKL_NUM_THREADS="$cpu_threads"
+  "$py" -u scripts/run_trievidence.py evaluate "$base/best.pt" "${common[@]}" \
+    --split val --output "$work/base_val" | tee "$work/base_val.log"
+  "$py" -u scripts/run_trievidence.py evaluate "$chosen/best.pt" "${common[@]}" \
+    --split val --output "$work/chosen_val" | tee "$work/chosen_val.log"
+  "$py" scripts/compare_trievidence.py "$work/base_val" "$work/chosen_val" | tee "$work/accept_val.json"
+)
+```
+
+完成 Validation 后，沿用上一步的 `chosen`，运行固定配置的 Test。使用已备好的双 ESM Test 缓存。
+
+```bash
+(
+  set -eo pipefail
+  export CUDA_VISIBLE_DEVICES="${gpus[0]}" OMP_NUM_THREADS="$cpu_threads" MKL_NUM_THREADS="$cpu_threads"
+  "$py" -u scripts/run_trievidence.py evaluate "$base/best.pt" "${common[@]}" \
+    --split test --output "$work/base_test" | tee "$work/base_test.log"
+  "$py" -u scripts/run_trievidence.py evaluate "$chosen/best.pt" "${common[@]}" \
+    --split test --output "$work/chosen_test" | tee "$work/chosen_test.log"
+  "$py" scripts/compare_trievidence.py "$work/base_test" "$work/chosen_test" | tee "$work/accept_test.json"
+)
+```
+
+### RTX 5070 Windows PowerShell
+
+从 RTX 5070 的项目目录运行。先将原打包目录的 `best.pt` 和 `val_predictions.npz` 同放在下面的 `$base`。项目准备相同数据和特征缓存。
+
+```powershell
+$project = "$PWD"
+$base = Join-Path $project 'runs/trievidence_packed_s42_20261119_155453/model'
+$stamp = Get-Date -Format yyyyMMdd_HHmmss
+$work = Join-Path $project "runs/trievidence_depth_$stamp"
+$code = Join-Path (Split-Path $project -Parent) "MFP-Nova-depth-$stamp"
+conda activate MFP-Nova
+$py = Join-Path $env:CONDA_PREFIX 'python.exe'
+git -C $project fetch origin refs/heads/codex/trievidence-mfp
+if ($LASTEXITCODE -ne 0) { throw 'git fetch failed' }
+git -C $project worktree add --detach $code FETCH_HEAD
+if ($LASTEXITCODE -ne 0) { throw 'git worktree failed' }
+New-Item -ItemType Directory -Path $work -ErrorAction Stop | Out-Null
+Set-Location $code
+$env:PYTHONPATH = "$code/src"
+$env:OMP_NUM_THREADS = '4'
+$env:MKL_NUM_THREADS = '4'
+$common = @('--data-root', "$project/data/therapeutic_2025", '--features', "$project/features/esm2_650m",
+            '--peptide-features', "$project/features/esm2_peptide_150m", '--device', 'cuda:0', '--batch-size', '16')
+
+foreach ($depth in 6,5,4) {
+    & $py -u scripts/refine_trievidence_depth.py "$base/best.pt" @common --depth $depth --epochs 0 `
+        --output "$work/depth$depth" 2>&1 | Tee-Object "$work/depth$depth.log"
+    if ($LASTEXITCODE -ne 0) { throw "Depth $depth failed" }
+    & $py scripts/compare_trievidence.py $base "$work/depth$depth" | Tee-Object "$work/compare_depth$depth.json"
+}
+
+# 需要恢复时执行这三行，按筛选结果选 4 或 5。
+$depth = 5
+& $py -u scripts/refine_trievidence_depth.py "$base/best.pt" @common --depth $depth --epochs 3 `
+    --output "$work/recover$depth" 2>&1 | Tee-Object "$work/recover$depth.log"
+& $py scripts/compare_trievidence.py $base "$work/recover$depth"
+```
+
+用选定的同一个 `$chosen` 先复跑 Validation。核对通过后，将 `$split` 改成 `test` 再执行本段：
+
+```powershell
+$chosen = "$work/depth5"
+$split = 'val'
+& $py -u scripts/run_trievidence.py evaluate "$base/best.pt" @common --split $split --output "$work/base_$split"
+if ($LASTEXITCODE -ne 0) { throw 'Baseline evaluation failed' }
+& $py -u scripts/run_trievidence.py evaluate "$chosen/best.pt" @common --split $split --output "$work/chosen_$split"
+if ($LASTEXITCODE -ne 0) { throw 'Candidate evaluation failed' }
+& $py scripts/compare_trievidence.py "$work/base_$split" "$work/chosen_$split" | Tee-Object "$work/accept_$split.json"
+```
+
+比较文件记录两项 ACC 差值、按簇配对区间、变化样本数、零命中和多功能肽 Jaccard。整模型复跑还记录参数数、预热后的批次 P50/P95 和显存峰值。批次时间包含数据读取和传输。在相同硬件、batch 和负载下解读。若原六层已经是唯一达到既有性能的候选，本轮结论是继续使用原版。

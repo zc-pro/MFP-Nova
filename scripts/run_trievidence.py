@@ -13,8 +13,9 @@ from torch.utils.data import DataLoader
 
 from mfp_nova.metrics import evaluate_metrics
 from evaluate_fine39_fixed_fusion import logit, read_theraset
-from mfp_nova.models.trievidence import AA34Reader, TriEvidence, center_evidence, empty_top10, fuse_evidence
-from mfp_nova.multimodal import BackbonePeptides, MultimodalData, MultimodalPeptides, collate_multimodal
+from mfp_nova.models.trievidence import AA34Reader, READER_HEADS, TriEvidence, center_evidence, empty_top10, fuse_evidence
+from mfp_nova.multimodal import (BackbonePeptides, MultimodalData, MultimodalPeptides,
+                                 collate_multimodal, independent_functions)
 from mfp_nova.research import to_device, validate_cache
 from mfp_nova.research_layers import observed_label_loss
 from mfp_nova.trainer import seed_everything, write_json
@@ -33,7 +34,7 @@ def read_anchor(path, expected):
     return checkpoint
 
 
-def initialize(theraset_path, helixset_path, channels, dropout):
+def initialize(theraset_path, helixset_path, channels, dropout, reader_head):
     anchors = [read_anchor(path, name) for path, name in
                ((theraset_path, "theraset"), (helixset_path, "helixset"))]
     theraset, helixset = anchors
@@ -46,7 +47,7 @@ def initialize(theraset_path, helixset_path, channels, dropout):
     if helixset["model_args"].get("evidence_readout"):
         raise ValueError("Use standard HelixSet with its supervised latent-direct head")
     arguments = {"theraset_args": theraset["model_args"], "helixset_args": helixset["model_args"],
-                 "cnn_channels": channels, "cnn_dropout": dropout}
+                 "cnn_channels": channels, "cnn_dropout": dropout, "reader_head": reader_head}
     model = TriEvidence(**arguments)
     model.theraset.load_state_dict(theraset["model_state"])
     # Only keys belonging to the latent-only architecture go into the packed model.
@@ -85,12 +86,16 @@ def align_saved(export, source, dataset, score):
 
 
 @torch.inference_mode()
-def collect(read, loader, device, progress=False):
+def collect(read, loader, device, progress=False, timings=None):
     parts = []
+    tick = time.perf_counter()
     for step, batch in enumerate(loader, 1):
         parts.append(tuple(t.float().cpu() for t in read(to_device(batch, device))))
+        if timings is not None:
+            timings.append(time.perf_counter() - tick)
         if progress and (step == 1 or step % 64 == 0 or step == len(loader)):
             print(f"Evidence batch {step}/{len(loader)}", flush=True)
+        tick = time.perf_counter()
     return tuple(torch.cat(tensors) for tensors in zip(*parts))
 
 
@@ -141,6 +146,7 @@ def diagnostics(source, dataset, theraset, aa34, latent, offsets, split, output)
     reference_hit = truth & reference
     support = source.statistics["labels"]["support"]
     projection = source.statistics["function_projection"]
+    multi = torch.from_numpy(independent_functions(y, projection).sum(1) >= 2)
 
     def summary(logits, predicted):
         result = evaluate_metrics(y, logits.sigmoid().numpy(), train_support=support,
@@ -148,6 +154,7 @@ def diagnostics(source, dataset, theraset, aa34, latent, offsets, split, output)
         hit = truth & predicted
         result.update(zero_hit_rows=int((~hit.any(1)).sum()),
                       empty_rows=int((~predicted.any(1)).sum()),
+                      multifunction_sample_jaccard=float(row_jaccard(truth, predicted)[multi].mean()) if multi.any() else None,
                       top5_miss_rescues=int((hit.any(1) & missed_top5).sum()),
                       new_labels_at_theraset_6_10=int((hit & low_ranks & ~reference_hit).sum()),
                       lost_theraset_true_labels=int((reference_hit & ~hit).sum()))
@@ -169,7 +176,8 @@ def diagnostics(source, dataset, theraset, aa34, latent, offsets, split, output)
                         targets=y, split=split, probabilities=mixed.sigmoid().numpy(), threshold=.5,
                         predicted=rescued.numpy(), predicted_raw=raw.numpy(),
                         theraset_logits=theraset.numpy(), aa34_logits=aa34.numpy(), latent_logits=latent.numpy())
-    report = {"model": MODEL_NAME, "split": split, "rows": len(y), "theraset_top5_misses": int(missed_top5.sum()),
+    report = {"model": MODEL_NAME, "split": split, "rows": len(y), "multifunction_rows": int(multi.sum()),
+              "theraset_top5_misses": int(missed_top5.sum()),
               "branch_thresholds": offsets.sigmoid().tolist(), "arms": results}
     for name in ("theraset", "theraset_helixset", "fusion", "fusion_empty_top10"):
         print(f"{name} ACC={results[name]['sample_jaccard']:.4%} "
@@ -211,7 +219,7 @@ def fit_aa34(args, reader, source, backbone, val_backbone, a, h, offsets):
 def train(args, output):
     seed_everything(args.seed)
     started = time.perf_counter()
-    model, model_args, anchors = initialize(args.theraset, args.helixset, args.channels, args.dropout)
+    model, model_args, anchors = initialize(args.theraset, args.helixset, args.channels, args.dropout, args.reader_head)
     theraset, helixset = anchors
     source, validation = open_data(args, "val", theraset)
     validate_cache(validation, helixset["config"], helixset["encoder"])
@@ -238,8 +246,8 @@ def train(args, output):
     if args.reader is not None:
         cached = torch.load(args.reader, map_location="cpu", weights_only=True)
         if (cached["labels"] != source.data.labels or cached["dataset"] != source.statistics["dataset"]
-                or cached["channels"] != args.channels):
-            raise ValueError("Reader settings differ from the current Fine39 labels, dataset or channel count")
+                or cached["channels"] != args.channels or cached.get("reader_head", "global") != args.reader_head):
+            raise ValueError("Reader settings differ from the current Fine39 labels, dataset or model configuration")
         torch.testing.assert_close(cached["offsets"][[0, 2]], offsets[[0, 2]])
         model.aa34.load_state_dict(cached["model_state"])
         model.eval()
@@ -251,7 +259,7 @@ def train(args, output):
     torch.save(dict(static, epoch=epoch, model_state=model.state_dict()), output / "best.pt")
     report = diagnostics(source, validation, a, b, h, chosen, "val", output)
     report.update(best_epoch=epoch, anchors=origin, history=history, train_rows=len(backbone),
-                  source_reader=str(args.reader) if args.reader else None,
+                  source_reader=str(args.reader) if args.reader else None, reader_head=args.reader_head,
                   seed=args.seed, elapsed_seconds=time.perf_counter() - started,
                   cnn_parameters=sum(p.numel() for p in model.aa34.parameters()),
                   total_parameters=sum(p.numel() for p in model.parameters()),
@@ -274,16 +282,18 @@ def train_cached(args, output):
         a = align_saved(thera, source, validation, "probabilities")
         h = align_saved(exits, source, validation, "direct")
     offsets = torch.tensor([float(thera["threshold"]), .5, args.helix_threshold]).logit()
-    reader = AA34Reader(source.statistics["labels"], args.channels, args.dropout).to(args.device)
+    reader = AA34Reader(source.statistics["labels"], args.channels, args.dropout, args.reader_head).to(args.device)
     print(f"Cached evidence | Train={len(backbone)} Validation={len(validation)}", flush=True)
     chosen, b, epoch, history = fit_aa34(args, reader, source, backbone, validation, a, h, offsets)
     torch.save({"model_state": reader.state_dict(), "offsets": chosen, "epoch": epoch, "channels": args.channels,
+                "reader_head": args.reader_head,
                 "labels": source.data.labels, "dataset": source.statistics["dataset"]}, output / "reader.pt")
     report = diagnostics(source, validation, a, b, h, chosen, "val", output)
     report.update(best_epoch=epoch, history=history, train_rows=len(backbone), seed=args.seed,
                   theraset_export=str(args.theraset_val), helixset_export=str(args.helix_exits),
                   elapsed_seconds=time.perf_counter() - started, device=args.device, torch=str(torch.__version__),
                   cnn_channels=args.channels, cnn_batch_size=args.cnn_batch_size, dropout=args.dropout,
+                  reader_head=args.reader_head,
                   learning_rate=args.learning_rate, unlabeled_weight=args.unlabeled_weight,
                   dataset=source.statistics["dataset"],
                   git_commit=subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip())
@@ -303,9 +313,22 @@ def evaluate(args, output):
         result = model(batch)
         return result["theraset_logits"], result["aa34_logits"], result["latent_logits"]
 
-    a, b, h = collect(read, batches(dataset, args.batch_size), args.device, progress=True)
+    device = torch.device(args.device)
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    timings = []
+    a, b, h = collect(read, batches(dataset, args.batch_size), args.device, progress=True, timings=timings)
     report = diagnostics(source, dataset, a, b, h, model.offsets.cpu(), args.split, output)
-    report.update(checkpoint=str(args.checkpoint), best_epoch=checkpoint["epoch"], anchors=checkpoint["anchors"])
+    steady = timings[5:-1] or timings
+    report.update(checkpoint=str(args.checkpoint), best_epoch=checkpoint["epoch"], anchors=checkpoint["anchors"],
+                  latent_recovery_epoch=checkpoint.get("latent_recovery_epoch"),
+                  parameters=sum(p.numel() for p in model.parameters()),
+                  inference={"batch_size": args.batch_size, "device": args.device,
+                             "hardware": torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu",
+                             "seconds": sum(timings), "batch_p50_seconds": float(np.median(steady)),
+                             "batch_p95_seconds": float(np.quantile(steady, .95)),
+                             "peak_cuda_memory_bytes": torch.cuda.max_memory_allocated(device)
+                             if device.type == "cuda" else None})
     write_json(output / "results.json", report)
 
 
@@ -328,6 +351,7 @@ def main():
         command.add_argument("--unlabeled-weight", type=float, default=.3)
         command.add_argument("--channels", type=int, default=128)
         command.add_argument("--dropout", type=float, default=.2)
+        command.add_argument("--reader-head", choices=READER_HEADS, default="global")
     score = commands.add_parser("evaluate", help="Evaluate a packed checkpoint with its saved cutoff")
     score.add_argument("checkpoint", type=Path)
     score.add_argument("--split", choices=("val", "test"), default="val")

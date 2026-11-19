@@ -11,20 +11,54 @@ from .theraset import TheraSet, motif_classifier
 
 
 LOGIT_LIMIT = math.log((1 - 1e-6) / 1e-6)
+READER_HEADS = ("global", "local", "contrast")
+
+
+class LocalLabelReadout(nn.Module):
+    """Contrast the strongest residue neighborhoods with the peptide's own background."""
+
+    def __init__(self, input_dim, num_labels, subtract_background):
+        super().__init__()
+        self.project = nn.Sequential(nn.LayerNorm(input_dim), nn.Linear(input_dim, 64), nn.GELU())
+        self.labels = nn.Linear(64, num_labels, bias=False)
+        self.subtract_background = subtract_background
+
+    def forward(self, maps, mask):
+        scores = self.labels(self.project(maps)).float()
+        valid = mask[..., None]
+        length = valid.sum(1).clamp_min(1)
+        top = scores.masked_fill(~valid, -torch.inf).topk(min(3, scores.shape[1]), dim=1).values
+        count = ((length + 1) // 2).clamp_max(3)
+        rank = torch.arange(top.shape[1], device=maps.device)[None, :, None]
+        peak = top.masked_fill(rank >= count[:, None], 0).sum(1) / count
+        if self.subtract_background:
+            background = scores.masked_fill(~valid, 0).sum(1) / length
+            return peak - background
+        return peak
 
 
 class AA34Reader(nn.Module):
-    def __init__(self, statistics, channels=128, dropout=.2):
+    def __init__(self, statistics, channels=128, dropout=.2, reader_head="global"):
         super().__init__()
+        if reader_head not in READER_HEADS:
+            raise ValueError(f"Unknown AA34 reader head: {reader_head}")
         self.motifs = ResidueCNN(dropout, channels)
-        self.classifier = motif_classifier(4 * channels, len(statistics["labels"]), dropout)
+        num_labels = len(statistics["labels"])
+        self.classifier = motif_classifier(4 * channels, num_labels, dropout)
         with torch.no_grad():
             self.classifier[-1].bias.copy_(prior_bias(statistics))
+        if reader_head != "global":
+            with torch.random.fork_rng(devices=[]):
+                self.local = LocalLabelReadout(4 * channels, num_labels, reader_head == "contrast")
+            self.local_gain = nn.Parameter(torch.full((num_labels,), .1))
 
     def forward(self, batch):
         maps = self.motifs(batch)
         pooled = maps.masked_fill(~batch["mask"][..., None], -torch.inf).amax(1)
-        return self.classifier(pooled)
+        logits = self.classifier(pooled)
+        if hasattr(self, "local"):
+            logits = logits + self.local_gain * self.local(maps, batch["mask"])
+        return logits
 
 
 def center_evidence(logits, offsets):
@@ -49,14 +83,14 @@ def empty_top10(logits, theraset_logits):
 
 
 class TriEvidence(nn.Module):
-    def __init__(self, theraset_args, helixset_args, cnn_channels=128, cnn_dropout=.2):
+    def __init__(self, theraset_args, helixset_args, cnn_channels=128, cnn_dropout=.2, reader_head="global"):
         super().__init__()
         # The frozen branches are loaded from checkpoints. Their initialization
         # should not affect the independently trained CNN's random stream.
         with torch.random.fork_rng(devices=[]):
             self.theraset = TheraSet(**theraset_args).requires_grad_(False).eval()
             self.helixset = HelixSet(**helixset_args, direct_only=True).requires_grad_(False).eval()
-        self.aa34 = AA34Reader(theraset_args["statistics"], cnn_channels, cnn_dropout)
+        self.aa34 = AA34Reader(theraset_args["statistics"], cnn_channels, cnn_dropout, reader_head)
         self.register_buffer("offsets", torch.zeros(3))
 
     def train(self, mode=True):
