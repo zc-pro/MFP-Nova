@@ -19,12 +19,15 @@ def ranks(scores):
     return np.argsort(np.argsort(-scores, axis=1, kind="stable"), axis=1) + 1
 
 
-def actions(base, direct, predicted, y, support):
+def actions(base, direct, predicted, y, support, nominees=None):
     rank, direct_rank = ranks(base), ranks(direct)
     incumbent = predicted.copy()
     empty = ~predicted.any(1)
     incumbent[np.flatnonzero(empty), base[empty].argmax(1)] = True
-    row, candidate = np.where(((rank <= 10) | (direct_rank <= 5)) & ~incumbent)
+    eligible = (rank <= 10) | (direct_rank <= 5)
+    if nominees is not None:
+        eligible |= nominees
+    row, candidate = np.where(eligible & ~incumbent)
     position, remove = np.where(incumbent[row])
     n_add = len(row)
     action = np.concatenate((np.arange(n_add), position))
@@ -70,18 +73,23 @@ def interval(delta, clusters):
     return np.quantile(values, [.025, .975]).tolist()
 
 
-def assess(scores, pack, y, folds, clusters, hard, allowed):
+def learn_threshold(scores, gains):
+    if not len(scores):
+        return float("inf")
+    fixed = (float("inf"), .15, .10, .075, .05, .025, .01, 0.)
+    quantiles = np.quantile(scores, [.80, .90, .95, .975, .99, .995, .999])
+    return max((*fixed, *quantiles), key=lambda cutoff: gains[scores > cutoff].sum())
+
+
+def assess(scores, pack, y, folds, clusters, hard, allowed, return_edits=False):
     _, _, gain, row, label, remove, add, incumbent = pack
     candidate = choose_actions(row, scores, np.flatnonzero(allowed))
-    fixed_thresholds = (float("inf"), .15, .10, .075, .05, .025, .01, 0.)
     selected = []
     used_threshold = []
     held_fold = folds[row[candidate]]
     for fold in range(5):
         fit = candidate[held_fold != fold]
-        quantile_thresholds = np.quantile(scores[fit], [.80, .90, .95, .975, .99, .995, .999])
-        threshold = max((*fixed_thresholds, *quantile_thresholds),
-                        key=lambda cutoff: gain[fit[scores[fit] > cutoff]].sum())
+        threshold = learn_threshold(scores[fit], gain[fit])
         held = candidate[(held_fold == fold) & (scores[candidate] > threshold)]
         selected.extend(held)
         used_threshold.append(None if np.isinf(threshold) else threshold)
@@ -95,7 +103,7 @@ def assess(scores, pack, y, folds, clusters, hard, allowed):
     delta = result - baseline
     np.testing.assert_allclose(delta[row[selected]], gain[selected], atol=1e-12)
     before, after = (incumbent & y).any(1), (edited & y).any(1)
-    return {
+    report = {
         "acc_pct": float(100 * result.mean()), "delta_pp": float(100 * delta.mean()),
         "paired_cluster_ci95_pp": interval(delta, clusters),
         "thresholds_by_fold": used_threshold, "actions_executed": len(selected),
@@ -109,6 +117,16 @@ def assess(scores, pack, y, folds, clusters, hard, allowed):
         "proposed_action_score_range": [float(scores[candidate].min()), float(scores[candidate].max())],
         "oracle_gain_pp_on_proposed_actions": float(100 * np.maximum(gain[candidate], 0).sum() / len(y)),
     }
+    return (report, selected, delta) if return_edits else report
+
+
+def fit_action_model(features, gain, rows):
+    model = HistGradientBoostingRegressor(max_iter=65, max_leaf_nodes=15, min_samples_leaf=100,
+                                          l2_regularization=1, early_stopping=False, random_state=42)
+    weights = 1 / np.bincount(rows)[rows]
+    with threadpool_limits(limits=4):
+        model.fit(features, gain, sample_weight=weights)
+    return model
 
 
 def main():
@@ -138,13 +156,10 @@ def main():
               "theraset_train_oof_acc_pct": train_oof_acc,
               "theraset_val_acc_pct": float(100 * row_jaccard(y, primary).mean()),
               "incumbent_acc_pct": float(100 * row_jaccard(y, pack[-1]).mean()), "arms": {}}
-    weights = 1 / np.bincount(row)[row]
     for mode, columns in (("final_scores", width), ("with_direct_and_correction", x.shape[1])):
         print(f"Fitting {mode} on {len(gain)} Train actions", flush=True)
-        model = HistGradientBoostingRegressor(max_iter=65, max_leaf_nodes=15, min_samples_leaf=100,
-                                              l2_regularization=1, early_stopping=False, random_state=42)
+        model = fit_action_model(x[:, :columns], gain, row)
         with threadpool_limits(limits=4):
-            model.fit(x[:, :columns], gain, sample_weight=weights)
             predictions = model.predict(pack[0][:, :columns])
         add = pack[-2]
         result["arms"][mode] = {
