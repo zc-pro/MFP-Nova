@@ -29,7 +29,7 @@ def candidate_features(base, direct, order, support):
     ), axis=-1)
 
 
-def train_confidence(data, paths):
+def load_branch_oof(data, paths):
     train, base = load_oof(data, paths)
     direct = np.empty_like(base)
     train_rows = data.rows[train]
@@ -41,6 +41,11 @@ def train_confidence(data, paths):
             if not np.array_equal(train_rows[position], saved["row_id"]):
                 raise ValueError(f"Train row IDs differ in {path}")
             direct[position] = saved["direct_logits"]
+    return train, base, direct
+
+
+def train_confidence(data, paths):
+    train, base, direct = load_branch_oof(data, paths)
     support = data.y[train].sum(0)
     order = np.argsort(-base, axis=1, kind="stable")[:, :10]
     feature = candidate_features(base, direct, order, support)
