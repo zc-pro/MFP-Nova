@@ -1,4 +1,4 @@
-"""Screen or recover a shallower latent branch from a packed TriEvidence checkpoint."""
+"""Screen or recover a compressed latent branch from a packed TriEvidence checkpoint."""
 
 import argparse
 import json
@@ -14,6 +14,20 @@ from mfp_nova.research import to_device, validate_cache
 from mfp_nova.research_layers import observed_label_loss
 from mfp_nova.trainer import seed_everything, write_json
 from run_trievidence import batches, collect, diagnostics, open_data, row_jaccard
+
+
+def svd_latent_ffn(state, depth, rank):
+    result = dict(state)
+    for block in range(depth):
+        for index in (1, 4):
+            prefix = f"helixset.latent_blocks.{block}.process.ff.net.{index}"
+            weight = result.pop(prefix + ".weight")
+            u, singular, vh = torch.linalg.svd(weight.float(), full_matrices=False)
+            scale = singular[:rank].sqrt()
+            result[prefix + ".0.weight"] = (scale[:, None] * vh[:rank]).to(weight.dtype)
+            result[prefix + ".1.weight"] = (u[:, :rank] * scale).to(weight.dtype)
+            result[prefix + ".1.bias"] = result.pop(prefix + ".bias")
+    return result
 
 
 def refine(args, output):
@@ -46,8 +60,15 @@ def refine(args, output):
             raise ValueError(f"The reference already disables {flag}")
         model_args["helixset_args"][flag] = False
     model_args["helixset_args"]["latent_depth"] = args.depth
+    state = packed["model_state"]
+    if args.ffn_rank is not None:
+        if args.ablate or args.depth != original_depth or model_args["helixset_args"].get("latent_ffn_rank") is not None:
+            raise ValueError("Start from the original full-rank checkpoint at the same depth")
+        model_args["helixset_args"]["latent_ffn_rank"] = args.ffn_rank
     model = TriEvidence(**model_args)
-    model.load_state_dict({k: packed["model_state"][k] for k in model.state_dict()})
+    if args.ffn_rank is not None:
+        state = svd_latent_ffn(state, args.depth, args.ffn_rank)
+    model.load_state_dict({k: state[k] for k in model.state_dict()})
     # Evaluation needs only the changing branch. The other two were exported
     # from this packed model on the same Validation rows.
     helix = model.helixset.to(args.device).eval()
@@ -57,24 +78,33 @@ def refine(args, output):
         train = MultimodalPeptides(source, args.features, "train", peptide_feature_root=args.peptide_features)
         validate_cache(train, packed["config"], packed["encoder"])
         train_loader = batches(train, args.batch_size, shuffle=True)
-        helix.latent_blocks[-1].requires_grad_(True)
+        if args.ffn_rank is not None:
+            for block in helix.latent_blocks:
+                for index in (1, 4):
+                    block.process.ff.net[index].requires_grad_(True)
+        else:
+            helix.latent_blocks[-1].requires_grad_(True)
         helix.latent_classifier.requires_grad_(True)
         optimizer = torch.optim.AdamW((p for p in helix.parameters() if p.requires_grad),
                                       lr=args.learning_rate, weight_decay=.01)
 
     best, history = None, []
+    print(f"depth={args.depth} ffn_rank={args.ffn_rank} | Validation={len(val)} | output={output}", flush=True)
     for epoch in range(args.epochs + 1):
         loss_sum = 0.
         if epoch:
-            helix.latent_blocks[-1].train()
+            if args.ffn_rank is None:
+                helix.latent_blocks[-1].train()
             helix.latent_classifier.train()
-            for batch in train_loader:
+            for step, batch in enumerate(train_loader, 1):
                 batch = to_device(batch, args.device)
                 optimizer.zero_grad(set_to_none=True)
                 loss = observed_label_loss(helix(batch)["logits"], batch["y"], source.statistics["labels"])
                 loss.backward()
                 optimizer.step()
                 loss_sum += float(loss.detach()) * len(batch["y"])
+                if step % 256 == 0:
+                    print(f"Epoch {epoch} train {step}/{len(train_loader)}", flush=True)
             helix.eval()
         h, = collect(lambda batch: (helix(batch)["logits"],), loader, args.device, progress=True)
         scores = fuse_evidence(a, c, h, offsets)
@@ -95,7 +125,8 @@ def refine(args, output):
 
     _, epoch, h = best
     report = diagnostics(source, val, a, c, h, offsets, "val", output)
-    report.update(reference_checkpoint=str(args.checkpoint), depth=args.depth, ablation=args.ablate, best_epoch=epoch,
+    report.update(reference_checkpoint=str(args.checkpoint), depth=args.depth, ablation=args.ablate,
+                  ffn_rank=args.ffn_rank, best_epoch=epoch,
                   train_rows=len(train) if train is not None else 0,
                   parameters=sum(p.numel() for p in model.parameters()), history=history)
     write_json(output / "results.json", report)
@@ -105,6 +136,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("--depth", type=int, required=True)
+    parser.add_argument("--ffn-rank", type=int, help="SVD rank for the two FFN linear layers in each latent block")
     parser.add_argument("--ablate", choices=("geometry", "triangles"),
                         help="Disable only HelixSet explicit geometry or only its triangle updates")
     parser.add_argument("--epochs", type=int, default=0)

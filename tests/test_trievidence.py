@@ -166,6 +166,18 @@ def test_packed_checkpoint_replays_validation_after_training(tmp_path, monkeypat
             original = torch.load(packed / "best.pt", map_location="cpu", weights_only=True)
             for key, value in original["model_state"].items():
                 torch.testing.assert_close(modified["model_state"][key], value, rtol=0, atol=0)
+        low_rank = tmp_path / "low_rank"
+        monkeypatch.setattr(sys, "argv", [str(script), str(packed / "best.pt"), *data_args,
+                                         "--depth", "2", "--ffn-rank", "8", "--epochs", "1",
+                                         "--output", str(low_rank)])
+        runpy.run_path(str(script), run_name="__main__")
+        saved = torch.load(low_rank / "best.pt", map_location="cpu", weights_only=True)
+        assert saved["model_args"]["helixset_args"]["latent_ffn_rank"] == 8
+        assert sum(v.numel() for v in saved["model_state"].values()) < sum(
+            v.numel() for v in original["model_state"].values())
+        monkeypatch.setattr(sys, "argv", ["trievidence", "evaluate", str(low_rank / "best.pt"), *data_args,
+                                         "--output", str(tmp_path / "low_rank_evaluate")])
+        main()
         script = script.with_name("train_trievidence_shared.py")
         for mode in ("states", "pairs"):
             shared, replay = tmp_path / mode, tmp_path / f"{mode}_evaluate"

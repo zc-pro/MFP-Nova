@@ -451,4 +451,34 @@ if ($LASTEXITCODE -ne 0) { throw 'Reuse evaluation failed' }
 & $py scripts/compare_trievidence.py "$work/reuse_off" "$work/reuse_on" | Tee-Object "$work/compare_reuse.json"
 ```
 
-如果要减少参数，首个层内候选可对六个潜变量块里的 FFN 两个大线性层做截断 SVD 初始化，保持各层的输入输出维度、注意力和三角更新。rank 256 和 192 分别约省 118 万和 265 万下游参数。每块先做有／无压缩的 Validation 对照，再决定是否需要用原 Train 短训恢复。低秩增加了中间矩阵乘法，耗时变化需要实测。此候选还未实现。
+### 六层 FFN 低秩筛选与训练
+
+六个潜变量块里的 FFN 各有两个大线性层。对它们做截断 SVD 初始化，保持各层的输入输出维度、注意力和三角更新。rank 256 和 192 分别约省 118 万和 265 万下游参数。先试 rank 256。设 `epochs=0` 只评估 SVD 初始化，达不到参考性能时设 `epochs=3`，在原 Train 上只恢复低秩矩阵和 latent 分类头。两次都从原始六层打包 `best.pt` 出发，保留原三路阈值。训练后选出的 `best.pt` 可直接用 `run_trievidence.py evaluate` 读取。低秩增加了中间矩阵乘法，实际耗时需实测。
+
+V100 Bash 沿用深度实验的准备命令，建立最新工作树并设置 `$py`、`$base`、`$work`、`common`。
+
+```bash
+rank=256
+epochs=0       # 首轮无重训。需要恢复时改成 3
+arm="ffn_r${rank}_e${epochs}"
+nohup env CUDA_VISIBLE_DEVICES="${gpus[0]}" OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 \
+  "$py" -u scripts/refine_trievidence_depth.py "$base/best.pt" "${common[@]}" \
+  --depth 6 --ffn-rank "$rank" --epochs "$epochs" --output "$work/$arm" \
+  >"$work/$arm.log" 2>&1 </dev/null &
+printf 'PID=%s 日志=%s\n' "$!" "$work/$arm.log"
+tail -n 8 -F "$work/$arm.log"
+```
+
+结束后执行 `"$py" scripts/compare_trievidence.py "$base" "$work/$arm" | tee "$work/compare_$arm.json"`。Validation 入选时，沿用上方整模型验收命令，把 `chosen` 指向 `"$work/$arm"`。测量实际耗时时，两边使用相同的输入计算复用设置。
+
+RTX 5070 PowerShell 使用相同准备部分：
+
+```powershell
+$rank = 256
+$epochs = 0    # 需要恢复时改成 3
+$arm = "ffn_r${rank}_e${epochs}"
+& $py -u scripts/refine_trievidence_depth.py "$base/best.pt" @common --depth 6 --ffn-rank $rank --epochs $epochs `
+    --output "$work/$arm" 2>&1 | Tee-Object "$work/$arm.log"
+if ($LASTEXITCODE -ne 0) { throw 'Low-rank experiment failed' }
+& $py scripts/compare_trievidence.py $base "$work/$arm" | Tee-Object "$work/compare_$arm.json"
+```

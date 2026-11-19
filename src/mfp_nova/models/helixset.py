@@ -255,7 +255,7 @@ class LabelPairRead(nn.Module):
 class LatentFusionBlock(nn.Module):
     """Separate reads prevent long residue streams from crowding out property tokens."""
 
-    def __init__(self, dim, heads, dropout):
+    def __init__(self, dim, heads, dropout, ffn_rank=None):
         super().__init__()
         self.motif_read = QualityRead(dim, heads, dropout)
         self.property_read = Attention(dim, heads, dropout)
@@ -263,6 +263,15 @@ class LatentFusionBlock(nn.Module):
         self.evidence_norms = nn.ModuleList([nn.LayerNorm(dim, elementwise_affine=False) for _ in range(3)])
         self.combine = nn.Sequential(nn.Linear(3 * dim, dim), nn.Dropout(dropout))
         self.process = TransformerBlock(dim, heads, dropout)
+        if ffn_rank is not None:
+            for index in (1, 4):
+                layer = self.process.ff.net[index]
+                if not 0 < ffn_rank < min(layer.in_features, layer.out_features):
+                    raise ValueError("FFN rank must be smaller than both linear dimensions")
+                self.process.ff.net[index] = nn.Sequential(
+                    nn.Linear(layer.in_features, ffn_rank, bias=False),
+                    nn.Linear(ffn_rank, layer.out_features),
+                )
 
     def forward(self, latent, latent_mask, memories, masks, reliability, motif_weights):
         evidence = [self.motif_read(latent, memories[0], latent_mask, masks[0], motif_weights),
@@ -324,7 +333,8 @@ class HelixSet(nn.Module):
                  pair_readout=True, fine_evidence=True, geometry_depth=4,
                  geometry_context=True, geometry_quality=True, distance_multiscale=True,
                  scale_balance=True, pair_interactions=True, structure_evidence=True,
-                 esm_tail=None, evidence_readout=False, peptide_input_dim=0, direct_only=False):
+                 esm_tail=None, evidence_readout=False, peptide_input_dim=0, direct_only=False,
+                 latent_ffn_rank=None):
         super().__init__()
         if direct_only and evidence_readout:
             raise ValueError("The latent-only exit does not use the early evidence decoder")
@@ -356,7 +366,7 @@ class HelixSet(nn.Module):
         self.pyramid = MotifPyramid(dim, dropout)
         self.latents = nn.Parameter(torch.randn(latent_count, dim) * .02)
         self.latent_blocks = nn.ModuleList([
-            LatentFusionBlock(dim, heads, dropout) for _ in range(latent_depth)
+            LatentFusionBlock(dim, heads, dropout, latent_ffn_rank) for _ in range(latent_depth)
         ])
         prior = torch.tensor(statistics["observed_prior"]).clamp(1e-4, 1 - 1e-4)
         if not direct_only:
