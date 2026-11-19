@@ -46,3 +46,29 @@ class LocalCandidateHead(nn.Module):
         evidence = self.read(query, memory, query_mask, valid, scale_weight)
         state = self.update(query + evidence, query_mask)
         return (self.norm(state) * self.output).sum(-1) + self.bias
+
+
+class CandidatePairRanker(nn.Module):
+    """Score candidate labels against the current TheraSet ordering."""
+
+    def __init__(self, input_dim, num_labels, mode="scores"):
+        super().__init__()
+        if mode not in ("scores", "span"):
+            raise ValueError("Expected scores or span")
+        self.span = LocalCandidateHead(input_dim, num_labels) if mode == "span" else None
+        self.label = nn.Embedding(num_labels, 8)
+        self.adjust = nn.Sequential(nn.Linear(13 + int(self.span is not None), 32), nn.GELU(), nn.Linear(32, 1))
+        nn.init.zeros_(self.adjust[-1].weight)
+        nn.init.zeros_(self.adjust[-1].bias)
+
+    def forward(self, base, direct, residues=None, mask=None):
+        features = [
+            base / 4, direct / 4, (base - direct) / 4,
+            (base - base.amax(dim=1, keepdim=True)) / 4,
+            (direct - direct.amax(dim=1, keepdim=True)) / 4,
+        ]
+        if self.span is not None:
+            features.append(self.span(residues, mask))
+        label = self.label.weight.unsqueeze(0).expand(base.size(0), -1, -1)
+        adjustment = self.adjust(torch.cat((torch.stack(features, dim=-1), label), dim=-1)).squeeze(-1)
+        return base + adjustment
