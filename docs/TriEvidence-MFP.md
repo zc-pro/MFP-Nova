@@ -146,6 +146,8 @@ AA34 的 `--reader-head contrast` 用现有 CNN 残基特征预测每个标签�
 
 五层和四层恢复均未达到两项 ACC 基线。当前采用六层作为性能对照，进入共享骨干实验。在本机缓存 Validation 对照中，加入六层 HelixSet 后，相比 TheraSet 加 AA34 新增命中 385 个已标注标签，也丢失 250 个。224 条原零命中样本获救，137 条原有命中的样本变为零命中。新读出应逐样本比较这些有益和有害的改变，以及两项总 ACC。
 
+共享头首轮仍低于六层。源码中，HelixSet 直接读出来自独立序列、理化、几何、残基对和多尺度窗口编码，再经六次分模态潜变量读取。已测的共享头只接收 TheraSet 合并后的残基状态，`pairs` 另把 TheraSet 一次构造的残基对映射到注意力偏置。独立理化 token 和几何节点 token 未接入该头，骨干权重保持冻结。Validation 的分数诊断显示，相对两路，六层带来的兜底前收益主要出现在最近 Train 相似度小于 0.70 的样本（3,753 条，+2.026 个百分点）。该组中有结构与缺结构样本的收益均为正。后续单块消融应区分显式结构路径、残基三角更新和已经观察到的潜变量深度效应。
+
 目标结构是 **一个多模态骨干、两个独立多模态读出和一个轻量 AA34 分支**。沿用 TheraSet 骨干和原读出。在同一次 `encode_evidence` 调用中取得残基状态、序列残基对、可用几何残基对与质量掩码，供两个多模态读出复用。把残基状态投影到 128 维做一次残基注意力，将现有残基对投影为注意力偏置，并用质量掩码控制几何偏置。随后通过独立标签查询读出 39 维 logits。关系读出的参数预算为 100 万以内，整模型下游参数目标约 1,425 万以内。
 
 原始 Train 只训练新读出，复用已有弱权重未标注项损失。三组对照为原两路、加共享状态读出、加带残基对偏置的共享读出。同时看相对两路找回的正确标签和原三路保住的标签数。利用这组对照判断共享骨干剩余的表示是否足以补回 HelixSet 的信息，再决定是否继续投入。
@@ -374,3 +376,49 @@ foreach ($mode in 'states','pairs') {
 ```
 
 沿用上方 PowerShell 的串行整模型验收命令，将 `$chosen` 设为 `"$work/states"` 或 `"$work/pairs"`。部署对照仍为六层 Test 兜底前 63.2046%、兜底后 64.0934%。
+
+## 六层 HelixSet 单项消融
+
+沿用上方对应平台的准备命令，建立最新工作树并复用六层打包目录。首次只跑原始 Validation。两组都使用六层权重和阈值。`geometry` 关闭 HelixSet 的显式结构证据，序列残基对仍运行。`triangles` 只关闭序列与几何两类残基对三角更新，保留其他结构路径。TheraSet 和 AA34 分数均取自原打包 Validation。
+
+V100 Bash 使用准备好的 `$base`、`$work`、`$py`、`gpus` 与 `common`，分别启动两卡：
+
+```bash
+arms=(geometry triangles)
+for i in "${!arms[@]}"; do
+  arm="${arms[$i]}"
+  nohup env CUDA_VISIBLE_DEVICES="${gpus[$i]}" OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 \
+    "$py" -u scripts/refine_trievidence_depth.py "$base/best.pt" "${common[@]}" \
+    --depth 6 --epochs 0 --ablate "$arm" --output "$work/$arm" \
+    >"$work/$arm.log" 2>&1 </dev/null &
+  printf '%s PID=%s 日志=%s\n' "$arm" "$!" "$work/$arm.log"
+done
+tail -n 8 -F "$work"/{geometry,triangles}.log
+```
+
+两组完成后比较。有最近邻文件时报告相似度低于 0.70 和结构可用性的交叉分组。
+
+```bash
+strata=(--structure "$project/data/therapeutic_2025/arrays/structure_primary.npz")
+nearest="$project/runs/fine39_research_audit_20261118_013306/nearest_val.npz"
+if [ -r "$nearest" ]; then strata+=(--nearest "$nearest"); fi
+for arm in geometry triangles; do
+  "$py" scripts/compare_trievidence.py "$base" "$work/$arm" "${strata[@]}" | tee "$work/compare_$arm.json"
+done
+```
+
+RTX 5070 PowerShell 使用同一准备部分提供的变量：
+
+```powershell
+$strata = @('--structure', "$project/data/therapeutic_2025/arrays/structure_primary.npz")
+$nearest = "$project/runs/fine39_research_audit_20261118_013306/nearest_val.npz"
+if (Test-Path -LiteralPath $nearest) { $strata += @('--nearest', $nearest) }
+foreach ($arm in 'geometry','triangles') {
+    & $py -u scripts/refine_trievidence_depth.py "$base/best.pt" @common --depth 6 --epochs 0 --ablate $arm `
+        --output "$work/$arm" 2>&1 | Tee-Object "$work/$arm.log"
+    if ($LASTEXITCODE -ne 0) { throw "Ablation $arm failed" }
+    & $py scripts/compare_trievidence.py $base "$work/$arm" @strata | Tee-Object "$work/compare_$arm.json"
+}
+```
+
+先看 `fusion` 的整体变化和 `nearest_below_070`，并比较对应的有结构与缺结构分组。消融衡量现有权重对计算路径的依赖。两组参数数量会相同，提速需另做整模型计时。

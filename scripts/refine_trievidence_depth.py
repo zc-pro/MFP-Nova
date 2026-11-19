@@ -38,6 +38,13 @@ def refine(args, output):
     original_depth = model_args["helixset_args"].get("latent_depth", 6)
     if not 1 <= args.depth <= original_depth or args.epochs < 0:
         raise ValueError("Use a positive depth no larger than the checkpoint depth and nonnegative epochs")
+    if args.ablate:
+        if args.epochs or args.depth != original_depth:
+            raise ValueError("Ablation compares original-depth weights without recovery training")
+        flag = {"geometry": "structure_evidence", "triangles": "triangles"}[args.ablate]
+        if model_args["helixset_args"].get(flag, True) is False:
+            raise ValueError(f"The reference already disables {flag}")
+        model_args["helixset_args"][flag] = False
     model_args["helixset_args"]["latent_depth"] = args.depth
     model = TriEvidence(**model_args)
     model.load_state_dict({k: packed["model_state"][k] for k in model.state_dict()})
@@ -88,7 +95,7 @@ def refine(args, output):
 
     _, epoch, h = best
     report = diagnostics(source, val, a, c, h, offsets, "val", output)
-    report.update(reference_checkpoint=str(args.checkpoint), depth=args.depth, best_epoch=epoch,
+    report.update(reference_checkpoint=str(args.checkpoint), depth=args.depth, ablation=args.ablate, best_epoch=epoch,
                   train_rows=len(train) if train is not None else 0,
                   parameters=sum(p.numel() for p in model.parameters()), history=history)
     write_json(output / "results.json", report)
@@ -98,6 +105,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("--depth", type=int, required=True)
+    parser.add_argument("--ablate", choices=("geometry", "triangles"),
+                        help="Disable only HelixSet explicit geometry or only its triangle updates")
     parser.add_argument("--epochs", type=int, default=0)
     parser.add_argument("--learning-rate", type=float, default=2e-5)
     parser.add_argument("--device", default="cuda:0")

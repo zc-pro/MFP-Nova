@@ -13,6 +13,66 @@ from mfp_nova.models.trievidence import center_evidence, empty_top10, fuse_evide
 from mfp_nova.multimodal import BackbonePeptides, MultimodalData, independent_functions
 from mfp_nova.trainer import write_json
 from run_trievidence import align_saved, row_jaccard
+from train_fine39_action_gain import interval
+
+
+def helix_impact(source, indices, truth, two, three, nearest):
+    added, removed = three & ~two, two & ~three
+    delta = row_jaccard(truth, three) - row_jaccard(truth, two)
+    before = (two & truth).any(1)
+    after = (three & truth).any(1)
+    lengths = np.asarray([len(s) for s in source.data.sequences[indices]])
+    structure = source.struct["structure_available"][indices]
+    functions = independent_functions(truth.numpy(), source.statistics["function_projection"]).sum(1)
+    groups = {
+        "all": np.ones(len(indices), dtype=bool),
+        "structure_present": structure,
+        "structure_missing": ~structure,
+        "length_2_8": lengths <= 8,
+        "length_9_16": (lengths > 8) & (lengths <= 16),
+        "length_17_32": (lengths > 16) & (lengths <= 32),
+        "length_33_plus": lengths > 32,
+        "one_function": functions == 1,
+        "two_functions": functions == 2,
+        "three_plus_functions": functions >= 3,
+    }
+    if nearest is not None:
+        with np.load(nearest) as neighbors:
+            order = np.argsort(neighbors["row_id"])
+            np.testing.assert_array_equal(neighbors["row_id"][order], source.data.rows[indices])
+            similarity = neighbors["similarity"][order]
+        for lo, hi in ((0., .5), (.5, .7), (.7, .8), (.8, 1.01)):
+            groups[f"nearest_train_{lo:.2f}_{hi:.2f}"] = (similarity >= lo) & (similarity < hi)
+        low_similarity = similarity < .7
+        groups.update(nearest_train_below_070=low_similarity,
+                      low_similarity_structure_present=low_similarity & structure,
+                      low_similarity_structure_missing=low_similarity & ~structure)
+    # Separate the two operations by averaging both orders of applying them.
+    # Their sample-wise contributions then sum to the full Jaccard change.
+    base_acc = row_jaccard(truth, two)
+    add_acc = row_jaccard(truth, two | added)
+    remove_acc = row_jaccard(truth, two & ~removed)
+    effect_add = .5 * ((add_acc - base_acc) + (base_acc + delta - remove_acc))
+    result = {}
+    clusters = source.data.clusters[indices]
+    for name, group in groups.items():
+        if not group.any():
+            continue
+        result[name] = {
+            "rows": int(group.sum()),
+            "changed_rows": int((added | removed).any(1)[group].sum()),
+            "raw_delta_pp": 100 * float(delta[group].mean()),
+            "paired_cluster_ci95_pp": interval(delta[group].numpy(), clusters[group]),
+            "add_effect_pp": 100 * float(effect_add[group].mean()),
+            "remove_effect_pp": 100 * float((delta - effect_add)[group].mean()),
+            "added_observed": int((added & truth)[group].sum()),
+            "removed_observed": int((removed & truth)[group].sum()),
+            "added_unannotated": int((added & ~truth)[group].sum()),
+            "removed_unannotated": int((removed & ~truth)[group].sum()),
+            "new_hit_rows": int((~before & after)[group].sum()),
+            "lost_hit_rows": int((before & ~after)[group].sum()),
+        }
+    return result
 
 
 def audit(args):
@@ -97,9 +157,11 @@ def audit(args):
                         "lost_observed_labels": int((truth & final_old & ~final_new & mask[:, None]).sum()),
                         "gained_unannotated_labels": int((~truth & final_new & ~final_old & mask[:, None]).sum()),
                         "removed_unannotated_labels": int((~truth & final_old & ~final_new & mask[:, None]).sum())}
+    helix_two = centered[:2].mean(0) >= 0
     report = {"split": "val", "rows": len(val), "source_single": str(args.single),
               "source_five": str(args.five), "source_helix_exits": str(args.helix),
-              "arms": arms, "paired": paired, "fixed_threshold_branch_removal": removals}
+              "arms": arms, "paired": paired, "fixed_threshold_branch_removal": removals,
+              "helix_added_to_fixed_two": helix_impact(source, idx, truth, helix_two, raw_new, args.nearest)}
     output = Path("runs") / datetime.now().strftime("trievidence_replacements_%Y%m%d_%H%M%S_%f")
     output.mkdir()
     write_json(output / "results.json", report)
@@ -111,5 +173,6 @@ if __name__ == "__main__":
     for name in ("single", "five", "helix"):
         parser.add_argument(name, type=Path)
     parser.add_argument("--data-root", type=Path, default=Path("data/therapeutic_2025"))
+    parser.add_argument("--nearest", type=Path, help="Optional nearest-Train similarity export for Validation")
     torch.set_num_threads(4)
     audit(parser.parse_args())

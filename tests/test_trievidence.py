@@ -130,6 +130,16 @@ def test_packed_checkpoint_replays_validation_after_training(tmp_path, monkeypat
         monkeypatch.setattr(sys, "argv", ["trievidence", "evaluate", str(shallow / "best.pt"), *data_args,
                                          "--output", str(tmp_path / "shallow_evaluate")])
         main()
+        for name, field in (("geometry", "structure_evidence"), ("triangles", "triangles")):
+            ablation = tmp_path / name
+            monkeypatch.setattr(sys, "argv", [str(script), str(packed / "best.pt"), *data_args,
+                                             "--depth", "2", "--ablate", name, "--output", str(ablation)])
+            runpy.run_path(str(script), run_name="__main__")
+            modified = torch.load(ablation / "best.pt", map_location="cpu", weights_only=True)
+            assert modified["model_args"]["helixset_args"][field] is False
+            original = torch.load(packed / "best.pt", map_location="cpu", weights_only=True)
+            for key, value in original["model_state"].items():
+                torch.testing.assert_close(modified["model_state"][key], value, rtol=0, atol=0)
         script = script.with_name("train_trievidence_shared.py")
         for mode in ("states", "pairs"):
             shared, replay = tmp_path / mode, tmp_path / f"{mode}_evaluate"
