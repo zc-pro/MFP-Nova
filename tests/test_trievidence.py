@@ -138,7 +138,7 @@ def test_packed_checkpoint_replays_validation_after_training(tmp_path, monkeypat
     (tmp_path / "theraset.pt").unlink()
     (tmp_path / "helixset.pt").unlink()
     monkeypatch.setattr(sys, "argv", ["trievidence", "evaluate", str(packed / "best.pt"), *data_args,
-                                     "--output", str(second)])
+                                     "--length-bucketed", "--output", str(second)])
     main()
     with np.load(first / "val_predictions.npz") as before, np.load(second / "val_predictions.npz") as after:
         for key in ("row_id", "aa34_logits", "probabilities", "predicted", "predicted_raw"):

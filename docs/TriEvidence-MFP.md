@@ -505,3 +505,11 @@ $out = "$work/gpu_$(Get-Date -Format yyyyMMdd_HHmmss)"
 ```
 
 报告包含成对延迟差的中位数、候选较快的测量次数、两路各自的 P50/P95。成对延迟差为候选减全秩，负数表示候选更快。
+
+### 保留权重的按长度组批
+
+现用方案为六层全秩 TriEvidence 加 `--reuse-input-compute`。rank 256 在交替 CUDA 前向的 72 个配对样本中，只有 14 个更快，配对延迟差中位数为 +1.31 ms，因此保留为压缩实验记录。
+
+`evaluate --length-bucketed` 按真实序列长度稳定排序后组批，计算完按原样本顺序导出。原始 Validation 的 8,529 条样本按 batch 16 估算，组批后 padding 后的残基位数由 301,666 降到 149,170，残基对位置由 11,672,804 降到 3,611,972，对应三角更新的立方长度量由 478,698,568 降到 110,169,352。这些量反映填充开销，实际 GPU 耗时另测。
+
+V100 Bash 与 RTX 5070 PowerShell 均沿用上方整模型 Validation 评估命令。两次加载同一个六层 `best.pt`，都指定 `--reuse-input-compute`，第二次加 `--length-bucketed`。同卡、相同 batch 比较 `compare_trievidence.py` 的 `branch_logits_max_abs_delta`、两项 `changed_rows`、整轮耗时、P50/P95 与峰值显存。不同 padding 形状可能改变浮点路径，需在实际 GPU 上确认原阈值下的预测一致。该方式面向批量推理，单条请求没有组批收益。

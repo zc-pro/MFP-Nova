@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from mfp_nova.metrics import evaluate_metrics
 from evaluate_fine39_fixed_fusion import logit, read_theraset
@@ -329,7 +329,17 @@ def evaluate(args, output):
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     timings = []
-    a, b, h = collect(read, batches(dataset, args.batch_size), args.device, progress=True, timings=timings)
+    inference_data = dataset
+    if args.length_bucketed:
+        lengths = [len(source.data.sequences[i]) for i in dataset.indices]
+        order = np.argsort(lengths, kind="stable")
+        inference_data = Subset(dataset, order.tolist())
+    columns = collect(read, batches(inference_data, args.batch_size), args.device,
+                      progress=True, timings=timings)
+    if args.length_bucketed:
+        original_order = torch.from_numpy(np.argsort(order))
+        columns = tuple(column[original_order] for column in columns)
+    a, b, h = columns
     report = diagnostics(source, dataset, a, b, h, model.offsets.cpu(), args.split, output,
                          shared="shared_mode" in checkpoint["model_args"])
     steady = timings[5:-1] or timings
@@ -338,6 +348,7 @@ def evaluate(args, output):
                   parameters=sum(p.numel() for p in model.parameters()),
                   inference={"batch_size": args.batch_size, "device": args.device,
                              "reuse_input_compute": getattr(model, "reuse_input_compute", False),
+                             "length_bucketed": args.length_bucketed,
                              "hardware": torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu",
                              "seconds": sum(timings), "batch_p50_seconds": float(np.median(steady)),
                              "batch_p95_seconds": float(np.quantile(steady, .95)),
@@ -369,6 +380,8 @@ def main():
     score = commands.add_parser("evaluate", help="Evaluate a packed checkpoint with its saved cutoff")
     score.add_argument("checkpoint", type=Path)
     score.add_argument("--split", choices=("val", "test"), default="val")
+    score.add_argument("--length-bucketed", action="store_true",
+                       help="Batch similar lengths together and restore original row order for metrics")
     score.add_argument("--reuse-input-compute", action="store_true",
                        help="Reuse equivalent dual-ESM normalization and residue distances in TriEvidence")
     for command in (fit, cached, score):
