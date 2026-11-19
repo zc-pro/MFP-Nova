@@ -133,11 +133,14 @@ def pass_train(reader, loader, device, optimizer, statistics, unlabeled_weight):
     return loss_sum / len(loader.dataset)
 
 
-def diagnostics(source, dataset, theraset, aa34, latent, offsets, split, output):
+def diagnostics(source, dataset, theraset, aa34, latent, offsets, split, output, shared=False):
     y = source.data.y[dataset.indices].astype(bool)
     truth = torch.from_numpy(y)
     mixed = fuse_evidence(theraset, aa34, latent, offsets)
     two = center_evidence(torch.stack((theraset, latent)), offsets[[0, 2]]).mean(0)
+    sequence_two = center_evidence(torch.stack((theraset, aa34)), offsets[:2]).mean(0)
+    third = "shared_readout" if shared else "helixset_latent"
+    two_name = "theraset_shared" if shared else "theraset_helixset"
     raw, rescued = mixed >= 0, empty_top10(mixed, theraset)
     order = theraset.argsort(dim=1, descending=True, stable=True)
     missed_top5 = ~truth.gather(1, order[:, :5]).any(1)
@@ -163,9 +166,11 @@ def diagnostics(source, dataset, theraset, aa34, latent, offsets, split, output)
     results = {
         "theraset": summary(theraset, reference),
         "aa34": summary(aa34, aa34 >= offsets[1]),
-        "helixset_latent": summary(latent, latent >= offsets[2]),
-        "theraset_helixset": summary(two, two >= 0),
-        "theraset_helixset_empty_top10": summary(two, empty_top10(two, theraset)),
+        third: summary(latent, latent >= offsets[2]),
+        two_name: summary(two, two >= 0),
+        f"{two_name}_empty_top10": summary(two, empty_top10(two, theraset)),
+        "theraset_aa34": summary(sequence_two, sequence_two >= 0),
+        "theraset_aa34_empty_top10": summary(sequence_two, empty_top10(sequence_two, theraset)),
         "fusion": summary(mixed, raw),
         "fusion_empty_top10": summary(mixed, rescued),
     }
@@ -177,9 +182,9 @@ def diagnostics(source, dataset, theraset, aa34, latent, offsets, split, output)
                         predicted=rescued.numpy(), predicted_raw=raw.numpy(),
                         theraset_logits=theraset.numpy(), aa34_logits=aa34.numpy(), latent_logits=latent.numpy())
     report = {"model": MODEL_NAME, "split": split, "rows": len(y), "multifunction_rows": int(multi.sum()),
-              "theraset_top5_misses": int(missed_top5.sum()),
+              "theraset_top5_misses": int(missed_top5.sum()), "third_branch": third,
               "branch_thresholds": offsets.sigmoid().tolist(), "arms": results}
-    for name in ("theraset", "theraset_helixset", "fusion", "fusion_empty_top10"):
+    for name in ("theraset", "theraset_aa34" if shared else two_name, "fusion", "fusion_empty_top10"):
         print(f"{name} ACC={results[name]['sample_jaccard']:.4%} "
               f"ZeroHit={results[name]['zero_hit_rows']}", flush=True)
     return report
@@ -305,7 +310,11 @@ def evaluate(args, output):
     if checkpoint["model_name"] != MODEL_NAME:
         raise ValueError("Use the packed TriEvidence-MFP best.pt")
     source, dataset = open_data(args, args.split, checkpoint)
-    model = TriEvidence(**checkpoint["model_args"])
+    if "shared_mode" in checkpoint["model_args"]:
+        from mfp_nova.models.trievidence_shared import SharedTriEvidence
+        model = SharedTriEvidence(**checkpoint["model_args"])
+    else:
+        model = TriEvidence(**checkpoint["model_args"])
     model.load_state_dict(checkpoint["model_state"])
     model.to(args.device).eval()
 
@@ -318,7 +327,8 @@ def evaluate(args, output):
         torch.cuda.reset_peak_memory_stats(device)
     timings = []
     a, b, h = collect(read, batches(dataset, args.batch_size), args.device, progress=True, timings=timings)
-    report = diagnostics(source, dataset, a, b, h, model.offsets.cpu(), args.split, output)
+    report = diagnostics(source, dataset, a, b, h, model.offsets.cpu(), args.split, output,
+                         shared="shared_mode" in checkpoint["model_args"])
     steady = timings[5:-1] or timings
     report.update(checkpoint=str(args.checkpoint), best_epoch=checkpoint["epoch"], anchors=checkpoint["anchors"],
                   latent_recovery_epoch=checkpoint.get("latent_recovery_epoch"),

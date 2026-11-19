@@ -130,3 +130,16 @@ def test_packed_checkpoint_replays_validation_after_training(tmp_path, monkeypat
         monkeypatch.setattr(sys, "argv", ["trievidence", "evaluate", str(shallow / "best.pt"), *data_args,
                                          "--output", str(tmp_path / "shallow_evaluate")])
         main()
+        script = script.with_name("train_trievidence_shared.py")
+        for mode in ("states", "pairs"):
+            shared, replay = tmp_path / mode, tmp_path / f"{mode}_evaluate"
+            monkeypatch.setattr(sys, "argv", [str(script), str(packed / "best.pt"), *data_args,
+                                             "--mode", mode, "--epochs", "1", "--output", str(shared)])
+            runpy.run_path(str(script), run_name="__main__")
+            monkeypatch.setattr(sys, "argv", ["trievidence", "evaluate", str(shared / "best.pt"), *data_args,
+                                             "--output", str(replay)])
+            main()
+            with np.load(shared / "val_predictions.npz") as before, np.load(replay / "val_predictions.npz") as after:
+                for key in ("theraset_logits", "aa34_logits", "latent_logits"):
+                    np.testing.assert_allclose(before[key], after[key], atol=1e-6)
+                np.testing.assert_array_equal(before["predicted"], after["predicted"])

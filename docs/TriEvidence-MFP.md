@@ -144,6 +144,8 @@ AA34 的 `--reader-head contrast` 用现有 CNN 残基特征预测每个标签�
 
 ### 3. 共享骨干作为更大幅度精简的候选
 
+五层和四层恢复均未达到两项 ACC 基线。当前采用六层作为性能对照，进入共享骨干实验。在本机缓存 Validation 对照中，加入六层 HelixSet 后，相比 TheraSet 加 AA34 新增命中 385 个已标注标签，也丢失 250 个。224 条原零命中样本获救，137 条原有命中的样本变为零命中。新读出应逐样本比较这些有益和有害的改变，以及两项总 ACC。
+
 目标结构是 **一个多模态骨干、两个独立多模态读出和一个轻量 AA34 分支**。沿用 TheraSet 骨干和原读出。在同一次 `encode_evidence` 调用中取得残基状态、序列残基对、可用几何残基对与质量掩码，供两个多模态读出复用。把残基状态投影到 128 维做一次残基注意力，将现有残基对投影为注意力偏置，并用质量掩码控制几何偏置。随后通过独立标签查询读出 39 维 logits。关系读出的参数预算为 100 万以内，整模型下游参数目标约 1,425 万以内。
 
 原始 Train 只训练新读出，复用已有弱权重未标注项损失。三组对照为原两路、加共享状态读出、加带残基对偏置的共享读出。同时看相对两路找回的正确标签和原三路保住的标签数。利用这组对照判断共享骨干剩余的表示是否足以补回 HelixSet 的信息，再决定是否继续投入。
@@ -292,3 +294,83 @@ if ($LASTEXITCODE -ne 0) { throw 'Candidate evaluation failed' }
 ```
 
 比较文件记录两项 ACC 差值、按簇配对区间、变化样本数、零命中和多功能肽 Jaccard。整模型复跑还记录参数数、预热后的批次 P50/P95 和显存峰值。批次时间包含数据读取和传输。在相同硬件、batch 和负载下解读。若原六层已经是唯一达到既有性能的候选，本轮结论是继续使用原版。
+
+## 共享读出训练与验收
+
+从原六层打包目录读取 `best.pt` 与 `val_predictions.npz`。两组分别用 `states`（共享残基状态）和 `pairs`（再加残基对偏置），固定 seed 42、8 轮、batch 16、学习率 0.0003。只训练新读出。TheraSet 和 AA34 的权重与阈值固定，新读出的阈值从 Validation 的 0.10 到 0.90 网格选择。比较原始三路的两项 ACC，并保留两路 `theraset_aa34` 对照。Test 仅运行在 Validation 上选定的候选。
+
+### 共享读出 V100 Bash
+
+```bash
+project="$HOME/wuzhencheng/projects/MFP-Nova"
+base="$project/runs/trievidence_packed_s42_20261119_155453/model"
+stamp=$(date +%Y%m%d_%H%M%S)
+work="$project/runs/trievidence_shared_$stamp"
+code="$(dirname "$project")/MFP-Nova-shared-$stamp"
+gpus=(2 3)
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate MFP-Nova
+py="$CONDA_PREFIX/bin/python"
+
+(
+  set -e
+  git -C "$project" fetch origin refs/heads/codex/trievidence-mfp
+  git -C "$project" worktree add --detach "$code" FETCH_HEAD
+  mkdir "$work"
+)
+cd "$code"
+export PYTHONPATH="$code/src" OMP_NUM_THREADS=4 MKL_NUM_THREADS=4
+common=(--data-root "$project/data/therapeutic_2025"
+        --features "$project/features/esm2_650m"
+        --peptide-features "$project/features/esm2_peptide_150m"
+        --device cuda:0 --batch-size 16)
+
+modes=(states pairs)
+for i in "${!modes[@]}"; do
+  mode="${modes[$i]}"
+  nohup env CUDA_VISIBLE_DEVICES="${gpus[$i]}" "$py" -u scripts/train_trievidence_shared.py \
+    "$base/best.pt" "${common[@]}" --mode "$mode" --epochs 8 --output "$work/$mode" \
+    >"$work/$mode.log" 2>&1 </dev/null &
+  printf '%s GPU=%s PID=%s 日志=%s\n' "$mode" "${gpus[$i]}" "$!" "$work/$mode.log"
+done
+tail -n 8 -F "$work"/{states,pairs}.log
+```
+
+两组完成后，先比较缓存分数。达到 Validation 基线的候选进入整模型复跑。
+
+```bash
+for mode in states pairs; do
+  "$py" scripts/compare_trievidence.py "$base" "$work/$mode" | tee "$work/compare_$mode.json"
+done
+```
+
+将 `chosen` 指向入选的 `states` 或 `pairs`。先运行 Validation 串行实测，复核通过后保持 `chosen` 不变，将 `split` 改为 `test` 重跑命令。
+
+```bash
+chosen="$work/pairs"
+split=val
+(
+  set -eo pipefail
+  export CUDA_VISIBLE_DEVICES="${gpus[0]}"
+  "$py" -u scripts/run_trievidence.py evaluate "$base/best.pt" "${common[@]}" \
+    --split "$split" --output "$work/base_$split" | tee "$work/base_$split.log"
+  "$py" -u scripts/run_trievidence.py evaluate "$chosen/best.pt" "${common[@]}" \
+    --split "$split" --output "$work/chosen_$split" | tee "$work/chosen_$split.log"
+  "$py" scripts/compare_trievidence.py "$work/base_$split" "$work/chosen_$split" | tee "$work/accept_$split.json"
+)
+```
+
+### 共享读出 RTX 5070 PowerShell
+
+沿用上方深度精简 PowerShell 的准备部分，建立最新工作树并得到 `$project`、`$base`、`$py`、`$work` 和 `@common`，随后执行下面两组。
+
+```powershell
+foreach ($mode in 'states','pairs') {
+    & $py -u scripts/train_trievidence_shared.py "$base/best.pt" @common --mode $mode --epochs 8 `
+        --output "$work/$mode" 2>&1 | Tee-Object "$work/$mode.log"
+    if ($LASTEXITCODE -ne 0) { throw "Shared readout $mode failed" }
+    & $py scripts/compare_trievidence.py $base "$work/$mode" | Tee-Object "$work/compare_$mode.json"
+}
+```
+
+沿用上方 PowerShell 的串行整模型验收命令，将 `$chosen` 设为 `"$work/states"` 或 `"$work/pairs"`。部署对照仍为六层 Test 兜底前 63.2046%、兜底后 64.0934%。

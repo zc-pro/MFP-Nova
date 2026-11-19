@@ -310,7 +310,7 @@ class TheraSet(nn.Module):
                 reliability, residues, pairs, geometric_pairs, pair_quality, mask, source_present)
 
     def forward(self, batch, return_evidence=False, return_residues=False, return_states=False,
-                order_update=None, use_relation=True, without_view=None):
+                order_update=None, use_relation=True, without_view=None, return_memory=False):
         if self.b0_backbone is not None:
             logits = self.b0_backbone(batch["aa"], batch["mask"]).logits
             return {"logits": logits, "direct": logits}
@@ -349,6 +349,8 @@ class TheraSet(nn.Module):
             evidence_state, global_state[:, None].expand_as(evidence_state)], -1)).squeeze(-1).sigmoid()
         output = {"logits": direct + gate*delta, "direct": direct,
                   "evidence_logits": self.prior+delta}
+        if return_memory:
+            output["memory"] = memory
         if return_residues or return_states:
             output["residues"] = residues
         if return_states:
