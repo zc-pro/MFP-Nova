@@ -482,3 +482,26 @@ $arm = "ffn_r${rank}_e${epochs}"
 if ($LASTEXITCODE -ne 0) { throw 'Low-rank experiment failed' }
 & $py scripts/compare_trievidence.py $base "$work/$arm" | Tee-Object "$work/compare_$arm.json"
 ```
+
+### 纯 GPU 计时
+
+整轮正序和反序对照均是先跑的模型更快。用下列脚本从同一批原始 Validation 随机抽取 24 个完整 batch。特征提前上卡，两个模型在同进程对同一输入交替前向，使用 CUDA Event 计时。此基准不含数据读取与传输，不能替代实际服务端到端计时。保留两边都开启等价复用的设定。
+
+V100 Bash 在最新工作树中沿用 `$py`、`$base`、`$work`、`$project` 和 `common`。把 `candidate` 设成恢复训练选出的检查点，卡号按空闲情况指定。
+
+```bash
+candidate="$project/runs/trievidence_ffn_r256_20261119_210849/recover/best.pt"
+out="$work/gpu_$(date +%Y%m%d_%H%M%S)"
+CUDA_VISIBLE_DEVICES=4 "$py" -u scripts/benchmark_trievidence_gpu.py \
+  "$base/best.pt" "$candidate" "${common[@]}" --output "$out"
+```
+
+RTX 5070 PowerShell 在准备好两份检查点和同版本特征后运行：
+
+```powershell
+$candidate = "$project/runs/trievidence_ffn_r256_20261119_210849/recover/best.pt"
+$out = "$work/gpu_$(Get-Date -Format yyyyMMdd_HHmmss)"
+& $py -u scripts/benchmark_trievidence_gpu.py "$base/best.pt" $candidate @common --output $out
+```
+
+报告包含成对延迟差的中位数、候选较快的测量次数、两路各自的 P50/P95。成对延迟差为候选减全秩，负数表示候选更快。
