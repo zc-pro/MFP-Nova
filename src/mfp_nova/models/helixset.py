@@ -11,7 +11,7 @@ from torch.nn import functional as F
 
 from ..research_layers import (
     Attention, FeedForward, PropertyEncoder, SequenceEncoder, TransformerBlock,
-    observed_label_loss, training_views, unlabeled_weights,
+    observed_label_loss, residue_distances, training_views, unlabeled_weights,
 )
 
 
@@ -387,12 +387,11 @@ class HelixSet(nn.Module):
     def pair_features(self, batch, structural, reliability):
         mask = batch["mask"]
         observed = structural[:, :, None] & structural[:, None, :]
-        coords = batch["coords"].float().masked_fill(~structural[..., None], 0)
-        with torch.autocast(device_type=coords.device.type, enabled=False):
-            distances = torch.cdist(coords, coords)
-            centers = torch.linspace(0, 20, 16, device=coords.device)
+        with torch.autocast(device_type=mask.device.type, enabled=False):
+            distances = residue_distances(batch, structural)
+            centers = torch.linspace(0, 20, 16, device=distances.device)
             near = torch.exp(-((distances[..., None] - centers) / 1.5).square())
-            far_centers = torch.linspace(24, 56, 8, device=coords.device)
+            far_centers = torch.linspace(24, 56, 8, device=distances.device)
             far = torch.exp(-((distances[..., None] - far_centers) / 5.).square())
             # Continuous tails still distinguish distances beyond the last RBF.
             tails = torch.stack([torch.log1p(distances) / math.log(65),

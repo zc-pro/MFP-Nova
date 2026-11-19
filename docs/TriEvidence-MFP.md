@@ -422,3 +422,33 @@ foreach ($arm in 'geometry','triangles') {
 ```
 
 先看 `fusion` 的整体变化和 `nearest_below_070`，并比较对应的有结构与缺结构分组。消融衡量现有权重对计算路径的依赖。两组参数数量会相同，提速需另做整模型计时。
+
+## 等价复用和层内精简
+
+保留六层权重、显式结构和三角更新。整模型 `evaluate --reuse-input-compute` 可选共用双 ESM 输入归一化与拼接，以及结构掩码相同时的 Cα 距离矩阵。两路的 ESM 学习型投影和各自的距离基函数保持原计算。该选项不改变参数量或 checkpoint 格式，适用于原三路模型。用同卡顺序复跑下面 A/B，在 `compare_trievidence.py` 的两组 `changed_rows` 均为 0 时确认标签决策一致，再比较 P50/P95。延迟收益很小时，反转两组顺序复测以检查缓存预热的影响。
+
+V100 Bash 沿用上面最新工作树及 `$py`、`$base`、`$work`、`common` 的准备命令：
+
+```bash
+(
+  set -eo pipefail
+  export CUDA_VISIBLE_DEVICES="${gpus[0]}"
+  "$py" -u scripts/run_trievidence.py evaluate "$base/best.pt" "${common[@]}" \
+    --split val --output "$work/reuse_off"
+  "$py" -u scripts/run_trievidence.py evaluate "$base/best.pt" "${common[@]}" \
+    --split val --reuse-input-compute --output "$work/reuse_on"
+  "$py" scripts/compare_trievidence.py "$work/reuse_off" "$work/reuse_on" | tee "$work/compare_reuse.json"
+)
+```
+
+RTX 5070 PowerShell 使用上方准备部分：
+
+```powershell
+& $py -u scripts/run_trievidence.py evaluate "$base/best.pt" @common --split val --output "$work/reuse_off"
+if ($LASTEXITCODE -ne 0) { throw 'Baseline evaluation failed' }
+& $py -u scripts/run_trievidence.py evaluate "$base/best.pt" @common --split val --reuse-input-compute --output "$work/reuse_on"
+if ($LASTEXITCODE -ne 0) { throw 'Reuse evaluation failed' }
+& $py scripts/compare_trievidence.py "$work/reuse_off" "$work/reuse_on" | Tee-Object "$work/compare_reuse.json"
+```
+
+如果要减少参数，首个层内候选可对六个潜变量块里的 FFN 两个大线性层做截断 SVD 初始化，保持各层的输入输出维度、注意力和三角更新。rank 256 和 192 分别约省 118 万和 265 万下游参数。每块先做有／无压缩的 Validation 对照，再决定是否需要用原 Train 短训恢复。低秩增加了中间矩阵乘法，耗时变化需要实测。此候选还未实现。

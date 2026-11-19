@@ -19,6 +19,8 @@ def compare(baseline, candidate, nearest=None, structure=None):
         for key in ("row_id", "targets", "cluster_id", "label_names"):
             np.testing.assert_array_equal(a[key], b[key])
         y, clusters = a["targets"].astype(bool), a["cluster_id"]
+        logits_delta = {k: float(np.abs(a[k] - b[k]).max())
+                        for k in ("theraset_logits", "aa34_logits", "latent_logits") if k in a and k in b}
         strata = {}
         if nearest is not None:
             if split != "val":
@@ -64,6 +66,7 @@ def compare(baseline, candidate, nearest=None, structure=None):
                         "paired_cluster_ci95_pp": values["paired_cluster_ci95_pp"],
                         "gained_observed_labels": int(gained[keep].sum()), "lost_observed_labels": int(lost[keep].sum())}
     return {"split": split, "rows": len(y), "metrics": metrics,
+            "branch_logits_max_abs_delta": logits_delta,
             "both_acc_at_least_baseline": all(v["delta_pp"] >= 0 for v in metrics.values()),
             "parameters": [r.get("parameters") for r in (base, other)],
             "inference": [r.get("inference") for r in (base, other)]}

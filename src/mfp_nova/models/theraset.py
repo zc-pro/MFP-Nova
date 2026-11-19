@@ -11,7 +11,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from ..research_layers import (Attention, FeedForward, PropertyEncoder, SequenceEncoder,
-                              TransformerBlock, masked_mean, observed_label_loss, training_views)
+                              TransformerBlock, masked_mean, observed_label_loss, residue_distances, training_views)
 from .helixset import LabelPairRead, QualityRead, structure_strength
 
 
@@ -120,10 +120,9 @@ class FactorizedPairs(nn.Module):
         pairs = pairs * valid[..., None]
         observed = structural[:, :, None] & structural[:, None, :]
         observed = observed & ~torch.eye(mask.shape[1], dtype=torch.bool, device=mask.device)[None]
-        coords = batch["coords"].float().masked_fill(~structural[..., None], 0)
-        with torch.autocast(device_type=coords.device.type, enabled=False):
-            distance = torch.cdist(coords, coords)
-            centers = torch.linspace(0, 30, 16, device=coords.device)
+        with torch.autocast(device_type=residues.device.type, enabled=False):
+            distance = residue_distances(batch, structural)
+            centers = torch.linspace(0, 30, 16, device=distance.device)
             rbf = torch.exp(-((distance[..., None]-centers)/2).square())
         kind = batch["edge_type"].masked_fill(~observed, 0)
         known = batch["confidence_known"] & structural

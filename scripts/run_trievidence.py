@@ -311,10 +311,13 @@ def evaluate(args, output):
         raise ValueError("Use the packed TriEvidence-MFP best.pt")
     source, dataset = open_data(args, args.split, checkpoint)
     if "shared_mode" in checkpoint["model_args"]:
+        if args.reuse_input_compute:
+            raise ValueError("Input reuse applies to the original two-encoder TriEvidence")
         from mfp_nova.models.trievidence_shared import SharedTriEvidence
         model = SharedTriEvidence(**checkpoint["model_args"])
     else:
         model = TriEvidence(**checkpoint["model_args"])
+        model.reuse_input_compute = args.reuse_input_compute
     model.load_state_dict(checkpoint["model_state"])
     model.to(args.device).eval()
 
@@ -334,6 +337,7 @@ def evaluate(args, output):
                   latent_recovery_epoch=checkpoint.get("latent_recovery_epoch"),
                   parameters=sum(p.numel() for p in model.parameters()),
                   inference={"batch_size": args.batch_size, "device": args.device,
+                             "reuse_input_compute": getattr(model, "reuse_input_compute", False),
                              "hardware": torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu",
                              "seconds": sum(timings), "batch_p50_seconds": float(np.median(steady)),
                              "batch_p95_seconds": float(np.quantile(steady, .95)),
@@ -365,6 +369,8 @@ def main():
     score = commands.add_parser("evaluate", help="Evaluate a packed checkpoint with its saved cutoff")
     score.add_argument("checkpoint", type=Path)
     score.add_argument("--split", choices=("val", "test"), default="val")
+    score.add_argument("--reuse-input-compute", action="store_true",
+                       help="Reuse equivalent dual-ESM normalization and residue distances in TriEvidence")
     for command in (fit, cached, score):
         command.add_argument("--data-root", type=Path, default=Path("data/therapeutic_2025"))
         command.add_argument("--device", default="cuda:0")

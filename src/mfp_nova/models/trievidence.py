@@ -5,6 +5,7 @@ import math
 import torch
 from torch import nn
 
+from ..research_layers import residue_distances
 from .helixset import HelixSet
 from .sequence_features import ResidueCNN, prior_bias
 from .theraset import TheraSet, motif_classifier
@@ -92,6 +93,7 @@ class TriEvidence(nn.Module):
             self.helixset = HelixSet(**helixset_args, direct_only=True).requires_grad_(False).eval()
         self.aa34 = AA34Reader(theraset_args["statistics"], cnn_channels, cnn_dropout, reader_head)
         self.register_buffer("offsets", torch.zeros(3))
+        self.reuse_input_compute = False
 
     def train(self, mode=True):
         super().train(mode)
@@ -100,6 +102,17 @@ class TriEvidence(nn.Module):
         return self
 
     def anchor_logits(self, batch):
+        if self.reuse_input_compute:
+            batch = dict(batch)
+            first = getattr(self.theraset, "sequence", None)
+            second = self.helixset.sequence
+            if (hasattr(first, "peptide_norm") and hasattr(second, "peptide_norm") and self.helixset.esm_tail is None
+                    and first.plm_norm.normalized_shape == second.plm_norm.normalized_shape
+                    and first.peptide_norm.normalized_shape == second.peptide_norm.normalized_shape):
+                batch["_trievidence_dual_esm"] = first.normalized_dual_esm(batch)
+            if self.theraset.structure_evidence and self.helixset.structure_evidence:
+                structural = batch["struct_mask"] & batch["mask"]
+                batch["_trievidence_distances"] = residue_distances(batch, structural)
         return self.theraset(batch)["logits"], self.helixset(batch)["logits"]
 
     def forward(self, batch):

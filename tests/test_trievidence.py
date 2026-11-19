@@ -36,6 +36,32 @@ def test_latent_exit_matches_full_helixset_and_only_cnn_receives_gradients():
     assert joint.aa34.classifier[-1].weight.grad.abs().sum() > 0
 
 
+def test_shared_input_compute_preserves_logits_and_reuses_distance(monkeypatch):
+    batch = synthetic_batch()
+    batch["esm_peptide"] = torch.randn(*batch["esm"].shape[:2], 6)
+    common = dict(input_dim=12, peptide_input_dim=6, num_labels=15, vocab_size=10,
+                  statistics=sample_statistics(15), dim=16, heads=4, pair_dim=8)
+    model = TriEvidence(dict(common, cnn_channels=8), dict(common, sequence_depth=1,
+                        latent_depth=1, pair_depth=1, geometry_depth=1), cnn_channels=8).eval()
+    cdist = torch.cdist
+    calls = []
+
+    def record(*args, **kwargs):
+        calls.append(True)
+        return cdist(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "cdist", record)
+    with torch.inference_mode():
+        original = model(batch)
+        assert len(calls) == 2
+        calls.clear()
+        model.reuse_input_compute = True
+        reused = model(batch)
+        assert len(calls) == 1
+        for name in original:
+            torch.testing.assert_close(original[name], reused[name], rtol=0, atol=0)
+
+
 def test_empty_top10_preserves_nonempty_and_uses_only_anchor_candidates():
     anchor = torch.arange(12).float().repeat(3, 1)
     logits = -torch.ones_like(anchor)

@@ -12,6 +12,15 @@ def masked_mean(x, mask):
     return (x*mask.unsqueeze(-1)).sum(1)/mask.sum(1, keepdim=True).clamp_min(1)
 
 
+def residue_distances(batch, structural):
+    shared = batch.get("_trievidence_distances")
+    if shared is not None:
+        return shared
+    coords = batch["coords"].float().masked_fill(~structural[..., None], 0)
+    with torch.autocast(device_type=coords.device.type, enabled=False):
+        return torch.cdist(coords, coords)
+
+
 class Attention(nn.Module):
     def __init__(self, dim, heads, dropout):
         super().__init__()
@@ -92,13 +101,18 @@ class SequenceEncoder(nn.Module):
         self.layers = nn.ModuleList([LocalGlobalBlock(dim, heads, dropout, separable) for _ in range(depth)])
         self.global_layer = nn.Sequential(nn.Linear(2*dim, dim), nn.GELU(), nn.LayerNorm(dim))
 
+    def normalized_dual_esm(self, batch):
+        return torch.cat([self.plm_norm(batch["esm"]), self.peptide_norm(batch["esm_peptide"])], -1)
+
     def forward(self, batch, return_shallow=False):
         mask = batch["mask"]
         chemical = self.chem(batch["residue_chem"])
         annotated = self.aa(batch["aa"])+self.d(batch["d"])+chemical
         features = batch["esm"]
         if hasattr(self, "peptide_norm"):
-            features = torch.cat([self.plm_norm(features), self.peptide_norm(batch["esm_peptide"])], -1)
+            features = batch.get("_trievidence_dual_esm")
+            if features is None:
+                features = self.normalized_dual_esm(batch)
         plm = self.plm(features)
         x = plm+torch.sigmoid(self.input_gate(torch.cat([plm, annotated], -1)))*annotated
         x = (x+self.position(torch.arange(x.shape[1], device=x.device)))*mask[..., None]
