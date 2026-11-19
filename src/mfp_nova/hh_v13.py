@@ -35,13 +35,22 @@ def base_logits(model, loader, device):
                            for batch in loader])
 
 
+@torch.inference_mode()
 def export_fold(run, model, loader, device, fold, epoch, diagnostic, elapsed):
     dataset = loader.dataset
     data, rows = dataset.source.data, dataset.indices
-    logits = base_logits(model, loader, device)
+    model.eval()
+    scores = {"base_logits": [], "direct_logits": [], "correction": []}
+    for batch in loader:
+        output = model(to_device(batch, device))
+        final, direct = output["logits"].float(), output["direct"].float()
+        scores["base_logits"].append(final.cpu().numpy())
+        scores["direct_logits"].append(direct.cpu().numpy())
+        scores["correction"].append((final - direct).cpu().numpy())
+    scores = {key: np.concatenate(parts) for key, parts in scores.items()}
     np.savez_compressed(run/"oof_logits.npz", row_id=data.rows[rows], ID=data.ids[rows],
                         cluster_id=data.clusters[rows], label_names=data.labels, targets=data.y[rows],
-                        base_logits=logits, fold=fold, diagnostic=diagnostic)
+                        **scores, fold=fold, diagnostic=diagnostic)
     result = {"fold": fold, "epoch": epoch, "rows": len(rows), "diagnostic_subset": diagnostic,
               "elapsed_seconds": elapsed, "oof_logits": str(run/"oof_logits.npz")}
     write_json(run/"results.json", result)
