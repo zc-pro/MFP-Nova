@@ -324,8 +324,9 @@ class HelixSet(nn.Module):
                  pair_readout=True, fine_evidence=True, geometry_depth=4,
                  geometry_context=True, geometry_quality=True, distance_multiscale=True,
                  scale_balance=True, pair_interactions=True, structure_evidence=True,
-                 esm_tail=None, evidence_readout=False, peptide_input_dim=0):
+                 esm_tail=None, evidence_readout=False, peptide_input_dim=0, latent_memory_only=False):
         super().__init__()
+        self.latent_memory_only = latent_memory_only
         self.statistics = statistics
         self.esm_tail = None
         self.triangles, self.label_context = triangles, label_context
@@ -360,6 +361,8 @@ class HelixSet(nn.Module):
         self.output_norm = nn.LayerNorm(dim)
         self.label_weights = nn.Parameter(torch.randn(num_labels, dim) / math.sqrt(dim))
         self.label_bias = nn.Parameter(torch.zeros(num_labels))
+        if latent_memory_only:
+            return
         prior = torch.tensor(statistics["observed_prior"]).clamp(1e-4, 1 - 1e-4)
         with torch.no_grad():
             self.label_bias.copy_(torch.logit(prior))
@@ -429,8 +432,9 @@ class HelixSet(nn.Module):
         seq, seq_mask = self.sequence(batch)
         prop, prop_mask = self.properties(batch)
         mask = batch["mask"]
-        labels = self.label_queries[None].expand(mask.shape[0], -1, -1)
-        label_mask = torch.ones(labels.shape[:2], dtype=torch.bool, device=mask.device)
+        if not self.latent_memory_only:
+            labels = self.label_queries[None].expand(mask.shape[0], -1, -1)
+            label_mask = torch.ones(labels.shape[:2], dtype=torch.bool, device=mask.device)
         if hasattr(self, "early_evidence"):
             early, modality_weights = self.early_evidence(labels, label_mask, seq, seq_mask, prop, prop_mask)
             early_logits = (self.output_norm(early) * self.label_weights).sum(-1) + self.label_bias
@@ -477,6 +481,8 @@ class HelixSet(nn.Module):
         latent_mask = torch.ones(latent.shape[:2], dtype=torch.bool, device=mask.device)
         for block in self.latent_blocks:
             latent = block(latent, latent_mask, memories, masks, reliability, motif_weights)
+        if self.latent_memory_only:
+            return residues, prop, prop_mask, latent, latent_mask
         intermediate = []
         for block in self.decoder:
             labels, pair_attention = block(

@@ -15,6 +15,47 @@
 
 ### TheraSet-Bridge · 跨簇证据迁移
 
+### Unified Evidence 的 Fine39 从头训练
+
+`unified_evidence` 复用 HelixSet 原有四个残基对块和六层全秩 latent，保留独立 AA34 局部特征与理化 token。每个标签用同一查询分别读取残基、局部、理化和 latent 记忆，合并证据后由一个头产生 39 个 logits。下游所有参数从随机初始化开始。两套冻结预训练 ESM 仍读现有缓存。首轮仅使用现有弱权重缺标监督。
+
+训练前在仓库根目录运行 `git pull --ff-only origin main`。Train 和 Validation 需要已经提取的 `features/esm2_650m/{train,val}` 与 `features/esm2_peptide_150m/{train,val}`。使用现有 Fine39 同源簇划分，Validation 选模型并拟合全局阈值。
+
+V100 Ubuntu Bash（修改 `gpu` 选择空闲设备）
+
+~~~bash
+conda activate MFP-Nova
+py="$CONDA_PREFIX/bin/python"
+gpu=4
+cpu_threads=4
+run="unified_evidence_fine39_s42_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "runs/$run"
+nohup env CUDA_VISIBLE_DEVICES="$gpu" OMP_NUM_THREADS="$cpu_threads" MKL_NUM_THREADS="$cpu_threads" PYTHONPATH="$PWD/src" \
+  "$py" -u -m mfp_nova.cli train --model unified_evidence --task fine39 \
+  --device cuda:0 --precision fp32 --seed 42 --epochs 60 --batch-size 16 --accumulation-steps 4 \
+  --name "$run/model" >"runs/$run/train.log" 2>&1 </dev/null &
+printf 'PID=%s  日志=%s\n' "$!" "runs/$run/train.log"
+~~~
+
+RTX 5070 PowerShell
+
+~~~powershell
+conda activate MFP-Nova
+$py = Join-Path $env:CONDA_PREFIX 'python.exe'
+$env:PYTHONPATH = Join-Path $PWD 'src'
+$run = 'unified_evidence_fine39_s42_' + (Get-Date -Format 'yyyyMMdd_HHmmss')
+New-Item -ItemType Directory -Path "runs/$run" | Out-Null
+& $py -u -m mfp_nova.cli train --model unified_evidence --task fine39 `
+  --device cuda:0 --precision fp32 --seed 42 --epochs 60 --batch-size 16 --accumulation-steps 4 `
+  --name "$run/model" 2>&1 | Tee-Object -FilePath "runs/$run/train.log"
+~~~
+
+比较 `runs/<实验名>/model/results.json` 中的 `validation.sample_jaccard`（直接 ACC）和 `empty_top1.fallback_metrics.sample_jaccard`（只给空预测补自身 Top-1）。逐样本对照用 `best_validation.npz`，含 `row_id`、`cluster_id`、分数和固定阈值。历史六层 TriEvidence 的 V100 Validation 参照为 62.3032%／63.0487%，后者使用了独立 TheraSet 候选池，和本模型的 Top-1 规则有区别。确定模型后，可用以下命令和原 Test 缓存作固定阈值评价。
+
+~~~text
+python -m mfp_nova.cli evaluate runs/<实验名>/model/best.pt --split test --device cuda:0 --batch-size 16 --output runs/<实验名>/test.json --predictions runs/<实验名>/test_predictions.npz
+~~~
+
 `theraset_bridge` 复用 TheraSet 的多模态取证骨干，独立实现按簇对均衡的单向证据迁移。三组训练模式为 `off`、`align` 和 `positive`。[独立配置](configs/theraset_bridge.yaml) · [设计与训练说明](docs/XBridge-MFP.md#theraset-bridge-跨簇融合设计)
 
 ### XBridge-MFP · Fine39 跨簇功能取证

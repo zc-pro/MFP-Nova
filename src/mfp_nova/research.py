@@ -17,7 +17,7 @@ from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
 from .metrics import evaluate_metrics, evaluate_groups, format_epoch, fit_global_threshold, fit_label_thresholds
 from .models import (HH_MODELS, HH_V15_RANKER, HH_V16, HH_V17, HH_V20, HH_V20_CHEMICAL_MODES,
-                     PEPTIDE_V3, PEPTIDE_V6, PEPTIDE_V7, SEQUENCE_ONLY_MODELS, XBRIDGE, THERASET_BRIDGE)
+                     PEPTIDE_V3, PEPTIDE_V6, PEPTIDE_V7, SEQUENCE_ONLY_MODELS, XBRIDGE, THERASET_BRIDGE, UNIFIED_EVIDENCE)
 from .multimodal import BackbonePeptides, MultimodalData, MultimodalPeptides, backbone_inputs, collate_multimodal
 from .research_layers import observed_label_loss
 from .consistency import bernoulli_consistency, consistency_weight
@@ -85,6 +85,9 @@ def make_model(name, arguments):
     if name == "theraset":
         from .models.theraset import TheraSet
         return TheraSet(**arguments)
+    if name == UNIFIED_EVIDENCE:
+        from .models.unified_evidence import UnifiedEvidence
+        return UnifiedEvidence(**arguments)
     if name == "helixset":
         from .models.helixset import HelixSet
         return HelixSet(**arguments)
@@ -220,6 +223,17 @@ def metrics(y, probabilities, statistics, threshold=.5, predicted=None):
                             statistics["function_projection"], predicted)
 
 
+def unified_fallback_report(y, probabilities, statistics, threshold):
+    raw = probabilities >= threshold
+    empty = np.flatnonzero(~raw.any(axis=1))
+    fallback = raw.copy()
+    fallback[empty, probabilities[empty].argmax(axis=1)] = True
+    return {"empty_predictions": int(len(empty)),
+            "raw_zero_hit_rows": int((~(raw & y.astype(bool)).any(axis=1)).sum()),
+            "fallback_zero_hit_rows": int((~(fallback & y.astype(bool)).any(axis=1)).sum()),
+            "fallback_metrics": metrics(y, probabilities, statistics, threshold, fallback)}
+
+
 def joint_set_protocol():
     return {"metric_suite": "jaccard", "threshold_strategy": "joint_expected_jaccard",
             "threshold_fit_split": None, "selection_threshold": None,
@@ -293,12 +307,12 @@ def validate_cache(dataset, config, reference=None):
     settings = config.get("peptide_encoder")
     if (peptide is None) != (settings is None):
         raise ValueError("Peptide encoder configuration and cache must be supplied together")
-    if config.get("model_name") in (PEPTIDE_V7, XBRIDGE, THERASET_BRIDGE) and peptide is None:
+    if config.get("model_name") in (PEPTIDE_V7, XBRIDGE, THERASET_BRIDGE, UNIFIED_EVIDENCE) and peptide is None:
         raise ValueError(f"{config['model_name']} requires both frozen ESM caches")
     if peptide is not None:
         if config["model_name"] not in (
                 "helixset", "theraset", "privilegedbridge", *SEQUENCE_ONLY_MODELS,
-                *HH_MODELS, HH_V16, HH_V17, XBRIDGE, THERASET_BRIDGE):
+                *HH_MODELS, HH_V16, HH_V17, XBRIDGE, THERASET_BRIDGE, UNIFIED_EVIDENCE):
             raise ValueError("This architecture does not support dual frozen encoders")
         if peptide["name"] != settings["name"] or peptide["max_length"] != settings["max_length"]:
             raise ValueError("Configured peptide encoder differs from cache")
@@ -463,7 +477,7 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     peptide_v3 = config["model_name"] == PEPTIDE_V3
     if peptide_v3 and config["data"]["track"] not in ("fine39", "major15", "rich48"):
         raise ValueError("V3 uses the project Fine39, Major15 or Rich48 split")
-    if config["model_name"] in (PEPTIDE_V6, PEPTIDE_V7, XBRIDGE) and config["data"]["track"] != "fine39":
+    if config["model_name"] in (PEPTIDE_V6, PEPTIDE_V7, XBRIDGE, UNIFIED_EVIDENCE) and config["data"]["track"] != "fine39":
         raise ValueError(f"{config['model_name']} uses the project Fine39 split")
     anchor = None
     if xbridge:
@@ -1404,6 +1418,8 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
 
         key = "xbridge_diagnostics" if xbridge else "theraset_bridge_diagnostics"
         result[key] = evidence_report(y, probabilities, xbridge_outputs or {}, source.statistics)
+    if config["model_name"] == UNIFIED_EVIDENCE:
+        result["empty_top1"] = unified_fallback_report(y, probabilities, source.statistics, threshold)
     export_predictions = settings.get("export_validation_predictions", False)
     if export_predictions:
         result["validation_predictions"] = export_validation(
@@ -1653,6 +1669,9 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
               "metrics": evaluate_metrics(y, probabilities, threshold, source.statistics['labels']['support'],
                   source.statistics['function_projection'], predicted), "groups": grouped,
               "annotation_based_metrics": True, "experimental_structure_group": None}
+    if checkpoint["model_name"] == UNIFIED_EVIDENCE:
+        result["empty_top1"] = unified_fallback_report(y, probabilities, source.statistics, threshold)
+        extra_outputs["cluster_id"] = source.data.clusters[dataset.indices]
     if residue_nll is not None:
         result["order_nll"] = residue_nll
     if checkpoint["model_name"] in (XBRIDGE, THERASET_BRIDGE):
