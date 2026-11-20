@@ -1068,6 +1068,8 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
         online_targets, online_probabilities = [], []
+        buffer_metrics = config["model_name"] == UNIFIED_EVIDENCE
+        batch_losses, batch_sizes = [], []
         loss_settings = epoch_loss_settings(config, phase_epoch)
         if hh:
             loss_settings["hh_ramp"] = min(1., epoch/5)
@@ -1079,6 +1081,8 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         batch_done = time.perf_counter()
         for batch_index, batch in enumerate(loaders[0]):
             data_wait_seconds += time.perf_counter() - batch_done
+            if buffer_metrics:
+                online_targets.append(batch["y"].numpy().copy())
             batch = to_device(batch, device)
             teacher_logits = None
             if loss_settings.get("consistency", 0) > 0 and int(ema.n_averaged) > 0:
@@ -1135,16 +1139,27 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
             if boundary:
                 valid_microbatches = 0
             n = len(batch["y"])
-            if fold is None:
-                online_targets.append(batch["y"].detach().cpu().numpy())
-                online_probabilities.append(output["logits"].detach().float().sigmoid().cpu().numpy())
+            if buffer_metrics:
+                online_probabilities.append(output["logits"].detach().float().sigmoid())
+                losses = {"total": loss, **components}
+                batch_losses.append(torch.stack([value.detach().float() for value in losses.values()]))
+                batch_sizes.append(n)
+            else:
+                if fold is None:
+                    online_targets.append(batch["y"].detach().cpu().numpy())
+                    online_probabilities.append(output["logits"].detach().float().sigmoid().cpu().numpy())
+                for key, value in {"total": loss, **components}.items():
+                    totals[key] = totals.get(key, 0)+float(value.detach())*n
             del output
-            for key, value in {"total": loss, **components}.items():
-                totals[key] = totals.get(key, 0)+float(value.detach())*n
             count += n
             if settings.get("max_steps") and global_step>=settings["max_steps"]:
                 break
             batch_done = time.perf_counter()
+        if buffer_metrics:
+            # Transfer only detached epoch statistics, never the forward graph.
+            batch_values = torch.stack(batch_losses).cpu().numpy().astype(np.float64)
+            totals = dict(zip(losses, (np.asarray(batch_sizes) @ batch_values).tolist()))
+            online_probabilities = [torch.cat(online_probabilities).cpu().numpy()]
         train_seconds = time.perf_counter() - epoch_start
         if fold is not None:
             scheduler.step()
