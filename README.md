@@ -50,6 +50,35 @@ New-Item -ItemType Directory -Path "runs/$run" | Out-Null
   --name "$run/model" 2>&1 | Tee-Object -FilePath "runs/$run/train.log"
 ~~~
 
+#### V100 双卡训练同一个 seed
+
+单卡继续用上面的命令。双卡用 `torchrun` 的 Python 模块入口并加 `--ddp`，每卡 batch 32、累积 2，全局有效 batch 128。各卡分片读取原 Train，rank 0 负责 EMA、完整 Validation、日志和检查点。单机 CUDA 多卡使用 Linux NCCL，Windows RTX 5070 沿用上面的单卡命令。
+
+~~~bash
+(
+  set -euo pipefail
+  cd "$HOME/wuzhencheng/projects/MFP-Nova"
+  git switch main
+  git pull --ff-only origin main
+  source "$(conda info --base)/etc/profile.d/conda.sh"
+  conda activate MFP-Nova
+  py="$CONDA_PREFIX/bin/python"
+  gpus=2,4
+  run="unified_evidence_ddp2_eff128_s42_$(date +%Y%m%d_%H%M%S)"
+  mkdir -p "runs/$run"
+  nohup env CUDA_VISIBLE_DEVICES="$gpus" OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 PYTHONPATH="$PWD/src" \
+    "$py" -u -m torch.distributed.run --standalone --nproc-per-node=2 -m mfp_nova.cli train \
+    --model unified_evidence --ddp --task fine39 --seed 42 --device cuda:0 --precision fp32 \
+    --batch-size 32 --accumulation-steps 2 --num-workers 0 --epochs 60 --metric-suite jaccard \
+    --stop-file "runs/$run/stop" --name "$run/model" >"runs/$run/train.log" 2>&1 </dev/null &
+  printf 'PID=%s 日志=runs/%s/train.log\n' "$!" "$run"
+)
+~~~
+
+把 `gpus=2,4` 改为空闲卡。开始后日志应显示 `DDP | ranks=2 per_rank_batch=32 effective_batch=128`。想先查运行和显存，可在同一命令临时加 `--limit-samples 1024 --max-steps 12` 做诊断短跑，然后换新目录启动正式实验。多卡速度以完整轮次实测为准。
+
+暂停时创建启动命令指定的 `runs/<实验名>/stop`，会在完成并保存当前轮次后退出。继续时删除该标记，保持原来的进程数和实验名称，在训练命令上加 `--resume runs/<实验名>/model/last.pt --resume-in-place`。切换单卡与双卡或改变进程数，请从头开新实验。分布式采样在 Train 行数不能整除卡数时会填充少量训练行，以保持每卡步数一致。Validation 仍评估原始完整划分。
+
 比较 `runs/<实验名>/model/results.json` 中的 `validation.sample_jaccard`（直接 ACC）和 `empty_top1.fallback_metrics.sample_jaccard`（只给空预测补自身 Top-1）。逐样本对照用 `best_validation.npz`，含 `row_id`、`cluster_id`、分数和固定阈值。历史六层 TriEvidence 的 V100 Validation 参照为 62.3032%／63.0487%，后者使用了独立 TheraSet 候选池，和本模型的 Top-1 规则有区别。确定模型后，可用以下命令和原 Test 缓存作固定阈值评价。
 
 ~~~text

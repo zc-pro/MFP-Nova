@@ -1,6 +1,7 @@
 """Shared research training, checkpoint resume, evaluation and prediction."""
 import json
 import math
+import os
 import random
 import subprocess
 import sys
@@ -12,7 +13,9 @@ from .therapep import TRACKS as THERAPEP_TRACKS
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data import DataLoader, DistributedSampler
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
 from .metrics import evaluate_metrics, evaluate_groups, format_epoch, fit_global_threshold, fit_label_thresholds
@@ -455,6 +458,25 @@ def restore_history(run, checkpoint):
     path.write_text(''.join(json.dumps(r, allow_nan=False)+'\n' for r in records), encoding='utf-8')
 
 
+def train_distributed(config, name, **options):
+    device = torch.device(config["train"]["device"])
+    if device.type == "cuda":
+        device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+        torch.cuda.set_device(device)
+    config["train"]["device"] = str(device)
+    dist.init_process_group(backend="nccl" if device.type == "cuda" else "gloo")
+    try:
+        return train(config, name, **options)
+    finally:
+        dist.destroy_process_group()
+
+
+def gather_batches(tensor, world_size):
+    replicas = [torch.empty_like(tensor) for _ in range(world_size)]
+    dist.all_gather(replicas, tensor)
+    return torch.cat(replicas)
+
+
 def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     settings = config["train"]
     fold = settings.get("hh_oof_fold")
@@ -466,6 +488,14 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         torch.cuda.set_device(device)
     seed_everything(settings["seed"])
     checkpoint = torch.load(resume, map_location="cpu", weights_only=True) if resume else None
+    distributed = dist.is_initialized()
+    rank = dist.get_rank() if distributed else 0
+    world_size = dist.get_world_size() if distributed else 1
+    primary = rank == 0
+    if checkpoint and checkpoint["config"]["train"].get("world_size", 1) != world_size:
+        raise ValueError("Resume with the checkpoint's number of ranks, or start a fresh run")
+    if distributed:
+        settings["world_size"] = world_size
     pb = config["model_name"] == "privilegedbridge"
     hh = config["model_name"] == "hh_setreread"
     hh_v12 = config["model_name"] == "hh_setreread_v12"
@@ -788,11 +818,18 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         training_data = BridgePeptides(training_data, clusters)
         if theraset_bridge is not None or settings.get("xbridge_pair_batches"):
             batch_sampler = PositivePairBatches(source.data.y[rows], clusters, settings["batch_size"], generator)
+    sampler = DistributedSampler(training_data, seed=settings["seed"]) if distributed else None
     train_loader = (DataLoader(training_data, batch_sampler=batch_sampler, **loader_settings)
                     if batch_sampler is not None else DataLoader(training_data, batch_size=settings["batch_size"],
-                                                                shuffle=True, generator=generator, **loader_settings))
-    loaders = [train_loader, DataLoader(datasets[1], batch_size=settings["batch_size"], **loader_settings)]
-    print(f"DataLoader | workers={num_workers} pin_memory={pin_memory}", flush=True)
+                                                                shuffle=sampler is None, sampler=sampler,
+                                                                generator=generator, **loader_settings))
+    val_loader = DataLoader(datasets[1], batch_size=settings["batch_size"], **loader_settings) if primary else None
+    loaders = [train_loader, val_loader]
+    if primary:
+        print(f"DataLoader | workers={num_workers} pin_memory={pin_memory}", flush=True)
+        if distributed:
+            effective = world_size * settings["batch_size"] * settings.get("accumulation_steps", 1)
+            print(f"DDP | ranks={world_size} per_rank_batch={settings['batch_size']} effective_batch={effective}", flush=True)
     args = {"num_labels": len(source.data.labels), "statistics": source.statistics["labels"], **config["model"]}
     if not peptide_v3:
         args.update(input_dim=datasets[0].meta["input_dim"], vocab_size=len(source.statistics["chemical_vocab"])+2)
@@ -834,21 +871,22 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         model.initialize_from(previous)
         del previous, initial
     run = Path(settings["output"])/name
-    if resume_in_place:
-        if (run/'results.json').exists():
-            raise ValueError('This run is already complete; use a new name for another experiment')
-        if resume is not None:
-            if Path(resume).resolve() != (run/'last.pt').resolve():
-                raise ValueError('In-place resume requires this run directory\'s last.pt')
-            restore_history(run, checkpoint)
-        elif (run/'last.pt').exists() or (run/'history.jsonl').exists():
-            raise ValueError('Continue this run using --resume last.pt')
+    if primary:
+        if resume_in_place:
+            if (run/'results.json').exists():
+                raise ValueError('This run is already complete; use a new name for another experiment')
+            if resume is not None:
+                if Path(resume).resolve() != (run/'last.pt').resolve():
+                    raise ValueError('In-place resume requires this run directory\'s last.pt')
+                restore_history(run, checkpoint)
+            elif (run/'last.pt').exists() or (run/'history.jsonl').exists():
+                raise ValueError('Continue this run using --resume last.pt')
+            else:
+                # An interruption before epoch one committed has no state to resume.
+                run.mkdir(parents=True, exist_ok=True)
+                print('Restarting the uncommitted first epoch.', flush=True)
         else:
-            # An interruption before epoch one committed has no state to resume.
-            run.mkdir(parents=True, exist_ok=True)
-            print('Restarting the uncommitted first epoch.', flush=True)
-    else:
-        run.mkdir(parents=True, exist_ok=False)
+            run.mkdir(parents=True, exist_ok=False)
     if hh:
         model.freeze_backbone(bool(frozen_epochs and (checkpoint is None or checkpoint["epoch"] <= frozen_epochs)))
     if hh_v16:
@@ -877,7 +915,8 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         raise ValueError("ema_start_epoch requires ema_decay")
     # These models use LayerNorm; buffers are Train priors/indices, not BN moments.
     # Keep buffers copied from the online model, rather than averaging their values.
-    ema = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(ema_decay)) if ema_decay is not None else None
+    ema = (AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(ema_decay))
+           if primary and ema_decay is not None else None)
     if ema is not None:
         ema.requires_grad_(False)
     online_best_state, online_best_key, online_best_epoch = None, (-float("inf"), -float("inf")), 0
@@ -931,6 +970,18 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         generator.set_state(checkpoint["loader_rng"])
         if device.type == "cuda" and checkpoint["cuda_rng"] is not None:
             torch.cuda.set_rng_state(checkpoint["cuda_rng"], device)
+        if distributed and not primary:
+            cpu_rng, cuda_rng = checkpoint["ddp_rng"][rank]
+            torch.set_rng_state(cpu_rng)
+            if cuda_rng is not None:
+                torch.cuda.set_rng_state(cuda_rng, device)
+    elif distributed and not primary:
+        seed_everything(settings["seed"] + rank)
+    # HelixSet keeps legacy decoder parameters for single-card checkpoint compatibility.
+    ddp_model = (DistributedDataParallel(model, device_ids=[device.index] if device.type == "cuda" else None,
+                                        broadcast_buffers=False, gradient_as_bucket_view=True,
+                                        find_unused_parameters=True)
+                 if distributed else None)
     git = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True)
     status = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True)
     params = sum(p.numel() for p in model.parameters() if p.requires_grad or hh)
@@ -994,7 +1045,11 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         metadata["selection_candidates"] = {"primary": suite, "alternate": alternate_suite,
                                             "tracking_start_epoch": candidate_start,
                                             "stopping": "primary suite only; one shared optimizer trajectory"}
-    if not resume_in_place or checkpoint is None:
+    if distributed:
+        metadata["distributed"] = {"world_size": world_size, "per_rank_batch": settings["batch_size"],
+                                   "effective_batch": world_size * settings["batch_size"] * accumulation,
+                                   "sampler_padding_rows": sampler.total_size - len(training_data)}
+    if primary and (not resume_in_place or checkpoint is None):
         if inner_fold is not None:
             metadata["validation_scope"] = "internal_fine39_train_clusters"
             metadata["internal_fold"] = inner_fold
@@ -1011,7 +1066,7 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     elapsed_before = checkpoint.get("elapsed_seconds", 0) if checkpoint else 0
     peak_memory = (checkpoint.get("peak_cuda_memory_bytes", 0) or 0) if checkpoint else 0
     validation_groups = (source.groups(datasets[1].indices, source.data.y[datasets[1].indices])
-                         if fold is None else {})
+                         if primary and fold is None else {})
 
     def collect_validation(candidate, view_outputs=None, xbridge_outputs=None):
         residue_nll = {} if getattr(candidate, "order_evidence", None) is not None else None
@@ -1021,7 +1076,7 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         return values if hh_v16 else (*values, None, None, residue_nll)
 
     epoch = checkpoint["epoch"] if checkpoint else 0
-    if suite == "jaccard" and checkpoint is None and fold is None and not hh_v16:
+    if primary and suite == "jaccard" and checkpoint is None and fold is None and not hh_v16:
         y, probabilities, validation_loss, _, _, _ = collect_validation(model)
         report = metrics(y, probabilities, source.statistics, fixed_threshold)
         best_key, best_selection_threshold, _ = selection(y, probabilities, report, suite, protocol["threshold_strategy"],
@@ -1060,6 +1115,8 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
             # Keep warmup metrics, then compare all SetReread variants over the same trained phase.
             best_key = online_best_key = (-float("inf"), -float("inf"))
             stale = 0
+        if sampler is not None:
+            sampler.set_epoch(epoch)
         model.train()
         totals, count, skipped = {}, 0, 0
         gradient_records = []
@@ -1081,46 +1138,48 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         batch_done = time.perf_counter()
         for batch_index, batch in enumerate(loaders[0]):
             data_wait_seconds += time.perf_counter() - batch_done
-            if buffer_metrics:
+            if buffer_metrics and not distributed:
                 online_targets.append(batch["y"].numpy().copy())
             batch = to_device(batch, device)
-            teacher_logits = None
-            if loss_settings.get("consistency", 0) > 0 and int(ema.n_averaged) > 0:
-                ema.module.eval()
-                with torch.no_grad(), autocast_context(device, precision):
-                    teacher_logits = ema.module(batch)["logits"]
-            with autocast_context(device, precision):
-                loss, components, output = model.compute_loss(batch, loss_settings, return_output=True)
-            if consistency:
-                if teacher_logits is None:
-                    agreement = output["logits"].sum()*0
-                    agreement_terms = {"consistency_high": agreement, "consistency_low": agreement}
-                else:
-                    agreement, agreement_terms = bernoulli_consistency(output["logits"], teacher_logits, batch["y"])
-                loss = loss+loss_settings["consistency"]*agreement
-                components = {**components, "consistency": agreement, **agreement_terms}
-            del teacher_logits
-            if not torch.isfinite(loss):
-                raise FloatingPointError("Nonfinite research loss")
-            backward_enabled = not (pb and model.stage == "B" and not output["observed"].any())
-            valid_microbatches += int(backward_enabled)
-            group_size = min(accumulation, len(loaders[0])-(batch_index//accumulation)*accumulation)
-            if reconstruction_gradient != "sum":
-                from .gradient_balance import backward_reconstruction
-                auxiliary = loss_settings.get("reconstruction", .05)*components["reconstruction"]
-                # Construct the primary graph directly: subtracting reconstruction
-                # from total leaves zero-but-present gradients on its private head.
-                main = (components["classification"]+loss_settings.get("direct", .2)*components["direct"]
-                        +loss_settings.get("branch", .1)*components["branch"])
-                for key in ("function_aux", "function_hierarchy", "consistency", "relation_view"):
-                    if key in components:
-                        main = main+loss_settings.get(key, 0)*components[key]
-                gradient_records.append(backward_reconstruction(scaler.scale(main/group_size),
-                    scaler.scale(auxiliary/group_size), model.parameters(), gradient_ratio,
-                    project_conflicts=reconstruction_gradient=="project"))
-            elif backward_enabled:
-                scaler.scale(loss/group_size).backward()
             boundary = (batch_index+1)%accumulation==0 or batch_index+1==len(loaders[0])
+            with (ddp_model.no_sync() if distributed and not boundary else nullcontext()):
+                teacher_logits = None
+                if loss_settings.get("consistency", 0) > 0 and int(ema.n_averaged) > 0:
+                    ema.module.eval()
+                    with torch.no_grad(), autocast_context(device, precision):
+                        teacher_logits = ema.module(batch)["logits"]
+                with autocast_context(device, precision):
+                    loss, components, output = (ddp_model(batch, loss_settings) if distributed else
+                                                model.compute_loss(batch, loss_settings, return_output=True))
+                if consistency:
+                    if teacher_logits is None:
+                        agreement = output["logits"].sum()*0
+                        agreement_terms = {"consistency_high": agreement, "consistency_low": agreement}
+                    else:
+                        agreement, agreement_terms = bernoulli_consistency(output["logits"], teacher_logits, batch["y"])
+                    loss = loss+loss_settings["consistency"]*agreement
+                    components = {**components, "consistency": agreement, **agreement_terms}
+                del teacher_logits
+                if not torch.isfinite(loss):
+                    raise FloatingPointError("Nonfinite research loss")
+                backward_enabled = not (pb and model.stage == "B" and not output["observed"].any())
+                valid_microbatches += int(backward_enabled)
+                group_size = min(accumulation, len(loaders[0])-(batch_index//accumulation)*accumulation)
+                if reconstruction_gradient != "sum":
+                    from .gradient_balance import backward_reconstruction
+                    auxiliary = loss_settings.get("reconstruction", .05)*components["reconstruction"]
+                    # Construct the primary graph directly: subtracting reconstruction
+                    # from total leaves zero-but-present gradients on its private head.
+                    main = (components["classification"]+loss_settings.get("direct", .2)*components["direct"]
+                            +loss_settings.get("branch", .1)*components["branch"])
+                    for key in ("function_aux", "function_hierarchy", "consistency", "relation_view"):
+                        if key in components:
+                            main = main+loss_settings.get(key, 0)*components[key]
+                    gradient_records.append(backward_reconstruction(scaler.scale(main/group_size),
+                        scaler.scale(auxiliary/group_size), model.parameters(), gradient_ratio,
+                        project_conflicts=reconstruction_gradient=="project"))
+                elif backward_enabled:
+                    scaler.scale(loss/group_size).backward()
             if boundary and valid_microbatches:
                 if pb and model.stage == "B":
                     for parameter in model.parameters():
@@ -1140,6 +1199,8 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
                 valid_microbatches = 0
             n = len(batch["y"])
             if buffer_metrics:
+                if distributed:
+                    online_targets.append(batch["y"])
                 online_probabilities.append(output["logits"].detach().float().sigmoid())
                 losses = {"total": loss, **components}
                 batch_losses.append(torch.stack([value.detach().float() for value in losses.values()]))
@@ -1156,10 +1217,32 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
                 break
             batch_done = time.perf_counter()
         if buffer_metrics:
-            # Transfer only detached epoch statistics, never the forward graph.
-            batch_values = torch.stack(batch_losses).cpu().numpy().astype(np.float64)
-            totals = dict(zip(losses, (np.asarray(batch_sizes) @ batch_values).tolist()))
-            online_probabilities = [torch.cat(online_probabilities).cpu().numpy()]
+            values = torch.stack(batch_losses)
+            probabilities_tensor = torch.cat(online_probabilities)
+            if distributed:
+                targets_tensor = gather_batches(torch.cat(online_targets), world_size)
+                probabilities_tensor = gather_batches(probabilities_tensor, world_size)
+                weights = values.new_tensor(batch_sizes)
+                summed = (values.double() * weights[:, None]).sum(0)
+                dist.reduce(summed, dst=0)
+                count *= world_size
+                ddp_rng = [None] * world_size
+                dist.all_gather_object(ddp_rng, (torch.get_rng_state(),
+                                                 torch.cuda.get_rng_state(device) if device.type == "cuda" else None))
+                if not primary:
+                    if global_step > epoch_start_step:
+                        scheduler.step()
+                    finished = torch.zeros((), dtype=torch.int32, device=device)
+                    dist.broadcast(finished, src=0)
+                    if finished.item():
+                        return None
+                    continue
+                online_targets = [targets_tensor.cpu().numpy()]
+                totals = dict(zip(losses, summed.tolist()))
+            else:
+                batch_values = values.cpu().numpy().astype(np.float64)
+                totals = dict(zip(losses, (np.asarray(batch_sizes) @ batch_values).tolist()))
+            online_probabilities = [probabilities_tensor.cpu().numpy()]
         train_seconds = time.perf_counter() - epoch_start
         if fold is not None:
             scheduler.step()
@@ -1292,7 +1375,8 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         history.update(seconds=time.perf_counter()-epoch_start, elapsed_seconds=elapsed_before+time.perf_counter()-started,
                        train_seconds=train_seconds, data_wait_seconds=data_wait_seconds, validation_seconds=validation_seconds)
         phase_checkpoint = {"phase_best": phase_best} if suite == "jaccard" else {}
-        save_last_checkpoint({**static, **ema_checkpoint, **candidate_checkpoint, **phase_checkpoint, "history_record": history,
+        distributed_checkpoint = {"ddp_rng": ddp_rng} if distributed else {}
+        save_last_checkpoint({**static, **distributed_checkpoint, **ema_checkpoint, **candidate_checkpoint, **phase_checkpoint, "history_record": history,
                     "best_weights": best_weights, "model_state": checkpoint_state(model), "optimizer_state": optimizer.state_dict(),
                     "scheduler_state": scheduler.state_dict(), "best_model_state": best_state,
                     "scaler_state": scaler.state_dict(), "global_step": global_step,
@@ -1358,13 +1442,20 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
                   f"capped={g['capped_batches']}/{g['finite_batches']} "
                   f"cosine={fmt(g['mean_cosine'])} ratio={fmt(g['mean_weighted_aux_main_ratio'])} "
                   f"applied={fmt(g['mean_applied_aux_main_ratio'])} max={gradient_ratio:g}", flush=True)
-        if epoch>frozen_epochs and settings["patience"] and stale>=settings["patience"]:
+        early_stop = epoch > frozen_epochs and settings["patience"] and stale >= settings["patience"]
+        step_limit = settings.get("max_steps") and global_step >= settings["max_steps"]
+        paused = stop_file is not None and Path(stop_file).exists() and epoch < settings["epochs"]
+        if distributed:
+            finished = torch.tensor(int(bool(early_stop or step_limit or paused or epoch == settings["epochs"])),
+                                    dtype=torch.int32, device=device)
+            dist.broadcast(finished, src=0)
+        if early_stop or step_limit:
             break
-        if settings.get("max_steps") and global_step>=settings["max_steps"]:
-            break
-        if stop_file is not None and Path(stop_file).exists() and epoch < settings['epochs']:
+        if paused:
             print(f'Paused after epoch {epoch}; continue from {run / "last.pt"}', flush=True)
             return {'paused': True, 'epoch': epoch, 'checkpoint': str(run/'last.pt')}
+    if not primary:
+        return None
     if fold is not None:
         from .hh_v13 import export_fold
         selected = ema.module if ema is not None and int(ema.n_averaged)>0 else model

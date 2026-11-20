@@ -1,11 +1,12 @@
 import argparse
+import os
 import json
 from pathlib import Path
 
 import yaml
 
 from .models import RESEARCH_MODELS, LEGACY_MODELS, HH_MODELS, HH_V15_RANKER, HH_V16, HH_V17, HH_V20, HH_V20_CHEMICAL_MODES
-from .models import PEPTIDE_V3, PEPTIDE_V6, PEPTIDE_V7, V3_MODES, V7_HEADS, XBRIDGE, THERASET_BRIDGE
+from .models import PEPTIDE_V3, PEPTIDE_V6, PEPTIDE_V7, V3_MODES, V7_HEADS, XBRIDGE, THERASET_BRIDGE, UNIFIED_EVIDENCE
 from .metric_protocol import SUITES
 from .models.hypotheses import MODELS as HYPOTHESIS_MODELS
 from .data import TRACKS
@@ -48,6 +49,7 @@ def main(argv=None):
             sub.add_argument("--metric-suite", choices=SUITES,
                              help="Research models: primary report and checkpoint selection protocol")
             sub.add_argument("--task", choices=TRACKS, help="Alias for --track")
+            sub.add_argument("--ddp", action="store_true", help="Unified Evidence: one distributed run, launched by torchrun")
             sub.add_argument("--resume", help="last.pt with optimizer and RNG state; creates a new run")
             sub.add_argument("--stage", choices=("A", "B", "C"), help="PrivilegedBridge training phase")
             sub.add_argument("--initialize-from", help="Starting checkpoint for H1–H6, HH-SetReread, TheraSet continuation or PrivilegedBridge")
@@ -199,6 +201,12 @@ def main(argv=None):
     gpu_check.add_argument("--profile-only", action="store_true",
                            help="Measure random and longest Train batches without the subsequent short training run")
     args = parser.parse_args(argv)
+    if args.command == "train":
+        multi_process = int(os.environ.get("WORLD_SIZE", "1")) > 1
+        if args.ddp and (args.model != UNIFIED_EVIDENCE or not multi_process):
+            parser.error("--ddp requires --model unified_evidence and torchrun --nproc-per-node with at least two processes")
+        if multi_process and not args.ddp:
+            parser.error("Multi-process training requires --ddp")
     if args.command == "train" and args.setreread_interval and args.model != "setreread":
         parser.error("--setreread-interval requires --model setreread")
     if args.command == "train" and args.v7_head is not None and (args.model != PEPTIDE_V7 or args.resume):
@@ -519,7 +527,11 @@ def main(argv=None):
                 if args.stop_file:
                     continuation['stop_file'] = args.stop_file
                 try:
-                    train(config, name, resume=args.resume, **continuation)
+                    if args.ddp:
+                        from .research import train_distributed
+                        train_distributed(config, name, resume=args.resume, **continuation)
+                    else:
+                        train(config, name, resume=args.resume, **continuation)
                 except KeyboardInterrupt:
                     run = Path(config['train']['output']) / name
                     if (run/'last.pt').exists():

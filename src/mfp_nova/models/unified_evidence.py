@@ -23,7 +23,9 @@ class UnifiedEvidence(HelixSet):
         self.label_weights = nn.Parameter(torch.randn(num_labels, dim) / math.sqrt(dim))
         self.label_bias = nn.Parameter(prior_bias(statistics))
 
-    def forward(self, batch):
+    def forward(self, batch, loss_settings=None):
+        if loss_settings is not None:
+            return self.compute_loss(batch, loss_settings, return_output=True)
         residues, properties, property_mask, latent, latent_mask = super().forward(batch)
         mask = batch["mask"]
         local = self.local(batch)
