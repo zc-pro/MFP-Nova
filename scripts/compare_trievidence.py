@@ -65,10 +65,47 @@ def compare(baseline, candidate, nearest=None, structure=None):
                         "rows": int(keep.sum()), "delta_pp": values["delta_vs_theraset_pp"],
                         "paired_cluster_ci95_pp": values["paired_cluster_ci95_pp"],
                         "gained_observed_labels": int(gained[keep].sum()), "lost_observed_labels": int(lost[keep].sum())}
+        complement = {}
+        if (all("branch_thresholds" in report for report in (base, other))
+                and all(key in z for z in (a, b) for key in ("theraset_logits", "aa34_logits", "latent_logits"))):
+            limit = np.log((1 - 1e-6) / 1e-6)
+            for name, z, report in (("baseline", a, base), ("candidate", b, other)):
+                thresholds = np.asarray(report["branch_thresholds"])
+                offsets = np.log(thresholds / (1 - thresholds)).astype(np.float32)
+                branches = np.clip(np.stack([z[k] for k in ("theraset_logits", "aa34_logits", "latent_logits")]),
+                                   -limit, limit) - offsets[:, None, None]
+                full = z["predicted_raw"]
+                full_hit = (full & y).any(1)
+                full_score = (full & y).sum(1) / np.maximum((full | y).sum(1), 1)
+                pair_results = {}
+                for branch, pair in (("aa34", (0, 2)), ("latent", (0, 1))):
+                    pred = branches[list(pair)].mean(0) >= 0
+                    hit = (pred & y).any(1)
+                    score = (pred & y).sum(1) / np.maximum((pred | y).sum(1), 1)
+                    groups = {"all": np.ones(len(y), bool)}
+                    if "nearest_below_070" in strata:
+                        groups["nearest_below_070"] = strata["nearest_below_070"]
+                    pair_results[branch] = {
+                        key: {"rows": int(mask.sum()), "adding_delta_pp": 100 * float((full_score - score)[mask].mean()),
+                              "rescued": int((mask & ~hit & full_hit).sum()),
+                              "lost": int((mask & hit & ~full_hit).sum())}
+                        for key, mask in groups.items() if mask.any()
+                    }
+                    if branch == "aa34":
+                        pair_results["aa34_rescue_mask"] = ~hit & full_hit
+                complement[name] = pair_results
+            rescues = [complement[name].pop("aa34_rescue_mask") for name in ("baseline", "candidate")]
+            complement["aa34_rescue_overlap"] = {
+                "retained": int((rescues[0] & rescues[1]).sum()),
+                "baseline_only": int((rescues[0] & ~rescues[1]).sum()),
+                "candidate_only": int((~rescues[0] & rescues[1]).sum()),
+            }
     return {"split": split, "rows": len(y), "metrics": metrics,
             "branch_logits_max_abs_delta": logits_delta,
+            "branch_complementarity": complement,
             "both_acc_at_least_baseline": all(v["delta_pp"] >= 0 for v in metrics.values()),
             "parameters": [r.get("parameters") for r in (base, other)],
+            "cnn_parameters": [r.get("cnn_parameters") for r in (base, other)],
             "inference": [r.get("inference") for r in (base, other)]}
 
 

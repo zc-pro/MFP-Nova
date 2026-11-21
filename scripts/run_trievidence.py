@@ -298,6 +298,7 @@ def train_cached(args, output):
                   theraset_export=str(args.theraset_val), helixset_export=str(args.helix_exits),
                   elapsed_seconds=time.perf_counter() - started, device=args.device, torch=str(torch.__version__),
                   cnn_channels=args.channels, cnn_batch_size=args.cnn_batch_size, dropout=args.dropout,
+                  cnn_parameters=sum(p.numel() for p in reader.parameters()),
                   reader_head=args.reader_head,
                   learning_rate=args.learning_rate, unlabeled_weight=args.unlabeled_weight,
                   dataset=source.statistics["dataset"],
