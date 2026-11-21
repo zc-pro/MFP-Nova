@@ -11,7 +11,7 @@ import torch
 from mfp_nova.models.trievidence import TriEvidence, empty_top10, fuse_evidence
 from mfp_nova.multimodal import MultimodalPeptides
 from mfp_nova.research import to_device, validate_cache
-from mfp_nova.research_layers import observed_label_loss
+from mfp_nova.research_layers import observed_label_loss, unlabeled_weights
 from mfp_nova.trainer import seed_everything, write_json
 from run_trievidence import batches, collect, diagnostics, open_data, row_jaccard
 
@@ -28,6 +28,19 @@ def svd_latent_ffn(state, depth, rank):
             result[prefix + ".1.weight"] = (u[:, :rank] * scale).to(weight.dtype)
             result[prefix + ".1.bias"] = result.pop(prefix + ".bias")
     return result
+
+
+def candidate_ranking_loss(logits, targets, statistics, unknown_weight=.3):
+    """Rank each recorded positive above the highest-scored unrecorded candidates."""
+    positive = targets > 0
+    negatives = logits.masked_fill(positive, -torch.inf).topk(min(3, logits.size(1)), dim=1)
+    available = negatives.values.isfinite()
+    negative_scores = negatives.values.masked_fill(~available, 0)
+    weights = unlabeled_weights(targets, statistics, unknown_weight).gather(1, negatives.indices)
+    pairs = positive[:, :, None] & available[:, None, :]
+    violations = torch.nn.functional.softplus(negative_scores[:, None, :] - logits[:, :, None])
+    per_row = (violations * pairs * weights[:, None, :]).sum((1, 2)) / pairs.sum((1, 2)).clamp_min(1)
+    return per_row.mean()
 
 
 def refine(args, output):
@@ -52,6 +65,8 @@ def refine(args, output):
     original_depth = model_args["helixset_args"].get("latent_depth", 6)
     if not 1 <= args.depth <= original_depth or args.epochs < 0:
         raise ValueError("Use a positive depth no larger than the checkpoint depth and nonnegative epochs")
+    if args.representation and (args.epochs < 1 or args.depth != original_depth or args.ablate or args.ffn_rank):
+        raise ValueError("Representation training requires the original depth and at least one training epoch")
     if args.ablate:
         if args.epochs or args.depth != original_depth:
             raise ValueError("Ablation compares original-depth weights without recovery training")
@@ -78,7 +93,11 @@ def refine(args, output):
         train = MultimodalPeptides(source, args.features, "train", peptide_feature_root=args.peptide_features)
         validate_cache(train, packed["config"], packed["encoder"])
         train_loader = batches(train, args.batch_size, shuffle=True)
-        if args.ffn_rank is not None:
+        if args.representation:
+            train_blocks = list(helix.pair_blocks[-2:]) + list(helix.latent_blocks[-2:])
+            for block in train_blocks:
+                block.requires_grad_(True)
+        elif args.ffn_rank is not None:
             for block in helix.latent_blocks:
                 for index in (1, 4):
                     block.process.ff.net[index].requires_grad_(True)
@@ -93,13 +112,21 @@ def refine(args, output):
     for epoch in range(args.epochs + 1):
         loss_sum = 0.
         if epoch:
-            if args.ffn_rank is None:
+            if args.representation:
+                for block in train_blocks:
+                    block.train()
+            elif args.ffn_rank is None:
                 helix.latent_blocks[-1].train()
             helix.latent_classifier.train()
             for step, batch in enumerate(train_loader, 1):
                 batch = to_device(batch, args.device)
                 optimizer.zero_grad(set_to_none=True)
-                loss = observed_label_loss(helix(batch)["logits"], batch["y"], source.statistics["labels"])
+                logits = helix(batch)["logits"]
+                labels = batch["y"]
+                statistics = source.statistics["labels"]
+                loss = observed_label_loss(logits, labels, statistics)
+                if args.ranking_weight:
+                    loss = loss + args.ranking_weight * candidate_ranking_loss(logits, labels, statistics)
                 loss.backward()
                 optimizer.step()
                 loss_sum += float(loss.detach()) * len(batch["y"])
@@ -118,7 +145,8 @@ def refine(args, output):
                   "train_loss": loss_sum / len(train) if epoch else None}
         history.append(record)
         print(json.dumps(record), flush=True)
-        if best is None or key > best[0]:
+        if (args.representation and epoch == args.epochs) or (
+                not args.representation and (best is None or key > best[0])):
             best = key, epoch, h
             torch.save(dict(packed, model_state={k: v.detach().cpu() for k, v in model.state_dict().items()},
                             latent_recovery_epoch=epoch), output / "best.pt")
@@ -127,6 +155,8 @@ def refine(args, output):
     report = diagnostics(source, val, a, c, h, offsets, "val", output)
     report.update(reference_checkpoint=str(args.checkpoint), depth=args.depth, ablation=args.ablate,
                   ffn_rank=args.ffn_rank, best_epoch=epoch,
+                  representation=args.representation, ranking_weight=args.ranking_weight,
+                  selection="fixed_final_epoch" if args.representation else "validation",
                   train_rows=len(train) if train is not None else 0,
                   parameters=sum(p.numel() for p in model.parameters()), history=history)
     write_json(output / "results.json", report)
@@ -140,6 +170,9 @@ if __name__ == "__main__":
     parser.add_argument("--ablate", choices=("geometry", "triangles"),
                         help="Disable only HelixSet explicit geometry or only its triangle updates")
     parser.add_argument("--epochs", type=int, default=0)
+    parser.add_argument("--representation", action="store_true",
+                        help="Tune the last two pair and latent blocks and use the fixed final epoch")
+    parser.add_argument("--ranking-weight", type=float, default=0.)
     parser.add_argument("--learning-rate", type=float, default=2e-5)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--batch-size", type=int, default=16)
@@ -148,6 +181,8 @@ if __name__ == "__main__":
     parser.add_argument("--peptide-features", type=Path, default=Path("features/esm2_peptide_150m"))
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
+    if args.ranking_weight < 0 or (args.ranking_weight != 0 and not args.representation):
+        parser.error("--ranking-weight requires --representation and must be nonnegative")
     output = args.output or Path("runs") / datetime.now().strftime("trievidence_depth_%Y%m%d_%H%M%S_%f")
     output.mkdir(parents=True, exist_ok=False)
     refine(args, output)
