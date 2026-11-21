@@ -37,6 +37,17 @@ def fallback_diagnostics(a, b, base, other, y, strata):
 
     raw_score = list(map(jac, raw))
     final_delta = jac(final[1]) - jac(final[0])
+    rankings = []
+    for z in (a, b):
+        rankings.append(np.argsort(-z["probabilities"], axis=1, kind="stable"))
+    counts = [p.sum(1) for p in raw]
+    positions = np.arange(y.shape[1])
+    crossed = {}
+    for index, name in enumerate(("baseline", "candidate")):
+        predicted = np.zeros_like(y)
+        np.put_along_axis(predicted, rankings[index], positions < counts[1 - index][:, None], axis=1)
+        crossed[name + "_rank_other_count"] = jac(predicted)
+    added, removed = raw[1] & ~raw[0], raw[0] & ~raw[1]
     groups = {"both_empty": empty[0] & empty[1], "baseline_only_empty": empty[0] & ~empty[1],
               "candidate_only_empty": ~empty[0] & empty[1], "neither_empty": ~empty[0] & ~empty[1]}
     report = {}
@@ -53,6 +64,18 @@ def fallback_diagnostics(a, b, base, other, y, strata):
                 for mask_name, mask in zip(("baseline", "candidate"), empty)},
             "raw_delta_pp": float(100 * (raw_score[1] - raw_score[0])[subset].mean()),
         }
+        paired = subset & groups["neither_empty"]
+        if paired.any():
+            report[name]["nonempty_in_both"] = {
+                "rows": int(paired.sum()),
+                "changed_rows": int(((added | removed).any(1) & paired).sum()),
+                "added_annotated": int((added[paired] & y[paired]).sum()),
+                "removed_annotated": int((removed[paired] & y[paired]).sum()),
+                "added_unannotated": int((added[paired] & ~y[paired]).sum()),
+                "removed_unannotated": int((removed[paired] & ~y[paired]).sum()),
+                "acc_pct": {key: float(100 * score[paired].mean()) for key, score in (
+                    {"baseline": raw_score[0], "candidate": raw_score[1]} | crossed).items()},
+            }
     return report
 
 
