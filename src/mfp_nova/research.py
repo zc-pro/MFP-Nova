@@ -17,7 +17,7 @@ from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
 from .metrics import evaluate_metrics, evaluate_groups, format_epoch, fit_global_threshold, fit_label_thresholds
 from .models import (HH_MODELS, HH_V15_RANKER, HH_V16, HH_V17, HH_V20, HH_V20_CHEMICAL_MODES,
-                     PEPTIDE_V3, PEPTIDE_V6, PEPTIDE_V7, SEQUENCE_ONLY_MODELS, XBRIDGE, THERASET_BRIDGE)
+                     PEPTIDE_V3, PEPTIDE_V6, PEPTIDE_V7, SEQUENCE_ONLY_MODELS, XBRIDGE, THERASET_BRIDGE, THERAHELIX)
 from .multimodal import BackbonePeptides, MultimodalData, MultimodalPeptides, backbone_inputs, collate_multimodal
 from .research_layers import observed_label_loss
 from .consistency import bernoulli_consistency, consistency_weight
@@ -27,6 +27,9 @@ from .metric_protocol import (FIXED_THRESHOLD_SUITES, JACCARD_ORDER, protocol_de
 
 
 def make_model(name, arguments):
+    if name == THERAHELIX:
+        from .models.therahelix import TheraHelix
+        return TheraHelix(**arguments)
     if name == THERASET_BRIDGE:
         from .models.theraset_bridge import TheraSetBridge
         return TheraSetBridge(**arguments)
@@ -293,12 +296,12 @@ def validate_cache(dataset, config, reference=None):
     settings = config.get("peptide_encoder")
     if (peptide is None) != (settings is None):
         raise ValueError("Peptide encoder configuration and cache must be supplied together")
-    if config.get("model_name") in (PEPTIDE_V7, XBRIDGE, THERASET_BRIDGE) and peptide is None:
+    if config.get("model_name") in (PEPTIDE_V7, XBRIDGE, THERASET_BRIDGE, THERAHELIX) and peptide is None:
         raise ValueError(f"{config['model_name']} requires both frozen ESM caches")
     if peptide is not None:
         if config["model_name"] not in (
                 "helixset", "theraset", "privilegedbridge", *SEQUENCE_ONLY_MODELS,
-                *HH_MODELS, HH_V16, HH_V17, XBRIDGE, THERASET_BRIDGE):
+                *HH_MODELS, HH_V16, HH_V17, XBRIDGE, THERASET_BRIDGE, THERAHELIX):
             raise ValueError("This architecture does not support dual frozen encoders")
         if peptide["name"] != settings["name"] or peptide["max_length"] != settings["max_length"]:
             raise ValueError("Configured peptide encoder differs from cache")
@@ -644,7 +647,7 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         raise ValueError("R-Drop weight must be finite and nonnegative")
     if rdrop:
         if config["model_name"] not in ("helixset", "theraset", "termiscale", "motifspan", "privilegedbridge",
-                                       "hh_setreread", PEPTIDE_V3, PEPTIDE_V6, PEPTIDE_V7, THERASET_BRIDGE):
+                                       "hh_setreread", PEPTIDE_V3, PEPTIDE_V6, PEPTIDE_V7, THERASET_BRIDGE, THERAHELIX):
             raise ValueError("This model does not support R-Drop")
         if settings.get("rdrop_start_epoch", 6) < 1 or settings.get("rdrop_ramp_epochs", 5) < 1:
             raise ValueError("R-Drop start epoch and ramp length must be positive")

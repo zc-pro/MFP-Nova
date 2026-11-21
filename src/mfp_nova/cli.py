@@ -5,7 +5,7 @@ from pathlib import Path
 import yaml
 
 from .models import RESEARCH_MODELS, LEGACY_MODELS, HH_MODELS, HH_V15_RANKER, HH_V16, HH_V17, HH_V20, HH_V20_CHEMICAL_MODES
-from .models import PEPTIDE_V3, PEPTIDE_V6, PEPTIDE_V7, V3_MODES, V7_HEADS, XBRIDGE, THERASET_BRIDGE
+from .models import PEPTIDE_V3, PEPTIDE_V6, PEPTIDE_V7, V3_MODES, V7_HEADS, XBRIDGE, THERASET_BRIDGE, THERAHELIX
 from .metric_protocol import SUITES
 from .models.hypotheses import MODELS as HYPOTHESIS_MODELS
 from .data import TRACKS
@@ -486,7 +486,7 @@ def main(argv=None):
                     config["train"][key] = value
             if args.rdrop_weight is not None:
                 if model_name not in ("helixset", "theraset", "termiscale", "motifspan", "privilegedbridge",
-                                       "hh_setreread", PEPTIDE_V3, PEPTIDE_V6, PEPTIDE_V7, THERASET_BRIDGE):
+                                       "hh_setreread", PEPTIDE_V3, PEPTIDE_V6, PEPTIDE_V7, THERASET_BRIDGE, THERAHELIX):
                     raise ValueError("This model does not support R-Drop")
                 config["loss"]["rdrop"] = args.rdrop_weight
             if args.loss is not None:

@@ -428,6 +428,9 @@ class HelixSet(nn.Module):
         geometry_pairs = self.pair_geometry(features) * observed[..., None]
         return pairs, geometry_pairs, pair_quality
 
+    def read_latent(self, latent, sequence, sequence_mask):
+        return self.latent_classifier(latent.mean(1))
+
     def forward(self, batch, return_evidence=False):
         if self.esm_tail is not None:
             batch = dict(batch, esm=self.esm_tail(batch))
@@ -489,7 +492,7 @@ class HelixSet(nn.Module):
         latent_mask = torch.ones(latent.shape[:2], dtype=torch.bool, device=mask.device)
         for block in self.latent_blocks:
             latent = block(latent, latent_mask, memories, masks, reliability, motif_weights)
-        direct = self.latent_classifier(latent.mean(1))
+        direct = self.read_latent(latent, seq, seq_mask)
         if self.direct_only:
             return {"logits": direct, "direct": direct}
         intermediate = []
