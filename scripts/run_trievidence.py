@@ -350,6 +350,16 @@ def evaluate(args, output):
     model.load_state_dict(checkpoint["model_state"])
     model.to(args.device).eval()
 
+    latent_states = []
+    if args.export_latent:
+        if args.split != "val" or "shared_mode" in checkpoint["model_args"]:
+            raise ValueError("Latent export requires original TriEvidence on Validation")
+
+        def capture_latent(_layer, inputs):
+            latent_states.append(inputs[0].float().cpu())
+
+        latent_hook = model.helixset.latent_classifier.register_forward_pre_hook(capture_latent)
+
     def read(batch):
         result = model(batch)
         return result["theraset_logits"], result["aa34_logits"], result["latent_logits"]
@@ -368,6 +378,13 @@ def evaluate(args, output):
     if args.length_bucketed:
         original_order = torch.from_numpy(np.argsort(order))
         columns = tuple(column[original_order] for column in columns)
+    if args.export_latent:
+        latent_hook.remove()
+        states = torch.cat(latent_states)
+        if args.length_bucketed:
+            states = states[original_order]
+        np.savez_compressed(output / "val_latent_features.npz",
+                            row_id=source.data.rows[dataset.indices], pooled_latent=states.numpy())
     a, b, h = columns
     report = diagnostics(source, dataset, a, b, h, model.offsets.cpu(), args.split, output,
                          shared="shared_mode" in checkpoint["model_args"])
@@ -415,6 +432,7 @@ def main():
                        help="Batch similar lengths together and restore original row order for metrics")
     score.add_argument("--reuse-input-compute", action="store_true",
                        help="Reuse equivalent dual-ESM normalization and residue distances in TriEvidence")
+    score.add_argument("--export-latent", action="store_true", help="Save pooled HelixSet Validation features")
     for command in (fit, cached, score):
         command.add_argument("--data-root", type=Path, default=Path("data/therapeutic_2025"))
         command.add_argument("--device", default="cuda:0")
