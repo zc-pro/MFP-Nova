@@ -351,14 +351,18 @@ def evaluate(args, output):
     model.to(args.device).eval()
 
     latent_states = []
-    if args.export_latent:
+    if args.export_latent or args.export_latent_tokens:
         if args.split != "val" or "shared_mode" in checkpoint["model_args"]:
             raise ValueError("Latent export requires original TriEvidence on Validation")
 
-        def capture_latent(_layer, inputs):
-            latent_states.append(inputs[0].float().cpu())
+        def capture_latent(_layer, _inputs, states):
+            if args.export_latent_tokens:
+                states = states.to(dtype=torch.float16)
+            else:
+                states = states.mean(1).float()
+            latent_states.append(states.cpu())
 
-        latent_hook = model.helixset.latent_classifier.register_forward_pre_hook(capture_latent)
+        latent_hook = model.helixset.latent_blocks[-1].register_forward_hook(capture_latent)
 
     def read(batch):
         result = model(batch)
@@ -378,13 +382,17 @@ def evaluate(args, output):
     if args.length_bucketed:
         original_order = torch.from_numpy(np.argsort(order))
         columns = tuple(column[original_order] for column in columns)
-    if args.export_latent:
+    if args.export_latent or args.export_latent_tokens:
         latent_hook.remove()
         states = torch.cat(latent_states)
         if args.length_bucketed:
             states = states[original_order]
-        np.savez_compressed(output / "val_latent_features.npz",
-                            row_id=source.data.rows[dataset.indices], pooled_latent=states.numpy())
+        rows = source.data.rows[dataset.indices]
+        if args.export_latent_tokens:
+            np.savez_compressed(output / "val_latent_tokens.npz", row_id=rows, latent_tokens=states.numpy())
+        if args.export_latent:
+            pooled = states.float().mean(1) if args.export_latent_tokens else states
+            np.savez_compressed(output / "val_latent_features.npz", row_id=rows, pooled_latent=pooled.numpy())
     a, b, h = columns
     report = diagnostics(source, dataset, a, b, h, model.offsets.cpu(), args.split, output,
                          shared="shared_mode" in checkpoint["model_args"])
@@ -433,6 +441,8 @@ def main():
     score.add_argument("--reuse-input-compute", action="store_true",
                        help="Reuse equivalent dual-ESM normalization and residue distances in TriEvidence")
     score.add_argument("--export-latent", action="store_true", help="Save pooled HelixSet Validation features")
+    score.add_argument("--export-latent-tokens", action="store_true",
+                       help="Save all final HelixSet latent tokens in float16 on Validation")
     for command in (fit, cached, score):
         command.add_argument("--data-root", type=Path, default=Path("data/therapeutic_2025"))
         command.add_argument("--device", default="cuda:0")
