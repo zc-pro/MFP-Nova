@@ -120,13 +120,21 @@ def tune_cnn_offset(y, theraset, aa34, latent, offsets):
     return key, trial, fuse_evidence(theraset, aa34, latent, trial)
 
 
-def pass_train(reader, loader, device, optimizer, statistics, unlabeled_weight):
+def pass_train(reader, loader, device, optimizer, statistics, unlabeled_weight,
+               teacher=None, teacher_offset=None, distill_weight=.5):
     reader.train()
     loss_sum = 0.
     for batch in loader:
         batch = to_device(batch, device)
         optimizer.zero_grad(set_to_none=True)
-        loss = observed_label_loss(reader(batch), batch["y"], statistics, unlabeled_weight)
+        logits = reader(batch)
+        loss = observed_label_loss(logits, batch["y"], statistics, unlabeled_weight)
+        if teacher is not None and distill_weight > 0:
+            with torch.no_grad():
+                target = teacher(batch)
+                weight = 1 + 2 * torch.exp(-(target - teacher_offset).abs())
+            residual = torch.nn.functional.smooth_l1_loss(logits, target, reduction="none")
+            loss = loss + distill_weight * (weight * residual).mean()
         loss.backward()
         optimizer.step()
         loss_sum += float(loss.detach()) * len(batch["y"])
@@ -190,7 +198,7 @@ def diagnostics(source, dataset, theraset, aa34, latent, offsets, split, output,
     return report
 
 
-def fit_aa34(args, reader, source, backbone, val_backbone, a, h, offsets):
+def fit_aa34(args, reader, source, backbone, val_backbone, a, h, offsets, teacher=None):
     # DataLoader initialization for the live anchors consumes RNG state.
     seed_everything(args.seed)
     stats = source.statistics["labels"]
@@ -202,17 +210,23 @@ def fit_aa34(args, reader, source, backbone, val_backbone, a, h, offsets):
     best, history = None, []
     for epoch in range(1, args.epochs + 1):
         tick = time.perf_counter()
-        loss = pass_train(reader, train_loader, args.device, optimizer, stats, args.unlabeled_weight)
+        loss = pass_train(reader, train_loader, args.device, optimizer, stats, args.unlabeled_weight,
+                          teacher, offsets[1].to(args.device), getattr(args, "distill_weight", .5))
         schedule.step()
         reader.eval()
         b, = collect(lambda batch: (reader(batch),), val_loader, args.device)
-        key, chosen, fused = tune_cnn_offset(y, a, b, h, offsets)
+        if teacher is None:
+            key, chosen, fused = tune_cnn_offset(y, a, b, h, offsets)
+        else:
+            chosen = offsets
+            fused = fuse_evidence(a, b, h, chosen)
+            key = (float(row_jaccard(y, fused >= 0).mean()),)
         record = {"epoch": epoch, "train_loss": loss, "raw_val_acc": key[0], "cnn_threshold": float(chosen[1].sigmoid()),
                   "fallback_val_acc": float(row_jaccard(y, empty_top10(fused, a)).mean()),
                   "seconds": time.perf_counter() - tick}
         history.append(record)
         print(json.dumps(record), flush=True)
-        if best is None or key > best[0]:
+        if best is None or teacher is not None or key > best[0]:
             weights = {k: v.detach().cpu().clone() for k, v in reader.state_dict().items()}
             best = key, chosen, b, epoch, weights
 
@@ -288,8 +302,19 @@ def train_cached(args, output):
         h = align_saved(exits, source, validation, "direct")
     offsets = torch.tensor([float(thera["threshold"]), .5, args.helix_threshold]).logit()
     reader = AA34Reader(source.statistics["labels"], args.channels, args.dropout, args.reader_head).to(args.device)
+    teacher = None
+    if args.distill_reader:
+        checkpoint = torch.load(args.distill_reader, map_location="cpu", weights_only=True)
+        if checkpoint["labels"] != source.data.labels or checkpoint["dataset"] != source.statistics["dataset"]:
+            raise ValueError("Teacher must use the same Fine39 dataset and label order")
+        torch.testing.assert_close(checkpoint["offsets"][[0, 2]], offsets[[0, 2]])
+        offsets = checkpoint["offsets"]
+        teacher = AA34Reader(source.statistics["labels"], checkpoint["channels"], args.dropout,
+                             checkpoint.get("reader_head", "global"))
+        teacher.load_state_dict(checkpoint["model_state"])
+        teacher.to(args.device).requires_grad_(False).eval()
     print(f"Cached evidence | Train={len(backbone)} Validation={len(validation)}", flush=True)
-    chosen, b, epoch, history = fit_aa34(args, reader, source, backbone, validation, a, h, offsets)
+    chosen, b, epoch, history = fit_aa34(args, reader, source, backbone, validation, a, h, offsets, teacher)
     torch.save({"model_state": reader.state_dict(), "offsets": chosen, "epoch": epoch, "channels": args.channels,
                 "reader_head": args.reader_head,
                 "labels": source.data.labels, "dataset": source.statistics["dataset"]}, output / "reader.pt")
@@ -299,6 +324,9 @@ def train_cached(args, output):
                   elapsed_seconds=time.perf_counter() - started, device=args.device, torch=str(torch.__version__),
                   cnn_channels=args.channels, cnn_batch_size=args.cnn_batch_size, dropout=args.dropout,
                   cnn_parameters=sum(p.numel() for p in reader.parameters()),
+                  distill_reader=str(args.distill_reader) if teacher is not None else None,
+                  distill_weight=args.distill_weight if teacher is not None else None,
+                  selection="fixed_final_epoch_and_teacher_offset" if teacher is not None else "validation_raw",
                   reader_head=args.reader_head,
                   learning_rate=args.learning_rate, unlabeled_weight=args.unlabeled_weight,
                   dataset=source.statistics["dataset"],
@@ -369,6 +397,8 @@ def main():
     cached.add_argument("--theraset-val", type=Path, required=True)
     cached.add_argument("--helix-exits", type=Path, required=True)
     cached.add_argument("--helix-threshold", type=float, default=.64)
+    cached.add_argument("--distill-reader", type=Path, help="Frozen teacher reader.pt; keep its offset and export the final epoch")
+    cached.add_argument("--distill-weight", type=float, default=.5)
     for command in (fit, cached):
         command.add_argument("--epochs", type=int, default=25)
         command.add_argument("--seed", type=int, default=42)
