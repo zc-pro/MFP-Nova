@@ -1057,6 +1057,9 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
         online_targets, online_probabilities = [], []
+        defer_metrics = config["model_name"] == THERAHELIX
+        batch_losses = {}
+        pending_losses = []
         loss_settings = epoch_loss_settings(config, phase_epoch)
         if hh:
             loss_settings["hh_ramp"] = min(1., epoch/5)
@@ -1068,6 +1071,7 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         batch_done = time.perf_counter()
         for batch_index, batch in enumerate(loaders[0]):
             data_wait_seconds += time.perf_counter() - batch_done
+            cpu_targets = batch["y"]
             batch = to_device(batch, device)
             teacher_logits = None
             if loss_settings.get("consistency", 0) > 0 and int(ema.n_averaged) > 0:
@@ -1085,7 +1089,9 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
                 loss = loss+loss_settings["consistency"]*agreement
                 components = {**components, "consistency": agreement, **agreement_terms}
             del teacher_logits
-            if not torch.isfinite(loss):
+            if defer_metrics:
+                pending_losses.append(loss.detach())
+            elif not torch.isfinite(loss):
                 raise FloatingPointError("Nonfinite research loss")
             backward_enabled = not (pb and model.stage == "B" and not output["observed"].any())
             valid_microbatches += int(backward_enabled)
@@ -1106,6 +1112,10 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
             elif backward_enabled:
                 scaler.scale(loss/group_size).backward()
             boundary = (batch_index+1)%accumulation==0 or batch_index+1==len(loaders[0])
+            if defer_metrics and boundary:
+                if not torch.stack(pending_losses).isfinite().all():
+                    raise FloatingPointError("Nonfinite research loss")
+                pending_losses.clear()
             if boundary and valid_microbatches:
                 if pb and model.stage == "B":
                     for parameter in model.parameters():
@@ -1124,16 +1134,29 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
             if boundary:
                 valid_microbatches = 0
             n = len(batch["y"])
-            if fold is None:
+            if defer_metrics:
+                if fold is None:
+                    online_targets.append(cpu_targets.numpy())
+                    online_probabilities.append(output["logits"].detach().float().sigmoid())
+                for key, value in {"total": loss, **components}.items():
+                    batch_losses.setdefault(key, []).append((value.detach(), n))
+            elif fold is None:
                 online_targets.append(batch["y"].detach().cpu().numpy())
                 online_probabilities.append(output["logits"].detach().float().sigmoid().cpu().numpy())
             del output
-            for key, value in {"total": loss, **components}.items():
-                totals[key] = totals.get(key, 0)+float(value.detach())*n
+            if not defer_metrics:
+                for key, value in {"total": loss, **components}.items():
+                    totals[key] = totals.get(key, 0)+float(value.detach())*n
             count += n
             if settings.get("max_steps") and global_step>=settings["max_steps"]:
                 break
             batch_done = time.perf_counter()
+        if defer_metrics:
+            for key, entries in batch_losses.items():
+                values, sizes = zip(*entries)
+                totals[key] = float(np.dot(torch.stack(values).cpu().numpy().astype(np.float64), sizes))
+            if fold is None:
+                online_probabilities = [torch.cat(online_probabilities).cpu().numpy()]
         train_seconds = time.perf_counter() - epoch_start
         if fold is not None:
             scheduler.step()

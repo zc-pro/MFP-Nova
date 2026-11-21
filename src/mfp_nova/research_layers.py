@@ -33,7 +33,7 @@ class Attention(nn.Module):
         # An empty modality contributes exactly zero; MHA must not see an all-masked row.
         present = key_mask.any(1)
         safe = key_mask.clone()
-        safe[~present, 0] = True
+        safe[:, 0] |= ~present
         keys = keys.masked_fill(~key_mask[..., None], 0)
         attn_mask = None
         padding = ~safe
