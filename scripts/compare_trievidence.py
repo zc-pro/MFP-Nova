@@ -9,7 +9,54 @@ import numpy as np
 from evaluate_fine39_fixed_fusion import summarize
 
 
-def compare(baseline, candidate, nearest=None, structure=None):
+def fallback_diagnostics(a, b, base, other, y, strata):
+    """Cross the empty-row mask and candidate ranking without fitting a rule."""
+    empty, chosen, raw, final = [], [], [], []
+    for z, report in ((a, base), (b, other)):
+        raw.append(z["predicted_raw"])
+        final.append(z["predicted"])
+        empty.append(~raw[-1].any(1))
+        keys = ("theraset_logits", "aa34_logits", "latent_logits")
+        t = np.asarray(report["branch_thresholds"])
+        offset = np.log(t / (1 - t)).astype(np.float32)
+        limit = np.log((1 - 1e-6) / 1e-6)
+        fused = (np.clip(np.stack([z[k] for k in keys]), -limit, limit) -
+                 offset[:, None, None]).mean(0)
+        shortlist = np.argsort(-z[keys[0]], axis=1, kind="stable")[:, :10]
+        scores = np.take_along_axis(fused, shortlist, axis=1)
+        priority = shortlist + y.shape[1] * (np.arange(10) >= 5)
+        label = np.where(scores == scores.max(1, keepdims=True), priority,
+                         2 * y.shape[1]).min(1) % y.shape[1]
+        predicted = np.zeros_like(y)
+        predicted[np.arange(len(y)), label] = True
+        np.testing.assert_array_equal(predicted[empty[-1]], final[-1][empty[-1]])
+        chosen.append(predicted)
+
+    def jac(pred):
+        return (y & pred).sum(1) / np.maximum(1, (y | pred).sum(1))
+
+    raw_score = list(map(jac, raw))
+    final_delta = jac(final[1]) - jac(final[0])
+    groups = {"both_empty": empty[0] & empty[1], "baseline_only_empty": empty[0] & ~empty[1],
+              "candidate_only_empty": ~empty[0] & empty[1], "neither_empty": ~empty[0] & ~empty[1]}
+    report = {}
+    for name, subset in ({"all": np.ones(len(y), bool)} | strata).items():
+        if not subset.any():
+            continue
+        report[name] = {
+            "groups": {key: {"rows": int((mask & subset).sum()),
+                             "final_delta_pp_contribution": float(100 * (final_delta * mask)[subset].mean())}
+                       for key, mask in groups.items()},
+            "fallback_gain_pp_by_empty_mask_then_ranking": {
+                mask_name: {rank_name: float(100 * (mask * jac(ranking))[subset].mean())
+                            for rank_name, ranking in zip(("baseline", "candidate"), chosen)}
+                for mask_name, mask in zip(("baseline", "candidate"), empty)},
+            "raw_delta_pp": float(100 * (raw_score[1] - raw_score[0])[subset].mean()),
+        }
+    return report
+
+
+def compare(baseline, candidate, nearest=None, structure=None, diagnose_fallback=False):
     base, other = [json.loads((p / "results.json").read_text(encoding="utf-8"))
                    for p in (baseline, candidate)]
     split = base["split"]
@@ -100,7 +147,9 @@ def compare(baseline, candidate, nearest=None, structure=None):
                 "baseline_only": int((rescues[0] & ~rescues[1]).sum()),
                 "candidate_only": int((~rescues[0] & rescues[1]).sum()),
             }
+        fallback = fallback_diagnostics(a, b, base, other, y, strata) if diagnose_fallback else {}
     return {"split": split, "rows": len(y), "metrics": metrics,
+            "fallback_diagnostics": fallback,
             "branch_logits_max_abs_delta": logits_delta,
             "branch_complementarity": complement,
             "both_acc_at_least_baseline": all(v["delta_pp"] >= 0 for v in metrics.values()),
@@ -115,5 +164,8 @@ if __name__ == "__main__":
     parser.add_argument("candidate", type=Path)
     parser.add_argument("--nearest", type=Path, help="Fine39 nearest-Train Validation export")
     parser.add_argument("--structure", type=Path, help="Dataset structure_primary.npz")
+    parser.add_argument("--diagnose-fallback", action="store_true",
+                        help="Cross empty-row masks and fallback rankings for original TriEvidence")
     args = parser.parse_args()
-    print(json.dumps(compare(args.baseline, args.candidate, args.nearest, args.structure), indent=2))
+    print(json.dumps(compare(args.baseline, args.candidate, args.nearest, args.structure,
+                             args.diagnose_fallback), indent=2))
