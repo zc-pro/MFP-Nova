@@ -11,17 +11,21 @@ from evaluate_fine39_fixed_fusion import summarize
 
 def fallback_diagnostics(a, b, base, other, y, strata):
     """Cross the empty-row mask and candidate ranking without fitting a rule."""
-    empty, chosen, raw, final = [], [], [], []
+    empty, chosen, raw, final, rankings = [], [], [], [], []
     for z, report in ((a, base), (b, other)):
         raw.append(z["predicted_raw"])
         final.append(z["predicted"])
         empty.append(~raw[-1].any(1))
         keys = ("theraset_logits", "aa34_logits", "latent_logits")
-        t = np.asarray(report["branch_thresholds"])
-        offset = np.log(t / (1 - t)).astype(np.float32)
-        limit = np.log((1 - 1e-6) / 1e-6)
-        fused = (np.clip(np.stack([z[k] for k in keys]), -limit, limit) -
-                 offset[:, None, None]).mean(0)
+        if "fusion_logits" in z:
+            fused = z["fusion_logits"]
+        else:
+            t = np.asarray(report["branch_thresholds"])
+            offset = np.log(t / (1 - t)).astype(np.float32)
+            limit = np.log((1 - 1e-6) / 1e-6)
+            fused = (np.clip(np.stack([z[k] for k in keys]), -limit, limit) -
+                     offset[:, None, None]).mean(0)
+        rankings.append(np.argsort(-fused, axis=1, kind="stable"))
         shortlist = np.argsort(-z[keys[0]], axis=1, kind="stable")[:, :10]
         scores = np.take_along_axis(fused, shortlist, axis=1)
         priority = shortlist + y.shape[1] * (np.arange(10) >= 5)
@@ -37,9 +41,6 @@ def fallback_diagnostics(a, b, base, other, y, strata):
 
     raw_score = list(map(jac, raw))
     final_delta = jac(final[1]) - jac(final[0])
-    rankings = []
-    for z in (a, b):
-        rankings.append(np.argsort(-z["probabilities"], axis=1, kind="stable"))
     counts = [p.sum(1) for p in raw]
     positions = np.arange(y.shape[1])
     crossed = {}
@@ -55,6 +56,8 @@ def fallback_diagnostics(a, b, base, other, y, strata):
         if not subset.any():
             continue
         report[name] = {
+            "fixed_count_raw_acc_pct": {key: float(100 * score[subset].mean()) for key, score in (
+                {"baseline": raw_score[0], "candidate": raw_score[1]} | crossed).items()},
             "groups": {key: {"rows": int((mask & subset).sum()),
                              "final_delta_pp_contribution": float(100 * (final_delta * mask)[subset].mean())}
                        for key, mask in groups.items()},
@@ -198,7 +201,7 @@ if __name__ == "__main__":
     parser.add_argument("--nearest", type=Path, help="Fine39 nearest-Train Validation export")
     parser.add_argument("--structure", type=Path, help="Dataset structure_primary.npz")
     parser.add_argument("--diagnose-fallback", action="store_true",
-                        help="Cross empty-row masks and fallback rankings for original TriEvidence")
+                        help="Cross empty-row masks, per-row label counts and fusion rankings")
     args = parser.parse_args()
     print(json.dumps(compare(args.baseline, args.candidate, args.nearest, args.structure,
                              args.diagnose_fallback), indent=2))

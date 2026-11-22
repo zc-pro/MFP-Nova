@@ -494,6 +494,13 @@ def fit_candidates(args, output):
         history.append(record)
         print(json.dumps(record), flush=True)
         key = (final_acc, -zero_hits, raw_acc)
+        if args.export_first_epoch and epoch in (0, 1):
+            snapshot = output / f"epoch_{epoch}"
+            snapshot.mkdir()
+            report = diagnostics(source, validation, *val_columns, model.offsets.cpu(), "val",
+                                 snapshot, fused_logits=fused)
+            report.update(epoch=epoch, candidate_mode=args.candidate_mode)
+            write_json(snapshot / "results.json", report)
         if best is None or key > best[0]:
             best = key, epoch, fused, {k: v.detach().cpu().clone() for k, v in head.state_dict().items()}
 
@@ -628,6 +635,8 @@ def main():
     candidate.add_argument("--max-delta", type=float, default=1.)
     candidate.add_argument("--probe-memory", action="store_true",
                            help="Measure fixed-branch forward and candidate backward on long Train batches")
+    candidate.add_argument("--export-first-epoch", action="store_true",
+                           help="Export per-row Validation scores before and after the first epoch")
     score = commands.add_parser("evaluate", help="Evaluate a packed checkpoint with its saved cutoff")
     score.add_argument("checkpoint", type=Path)
     score.add_argument("--split", choices=("val", "test"), default="val")
