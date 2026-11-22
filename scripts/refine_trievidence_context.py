@@ -21,25 +21,31 @@ def project(adapter, state, mask):
     return adapter(state) * mask[..., None], mask
 
 
-def shared_context(encoder, batch, layer):
+def shared_context(encoder, batch, layer, mix=None):
     if layer is None:
         final, mask = encoder(batch)
         return final, mask, final
     final, mask, residues = encoder(batch, return_residue_layer=layer)
     # Keep the final chemistry token identical in every arm.
+    if mix is not None:
+        residues = torch.lerp(final[:, :-1], residues, mix)
     return final, mask, torch.cat([residues, final[:, -1:]], dim=1)
 
 
-def fit_epoch(model, adapter, loader, optimizer, device, phase, sequence_layer):
+def fit_epoch(model, adapter, loader, optimizer, device, phase, sequence_layer, mix=None):
     adapter.train()
     total, count = 0., 0
     for step, batch in enumerate(loader, 1):
         batch = to_device(batch, device)
         with torch.no_grad():
-            _, mask, state = shared_context(model.helixset.sequence, batch, sequence_layer)
+            final, mask, state = shared_context(model.helixset.sequence, batch, sequence_layer)
             target_context = model.theraset.encode_context(batch)
             if phase == "scores":
                 target_logits = model.theraset(batch, sequence_context=target_context)["logits"]
+        if mix is not None:
+            # The two source states are frozen, but the interpolation must carry gradients.
+            residues = torch.lerp(final[:, :-1], state[:, :-1], mix)
+            state = torch.cat([residues, final[:, -1:]], dim=1)
         context = project(adapter, state, mask)
         if phase == "context":
             errors = (context[0] - target_context[0]).square().mean(-1)
@@ -53,6 +59,9 @@ def fit_epoch(model, adapter, loader, optimizer, device, phase, sequence_layer):
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
+        if mix is not None:
+            with torch.no_grad():
+                mix.clamp_(0., 1.)
         total += float(loss.detach()) * len(batch["y"])
         count += len(batch["y"])
         if step == 1 or step % 256 == 0 or step == len(loader):
@@ -88,6 +97,16 @@ def run(args):
     helix_dim = model.helixset.sequence.plm.out_features
     thera_dim = model.theraset.sequence.plm.out_features
     adapter = nn.Linear(helix_dim, thera_dim).to(args.device)
+    mix = None
+    if args.mix_from:
+        if args.sequence_layer is None or args.sequence_layer >= depth or args.score_epochs:
+            raise ValueError("--mix-from needs a shallower --sequence-layer and --score-epochs 0")
+        start = torch.load(args.mix_from / "adapter.pt", map_location="cpu", weights_only=True)
+        if start.get("sequence_layer") not in (None, depth) or "mix" in start:
+            raise ValueError("Start from the unmixed final-layer context adapter")
+        adapter.load_state_dict(start["adapter_state"])
+        adapter.requires_grad_(False)
+        mix = nn.Parameter(torch.zeros(helix_dim, device=args.device))
     train_loader = batches(train, args.batch_size, shuffle=True)
     val_loader = batches(val, args.batch_size)
     args.output.mkdir(parents=True, exist_ok=False)
@@ -104,12 +123,20 @@ def run(args):
         adapter.eval()
 
         def read(batch):
-            final, mask, state = shared_context(model.helixset.sequence, batch, args.sequence_layer)
+            final, mask, state = shared_context(model.helixset.sequence, batch, args.sequence_layer, mix)
             result = model.theraset(batch, sequence_context=project(adapter, state, mask))
             latent = model.helixset(batch, sequence_context=(final, mask))["logits"]
             return result["logits"], result["direct"], latent
 
         candidate, direct, live_helix = collect(read, val_loader, args.device, progress=True)
+        if name == "mix_0":
+            with np.load(args.mix_from / "val_predictions.npz") as start_predictions:
+                np.testing.assert_array_equal(start_predictions["row_id"], source.data.rows[val.indices])
+                np.testing.assert_allclose(candidate.numpy(), start_predictions["theraset_logits"],
+                                           atol=1e-4, rtol=1e-5)
+                mixed = fuse_evidence(candidate, a, h, offsets)
+                np.testing.assert_array_equal(mixed >= 0, start_predictions["predicted_raw"])
+                np.testing.assert_array_equal(empty_top10(mixed, candidate), start_predictions["predicted"])
         out = args.output / name
         out.mkdir()
         report = diagnostics(source, val, candidate, a, h, offsets, "val", out)
@@ -117,6 +144,10 @@ def run(args):
         report.update(stage=name, training_loss=train_loss, anchor_checkpoint=str(args.checkpoint),
                       sequence_layer=depth if args.sequence_layer is None else args.sequence_layer,
                       adapter_parameters=sum(p.numel() for p in adapter.parameters()),
+                      mixing=None if mix is None else {
+                          "mean_shallow_weight": float(mix.detach().mean()),
+                          "max_shallow_weight": float(mix.detach().max()),
+                          "nonzero_channels": int(mix.detach().count_nonzero())},
                       diagnostic=dict(baseline_two_acc=float(row_jaccard(y, baseline_two).mean()),
                                       helixset_max_abs_delta=float((live_helix - h).abs().max()),
                                       retained_theraset_only=int((two & unique_t).sum()),
@@ -124,14 +155,24 @@ def run(args):
                                       total_theraset_only=int(unique_t.sum()),
                                       total_helixset_only=int(unique_h.sum())))
         write_json(out / "results.json", report)
-        torch.save({"adapter_state": adapter.state_dict(), "anchor_checkpoint": str(args.checkpoint),
-                    "sequence_layer": args.sequence_layer},
-                   out / "adapter.pt")
+        state = {"adapter_state": adapter.state_dict(), "anchor_checkpoint": str(args.checkpoint),
+                 "sequence_layer": args.sequence_layer}
+        if mix is not None:
+            state["mix"] = mix.detach().cpu()
+        torch.save(state, out / "adapter.pt")
         np.save(out / "direct_logits.npy", direct.numpy())
         history.append({"stage": name, "training_loss": train_loss,
                         "two_acc": report["arms"]["theraset_helixset"]["sample_jaccard"],
                         "fusion_acc": report["arms"]["fusion"]["sample_jaccard"]})
         write_json(args.output / "history.json", history)
+
+    if mix is not None:
+        evaluate("mix_0", None)
+        optimizer = torch.optim.Adam([mix], lr=args.lr)
+        for epoch in range(1, args.context_epochs + 1):
+            loss = fit_epoch(model, adapter, train_loader, optimizer, args.device, "context", args.sequence_layer, mix)
+            evaluate(f"mix_{epoch}", loss)
+        return
 
     for phase, epochs in (("context", args.context_epochs), ("scores", args.score_epochs)):
         if not epochs:
@@ -149,6 +190,8 @@ if __name__ == "__main__":
     parser.add_argument("--score-epochs", type=int, default=1)
     parser.add_argument("--sequence-layer", type=int,
                         help="Residue state after this many HelixSet sequence blocks; default: final")
+    parser.add_argument("--mix-from", type=Path,
+                        help="Final-layer context stage directory; freeze its adapter and fit a convex channel mix")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda:0")
