@@ -4,6 +4,7 @@ import math
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from ..research_layers import residue_distances
 from .helixset import HelixSet
@@ -94,6 +95,8 @@ class TriEvidence(nn.Module):
         self.aa34 = AA34Reader(theraset_args["statistics"], cnn_channels, cnn_dropout, reader_head)
         self.register_buffer("offsets", torch.zeros(3))
         self.reuse_input_compute = False
+        self.register_buffer("_packed_esm_weight", None, persistent=False)
+        self.register_buffer("_packed_esm_bias", None, persistent=False)
 
     def train(self, mode=True):
         super().train(mode)
@@ -101,18 +104,38 @@ class TriEvidence(nn.Module):
         self.helixset.eval()
         return self
 
+    def _can_share_esm(self):
+        first = getattr(self.theraset, "sequence", None)
+        second = self.helixset.sequence
+        return (hasattr(first, "peptide_norm") and hasattr(second, "peptide_norm")
+                and self.helixset.esm_tail is None
+                and first.plm_norm.normalized_shape == second.plm_norm.normalized_shape
+                and first.peptide_norm.normalized_shape == second.peptide_norm.normalized_shape)
+
+    @torch.no_grad()
+    def pack_esm_projections(self):
+        if not self._can_share_esm():
+            raise ValueError("Packing requires the same frozen dual-ESM inputs for both encoders")
+        first = self.theraset.sequence.plm
+        second = self.helixset.sequence.plm
+        self._packed_esm_weight = torch.cat((first.weight, second.weight))
+        self._packed_esm_bias = torch.cat((first.bias, second.bias))
+        self.reuse_input_compute = True
+
     def anchor_logits(self, batch):
         if self.reuse_input_compute:
             batch = dict(batch)
-            first = getattr(self.theraset, "sequence", None)
-            second = self.helixset.sequence
-            if (hasattr(first, "peptide_norm") and hasattr(second, "peptide_norm") and self.helixset.esm_tail is None
-                    and first.plm_norm.normalized_shape == second.plm_norm.normalized_shape
-                    and first.peptide_norm.normalized_shape == second.peptide_norm.normalized_shape):
-                batch["_trievidence_dual_esm"] = first.normalized_dual_esm(batch)
+            if self._can_share_esm():
+                batch["_trievidence_dual_esm"] = self.theraset.sequence.normalized_dual_esm(batch)
             if self.theraset.structure_evidence and self.helixset.structure_evidence:
                 structural = batch["struct_mask"] & batch["mask"]
                 batch["_trievidence_distances"] = residue_distances(batch, structural)
+            if self._packed_esm_weight is not None and not self.training:
+                projected = F.linear(batch["_trievidence_dual_esm"], self._packed_esm_weight, self._packed_esm_bias)
+                first, second = projected.split((self.theraset.sequence.plm.out_features,
+                                                 self.helixset.sequence.plm.out_features), dim=-1)
+                return (self.theraset(dict(batch, _trievidence_esm_projection=first))["logits"],
+                        self.helixset(dict(batch, _trievidence_esm_projection=second))["logits"])
         return self.theraset(batch)["logits"], self.helixset(batch)["logits"]
 
     def forward(self, batch):

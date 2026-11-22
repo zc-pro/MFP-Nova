@@ -91,6 +91,14 @@ def compare(baseline, candidate, nearest=None, structure=None, diagnose_fallback
         y, clusters = a["targets"].astype(bool), a["cluster_id"]
         logits_delta = {k: float(np.abs(a[k] - b[k]).max())
                         for k in ("theraset_logits", "aa34_logits", "latent_logits") if k in a and k in b}
+        fusion_delta = (float(np.abs(a["fusion_logits"] - b["fusion_logits"]).max())
+                        if "fusion_logits" in a and "fusion_logits" in b else None)
+        fallback_top10_changed = None
+        if "theraset_logits" in a and "theraset_logits" in b:
+            empty = ~a["predicted_raw"].any(1) | ~b["predicted_raw"].any(1)
+            first, second = (np.argsort(-z["theraset_logits"][empty], axis=1, kind="stable")[:, :10]
+                             for z in (a, b))
+            fallback_top10_changed = int(np.any(first != second, axis=1).sum())
         strata = {}
         if nearest is not None:
             if split != "val":
@@ -174,6 +182,8 @@ def compare(baseline, candidate, nearest=None, structure=None, diagnose_fallback
     return {"split": split, "rows": len(y), "metrics": metrics,
             "fallback_diagnostics": fallback,
             "branch_logits_max_abs_delta": logits_delta,
+            "fusion_logits_max_abs_delta": fusion_delta,
+            "fallback_top10_changed_rows": fallback_top10_changed,
             "branch_complementarity": complement,
             "both_acc_at_least_baseline": all(v["delta_pp"] >= 0 for v in metrics.values()),
             "parameters": [r.get("parameters") for r in (base, other)],

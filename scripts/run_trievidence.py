@@ -187,6 +187,7 @@ def diagnostics(source, dataset, theraset, aa34, latent, offsets, split, output,
                         row_id=source.data.rows[indices], ID=source.data.ids[indices],
                         cluster_id=source.data.clusters[indices], label_names=source.data.labels,
                         targets=y, split=split, probabilities=mixed.sigmoid().numpy(), threshold=.5,
+                        fusion_logits=mixed.numpy(),
                         predicted=rescued.numpy(), predicted_raw=raw.numpy(),
                         theraset_logits=theraset.numpy(), aa34_logits=aa34.numpy(), latent_logits=latent.numpy())
     report = {"model": MODEL_NAME, "split": split, "rows": len(y), "multifunction_rows": int(multi.sum()),
@@ -340,7 +341,7 @@ def evaluate(args, output):
         raise ValueError("Use the packed TriEvidence-MFP best.pt")
     source, dataset = open_data(args, args.split, checkpoint)
     if "shared_mode" in checkpoint["model_args"]:
-        if args.reuse_input_compute:
+        if args.reuse_input_compute or args.pack_esm_projections:
             raise ValueError("Input reuse applies to the original two-encoder TriEvidence")
         from mfp_nova.models.trievidence_shared import SharedTriEvidence
         model = SharedTriEvidence(**checkpoint["model_args"])
@@ -349,6 +350,8 @@ def evaluate(args, output):
         model.reuse_input_compute = args.reuse_input_compute
     model.load_state_dict(checkpoint["model_state"])
     model.to(args.device).eval()
+    if args.pack_esm_projections:
+        model.pack_esm_projections()
 
     latent_states = []
     if args.export_latent or args.export_latent_tokens:
@@ -402,6 +405,7 @@ def evaluate(args, output):
                   parameters=sum(p.numel() for p in model.parameters()),
                   inference={"batch_size": args.batch_size, "device": args.device,
                              "reuse_input_compute": getattr(model, "reuse_input_compute", False),
+                             "pack_esm_projections": args.pack_esm_projections,
                              "length_bucketed": args.length_bucketed,
                              "hardware": torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu",
                              "seconds": sum(timings), "batch_p50_seconds": float(np.median(steady)),
@@ -440,6 +444,8 @@ def main():
                        help="Batch similar lengths together and restore original row order for metrics")
     score.add_argument("--reuse-input-compute", action="store_true",
                        help="Reuse equivalent dual-ESM normalization and residue distances in TriEvidence")
+    score.add_argument("--pack-esm-projections", action="store_true",
+                       help="Reuse inputs and execute both original ESM projections in one linear operation")
     score.add_argument("--export-latent", action="store_true", help="Save pooled HelixSet Validation features")
     score.add_argument("--export-latent-tokens", action="store_true",
                        help="Save all final HelixSet latent tokens in float16 on Validation")

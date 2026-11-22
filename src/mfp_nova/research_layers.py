@@ -113,7 +113,9 @@ class SequenceEncoder(nn.Module):
             features = batch.get("_trievidence_dual_esm")
             if features is None:
                 features = self.normalized_dual_esm(batch)
-        plm = self.plm(features)
+        plm = batch.get("_trievidence_esm_projection")
+        if plm is None:
+            plm = self.plm(features)
         x = plm+torch.sigmoid(self.input_gate(torch.cat([plm, annotated], -1)))*annotated
         x = (x+self.position(torch.arange(x.shape[1], device=x.device)))*mask[..., None]
         shallow = x

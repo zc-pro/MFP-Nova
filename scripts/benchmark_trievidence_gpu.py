@@ -67,11 +67,14 @@ def benchmark(args):
         model.reuse_input_compute = True
         models.append(model.to(device).eval())
 
+    if args.pack_candidate_esm_projections:
+        models[1].pack_esm_projections()
     full, candidate = time_models(models, inputs, args.repeats)
     difference = candidate - full
     report = {"hardware": torch.cuda.get_device_name(device), "precision": "fp32", "reuse_input_compute": True,
               "batch_size": args.batch_size, "batches": args.batches, "repeats": args.repeats,
               "batch_indices": indices.tolist(),
+              "pack_candidate_esm_projections": args.pack_candidate_esm_projections,
               "paired_candidate_minus_baseline_p50_ms": float(np.median(difference)),
               "candidate_faster_pairs": int((difference < 0).sum()),
               "paired_measurements": len(full), "models": {}}
@@ -99,5 +102,7 @@ if __name__ == "__main__":
     parser.add_argument("--features", type=Path, default=Path("features/esm2_650m"))
     parser.add_argument("--peptide-features", type=Path, default=Path("features/esm2_peptide_150m"))
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--pack-candidate-esm-projections", action="store_true",
+                        help="Pack the candidate's original ESM projections before timing")
     args = parser.parse_args()
     benchmark(args)
