@@ -104,7 +104,7 @@ class SequenceEncoder(nn.Module):
     def normalized_dual_esm(self, batch):
         return torch.cat([self.plm_norm(batch["esm"]), self.peptide_norm(batch["esm_peptide"])], -1)
 
-    def forward(self, batch, return_shallow=False):
+    def forward(self, batch, return_shallow=False, return_residue_layer=None):
         mask = batch["mask"]
         chemical = self.chem(batch["residue_chem"])
         annotated = self.aa(batch["aa"])+self.d(batch["d"])+chemical
@@ -117,11 +117,16 @@ class SequenceEncoder(nn.Module):
         x = plm+torch.sigmoid(self.input_gate(torch.cat([plm, annotated], -1)))*annotated
         x = (x+self.position(torch.arange(x.shape[1], device=x.device)))*mask[..., None]
         shallow = x
-        for layer in self.layers:
+        selected = shallow if return_residue_layer == 0 else None
+        for index, layer in enumerate(self.layers, 1):
             x = layer(x, mask)
+            if index == return_residue_layer:
+                selected = x
         global_chem = masked_mean(self.chem(batch["chemical"]), batch["chemical"]!=0)
         global_token = self.global_layer(torch.cat([masked_mean(x, mask), global_chem], -1))
         result = torch.cat([x, global_token[:, None]], 1), F.pad(mask, (0, 1), value=True)
+        if return_residue_layer is not None:
+            return (*result, selected)
         return (*result, shallow) if return_shallow else result
 
 

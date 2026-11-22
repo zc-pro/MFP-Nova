@@ -21,13 +21,22 @@ def project(adapter, state, mask):
     return adapter(state) * mask[..., None], mask
 
 
-def fit_epoch(model, adapter, loader, optimizer, device, phase):
+def shared_context(encoder, batch, layer):
+    if layer is None:
+        final, mask = encoder(batch)
+        return final, mask, final
+    final, mask, residues = encoder(batch, return_residue_layer=layer)
+    # Keep the final chemistry token identical in every arm.
+    return final, mask, torch.cat([residues, final[:, -1:]], dim=1)
+
+
+def fit_epoch(model, adapter, loader, optimizer, device, phase, sequence_layer):
     adapter.train()
     total, count = 0., 0
     for step, batch in enumerate(loader, 1):
         batch = to_device(batch, device)
         with torch.no_grad():
-            state, mask = model.helixset.sequence(batch)
+            _, mask, state = shared_context(model.helixset.sequence, batch, sequence_layer)
             target_context = model.theraset.encode_context(batch)
             if phase == "scores":
                 target_logits = model.theraset(batch, sequence_context=target_context)["logits"]
@@ -58,6 +67,9 @@ def run(args):
     model.load_state_dict(checkpoint.pop("model_state"))
     if model.theraset.v5_readout is not None or not model.theraset.contextual_evidence:
         raise ValueError("Use the original packed TheraSet and HelixSet baseline")
+    depth = len(model.helixset.sequence.layers)
+    if args.sequence_layer is not None and not 0 <= args.sequence_layer <= depth:
+        raise ValueError(f"--sequence-layer must be between 0 and {depth}")
     model.to(args.device).eval().requires_grad_(False)
     source, val = open_data(args, "val", checkpoint)
     train = MultimodalPeptides(source, args.features, "train", peptide_feature_root=args.peptide_features)
@@ -92,9 +104,9 @@ def run(args):
         adapter.eval()
 
         def read(batch):
-            state, mask = model.helixset.sequence(batch)
+            final, mask, state = shared_context(model.helixset.sequence, batch, args.sequence_layer)
             result = model.theraset(batch, sequence_context=project(adapter, state, mask))
-            latent = model.helixset(batch, sequence_context=(state, mask))["logits"]
+            latent = model.helixset(batch, sequence_context=(final, mask))["logits"]
             return result["logits"], result["direct"], latent
 
         candidate, direct, live_helix = collect(read, val_loader, args.device, progress=True)
@@ -103,6 +115,7 @@ def run(args):
         report = diagnostics(source, val, candidate, a, h, offsets, "val", out)
         two = two_way(candidate)
         report.update(stage=name, training_loss=train_loss, anchor_checkpoint=str(args.checkpoint),
+                      sequence_layer=depth if args.sequence_layer is None else args.sequence_layer,
                       adapter_parameters=sum(p.numel() for p in adapter.parameters()),
                       diagnostic=dict(baseline_two_acc=float(row_jaccard(y, baseline_two).mean()),
                                       helixset_max_abs_delta=float((live_helix - h).abs().max()),
@@ -111,7 +124,8 @@ def run(args):
                                       total_theraset_only=int(unique_t.sum()),
                                       total_helixset_only=int(unique_h.sum())))
         write_json(out / "results.json", report)
-        torch.save({"adapter_state": adapter.state_dict(), "anchor_checkpoint": str(args.checkpoint)},
+        torch.save({"adapter_state": adapter.state_dict(), "anchor_checkpoint": str(args.checkpoint),
+                    "sequence_layer": args.sequence_layer},
                    out / "adapter.pt")
         np.save(out / "direct_logits.npy", direct.numpy())
         history.append({"stage": name, "training_loss": train_loss,
@@ -124,7 +138,7 @@ def run(args):
             continue
         optimizer = torch.optim.AdamW(adapter.parameters(), lr=args.lr if phase == "context" else args.lr / 5)
         for epoch in range(1, epochs + 1):
-            loss = fit_epoch(model, adapter, train_loader, optimizer, args.device, phase)
+            loss = fit_epoch(model, adapter, train_loader, optimizer, args.device, phase, args.sequence_layer)
             evaluate(f"{phase}_{epoch}", loss)
 
 
@@ -133,6 +147,8 @@ if __name__ == "__main__":
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("--context-epochs", type=int, default=1)
     parser.add_argument("--score-epochs", type=int, default=1)
+    parser.add_argument("--sequence-layer", type=int,
+                        help="Residue state after this many HelixSet sequence blocks; default: final")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda:0")
