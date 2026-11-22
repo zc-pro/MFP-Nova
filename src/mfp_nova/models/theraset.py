@@ -264,19 +264,25 @@ class TheraSet(nn.Module):
             from .residue_order import ResidueOrderEvidence
             self.order_evidence = ResidueOrderEvidence(statistics["support"], dim)
 
-    def encode_evidence(self, batch, maps):
-        mask = batch["mask"]
-        length = mask.shape[1]
-        motifs = [projection(h)*mask[..., None] for projection, h in zip(self.motif_projections, maps)]
+    def encode_context(self, batch):
         context_batch = batch
         if not self.chemical_evidence:
             context_batch = dict(batch, d=torch.zeros_like(batch["d"]),
                                  residue_chem=torch.zeros_like(batch["residue_chem"]),
                                  chemical=torch.zeros_like(batch["chemical"]))
-        if self.contextual_evidence:
-            context, context_mask = self.sequence(context_batch)
-            for layer in self.context_layers:
-                context = layer(context, context_mask)
+        context, mask = self.sequence(context_batch)
+        for layer in self.context_layers:
+            context = layer(context, mask)
+        return context, mask
+
+    def encode_evidence(self, batch, maps, sequence_context=None):
+        mask = batch["mask"]
+        length = mask.shape[1]
+        motifs = [projection(h)*mask[..., None] for projection, h in zip(self.motif_projections, maps)]
+        if sequence_context is not None:
+            context, context_mask = sequence_context
+        elif self.contextual_evidence:
+            context, context_mask = self.encode_context(batch)
         else:
             context = torch.zeros_like(motifs[0])
             context_mask = torch.zeros_like(mask)
@@ -309,18 +315,19 @@ class TheraSet(nn.Module):
                 reliability, residues, pairs, geometric_pairs, pair_quality, mask, source_present)
 
     def forward(self, batch, return_evidence=False, return_residues=False, return_states=False,
-                order_update=None, use_relation=True, without_view=None, return_memory=False):
+                order_update=None, use_relation=True, without_view=None, return_memory=False,
+                sequence_context=None):
         if self.b0_backbone is not None:
             logits = self.b0_backbone(batch["aa"], batch["mask"]).logits
             return {"logits": logits, "direct": logits}
         maps, pooled = self.cnn(batch)
         if self.v5_readout is not None:
-            return self.v5_readout(self.encode_evidence(batch, maps), self.global_projection(pooled),
+            return self.v5_readout(self.encode_evidence(batch, maps, sequence_context), self.global_projection(pooled),
                                    use_relation, without_view)
         direct = self.direct(pooled)
         if not self.evidence_decoder:
             return {"logits": direct, "direct": direct}
-        memory = self.encode_evidence(batch, maps)
+        memory = self.encode_evidence(batch, maps, sequence_context)
         residues, mask = memory[8], memory[-2]
         b, length = mask.shape
         prototype = self.prototype_coefficients.softmax(-1) @ self.prototype_bank

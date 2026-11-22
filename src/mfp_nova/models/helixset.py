@@ -431,7 +431,7 @@ class HelixSet(nn.Module):
     def read_latent(self, latent, sequence, sequence_mask):
         return self.latent_classifier(latent.mean(1))
 
-    def forward(self, batch, return_evidence=False):
+    def forward(self, batch, return_evidence=False, sequence_context=None):
         if self.esm_tail is not None:
             batch = dict(batch, esm=self.esm_tail(batch))
         if not self.structure_evidence:
@@ -440,7 +440,7 @@ class HelixSet(nn.Module):
             batch = dict(batch)
             batch["struct_mask"] = torch.zeros_like(batch["struct_mask"])
             batch["struct_global_mask"] = torch.zeros_like(batch["struct_global_mask"])
-        seq, seq_mask = self.sequence(batch)
+        seq, seq_mask = self.sequence(batch) if sequence_context is None else sequence_context
         prop, prop_mask = self.properties(batch)
         mask = batch["mask"]
         if not self.direct_only:
