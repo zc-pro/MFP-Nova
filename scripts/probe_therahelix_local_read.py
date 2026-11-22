@@ -51,7 +51,7 @@ class HeadUpdate(nn.Module):
 
 
 @torch.no_grad()
-def extract(model, dataset, args, teacher=None):
+def extract(model, dataset, args, teacher=None, supervision=False):
     captured = {}
 
     def capture_windows(_module, _inputs, output):
@@ -72,8 +72,12 @@ def extract(model, dataset, args, teacher=None):
                      captured["windows"].to(device="cpu", dtype=torch.float16),
                      captured["mask"].cpu(), logits, batch["y"])
             if teacher is not None:
-                maps = torch.cat(teacher.cnn.residue_maps(inputs), dim=-1)
-                entry += (maps.to(device="cpu", dtype=torch.float16), batch["mask"])
+                if supervision:
+                    prediction = teacher(inputs)
+                    entry += (prediction["direct"].float().cpu(), prediction["logits"].float().cpu())
+                else:
+                    maps = torch.cat(teacher.cnn.residue_maps(inputs), dim=-1)
+                    entry += (maps.to(device="cpu", dtype=torch.float16), batch["mask"])
             cache.append(entry)
             if step == 1 or step % 128 == 0 or step == len(loader):
                 print(f"Frozen forward {step}/{len(loader)}", flush=True)
@@ -108,6 +112,17 @@ def head_inputs(batch, device, use_cnn):
     return tuple(value.to(device) for value in (features, windows, mask, logits))
 
 
+def teacher_loss(scores, labels, direct, final, offset):
+    # Transfer positive support and actual downward revisions separately.
+    positive = (labels > 0) & (final >= offset)
+    suppressed = (labels == 0) & (direct >= offset) & (final < offset)
+    student = (scores / 2.).sigmoid()
+    target = ((final - offset) / 2.).sigmoid()
+    missed_support = (target - student).clamp_min(0.).square()
+    excess_support = (student - target).clamp_min(0.).square()
+    return (missed_support * positive + .3 * excess_support * suppressed).mean()
+
+
 def main(args):
     args.output.mkdir(parents=True, exist_ok=False)
     seed_everything(args.seed)
@@ -115,6 +130,10 @@ def main(args):
     if checkpoint["model_name"] != "therahelix" or checkpoint["track"] != "fine39":
         raise ValueError("Use the selected Fine39 TheraHelix checkpoint")
     teacher = None
+    supervision = args.teacher_weight > 0
+    if supervision and args.theraset_checkpoint is None:
+        raise ValueError("--teacher-weight requires --theraset-checkpoint")
+    teacher_offset = 0.
     if args.theraset_checkpoint:
         teacher, teacher_checkpoint = load_model(args.theraset_checkpoint, args.device)
         if (teacher_checkpoint["model_name"] != "theraset" or teacher_checkpoint["track"] != "fine39"
@@ -123,6 +142,8 @@ def main(args):
         for key in ("dataset", "chemical_vocab", "localized_terminal_chemistry"):
             if teacher_checkpoint["statistics"].get(key) != checkpoint["statistics"].get(key):
                 raise ValueError(f"Chemistry inputs differ between checkpoints: {key}")
+        np.testing.assert_array_equal(teacher_checkpoint["labels"], checkpoint["labels"])
+        teacher_offset = float(torch.tensor(teacher_checkpoint["threshold"]).logit())
     source, val = open_data(args, "val", checkpoint)
     rows = val.indices
     reference = align(args.checkpoint.with_name("best_validation.npz"), source, val)
@@ -130,7 +151,7 @@ def main(args):
     threshold = float(checkpoint["threshold"])
     offset = float(torch.tensor(threshold).logit())
     print("Extract Validation", flush=True)
-    val_cache = extract(model, val, args, teacher)
+    val_cache = extract(model, val, args, None if supervision else teacher)
     base = torch.cat([entry[3] for entry in val_cache]) - offset
     np.testing.assert_array_equal(base.numpy() >= 0, reference["probabilities"] >= threshold)
     y = source.data.y[rows].astype(bool)
@@ -152,10 +173,14 @@ def main(args):
     validate_cache(train, checkpoint["config"], checkpoint["encoder"])
     order = torch.randperm(len(train)).tolist()
     print("Extract Train", flush=True)
-    train_cache = extract(model, Subset(train, order), args, teacher)
+    train_cache = extract(model, Subset(train, order), args, teacher, supervision)
     del model, teacher
     dim = train_cache[0][1].size(-1)
-    if args.theraset_checkpoint:
+    if supervision:
+        initial = HeadUpdate(dim, y.shape[1], local=True).to(args.device)
+        control, candidate = "labels_only", "teacher_supervision"
+        heads = {control: initial, candidate: deepcopy(initial)}
+    elif args.theraset_checkpoint:
         width = max(dim, train_cache[0][5].size(-1))
         initial = HeadUpdate(dim, y.shape[1], local=True, window_width=width)
         control, candidate = "therahelix_windows", "theraset_cnn"
@@ -168,12 +193,18 @@ def main(args):
     history = []
     for epoch in range(1, args.epochs + 1):
         losses = dict.fromkeys(heads, 0.)
+        teacher_total = 0.
         for idx in torch.randperm(len(train_cache)).tolist():
             batch = train_cache[idx]
             labels = batch[4].to(args.device)
             for key, head in heads.items():
                 scores = head(*head_inputs(batch, args.device, key == "theraset_cnn"), 0.)
                 loss = observed_label_loss(scores, labels, source.statistics["labels"])
+                if key == "teacher_supervision":
+                    direct, final = (x.to(args.device) for x in batch[5:])
+                    auxiliary = teacher_loss(scores - offset, labels, direct, final, teacher_offset)
+                    loss = loss + args.teacher_weight * auxiliary
+                    teacher_total += float(auxiliary.detach()) * len(labels)
                 optimizers[key].zero_grad(set_to_none=True)
                 loss.backward()
                 optimizers[key].step()
@@ -210,10 +241,13 @@ def main(args):
                 f"{candidate}_vs_{control}_ci95_pp": paired_cluster_interval(
                     jac[candidate] - jac[control], source.data.clusters[rows][keep]),
                 "exploratory_calibrated": calibration}
-        history.append({"epoch": epoch, "loss": {k: v/len(train) for k, v in losses.items()}, "groups": metrics})
+        history.append({"epoch": epoch, "loss": {k: v/len(train) for k, v in losses.items()},
+                        "teacher_aux_loss": teacher_total / len(train) if supervision else None,
+                        "groups": metrics})
         write_json(args.output / "results.json", {"checkpoint": str(args.checkpoint), "seed": args.seed,
                    "learning_rate": args.lr, "batch_size": args.batch_size, "planned_final_epoch": args.epochs,
                    "theraset_checkpoint": str(args.theraset_checkpoint) if args.theraset_checkpoint else None,
+                   "teacher_weight": args.teacher_weight,
                    "head_parameters": {k: sum(p.numel() for p in head.parameters()) for k, head in heads.items()},
                    "history": history})
         print(f"Epoch {epoch}/{args.epochs} " + str({k: v["acc_pct"] for k, v in metrics["all"]["arms"].items()}), flush=True)
@@ -228,6 +262,8 @@ if __name__ == "__main__":
     parser.add_argument("old_predictions", type=Path, help="Original packed TriEvidence val_predictions.npz")
     parser.add_argument("--theraset-checkpoint", type=Path,
                         help="Compare equal heads reading frozen TheraHelix windows and original TheraSet CNN maps")
+    parser.add_argument("--teacher-weight", type=float, default=0.,
+                        help="Use positive weight to compare identical TheraHelix heads with and without Train teacher scores")
     parser.add_argument("--nearest", type=Path)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--batch-size", type=int, default=16)
