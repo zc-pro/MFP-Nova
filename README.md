@@ -17,6 +17,41 @@
 
 共享原始肽输入及双 ESM 缓存，分别读取强 TheraSet、独立 AA34 CNN 和 HelixSet latent-direct 的标签证据。首轮只训练 CNN，使用 Validation 校准并把三路和融合阈值保存到同一个检查点。[架构与双平台命令](docs/TriEvidence-MFP.md)
 
+### DuoEvidence · Fine39 二路精简
+
+保留 TheraSet 和 128 通道的独立 AA34 CNN，移除 HelixSet。一次 `train` 顺序训练两个随机初始化的下游模型。TheraSet 使用已有双 ESM 缓存，AA34 从序列读取 20 维残基编码和 14 维性质。两个模型各自在原始 Train 学习。推理时对两路阈值校正后的 logits 等权平均；若所有标签均低于判定线，就在 TheraSet 的前十个候选中选融合分最高的一个。输出为一个可直接加载的 `best.pt`。
+
+两条命令均在仓库根目录和已激活的 `MFP-Nova` 环境运行。TheraSet 有效 batch 为 64，AA34 的 batch 为 128。TheraSet 按原协议早停；AA34 默认 25 轮，用原始 Validation 的最终 Sample Jaccard 选择轮次与单一全局阈值。最终 `model/results.json` 同时给出原始融合 ACC（`raw_acc`）与空集补选后的 ACC（`sample_jaccard`）。随机初始化针对下游网络，两个 ESM 编码器沿用预训练特征缓存。
+
+V100（Ubuntu Bash，可改 GPU 编号和 CPU 线程数）：
+
+```bash
+run="runs/duoevidence_fresh_s42_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$run"
+gpu=4
+threads=4
+nohup env CUDA_VISIBLE_DEVICES="$gpu" OMP_NUM_THREADS="$threads" MKL_NUM_THREADS="$threads" PYTHONPATH="$PWD/src" \
+  "$CONDA_PREFIX/bin/python" -u scripts/run_duoevidence.py train --seed 42 --device cuda:0 \
+  --batch-size 64 --accumulation-steps 1 --output "$run/model" >"$run/train.log" 2>&1 </dev/null &
+echo "$! $run/train.log"
+```
+
+RTX 5070（Windows PowerShell，减小微批并累积至相同有效 batch，浮点运算与随机采样可有差别）：
+
+```powershell
+$run = "runs/duoevidence_fresh_s42_$(Get-Date -Format yyyyMMdd_HHmmss)"
+New-Item -ItemType Directory $run -ErrorAction Stop | Out-Null
+$env:PYTHONPATH = "$PWD/src"
+& "$env:CONDA_PREFIX/python.exe" -u scripts/run_duoevidence.py train --seed 42 --device cuda:0 `
+    --batch-size 16 --accumulation-steps 4 --output "$run/model" 2>&1 | Tee-Object "$run/train.log"
+```
+
+两平台均可用以下命令独立复跑该次 Validation（沿用上面的 `$run`，使用新的输出目录）。训练完成时也会自动重载检查点并执行一次完整 Validation。
+
+```text
+python scripts/run_duoevidence.py evaluate --checkpoint "$run/model/best.pt" --split val --device cuda:0 --batch-size 16 --output "$run/replay_val"
+```
+
 ### TheraSet-Bridge · 跨簇证据迁移
 
 `theraset_bridge` 复用 TheraSet 的多模态取证骨干，独立实现按簇对均衡的单向证据迁移。三组训练模式为 `off`、`align` 和 `positive`。[独立配置](configs/theraset_bridge.yaml) · [设计与训练说明](docs/XBridge-MFP.md#theraset-bridge-跨簇融合设计)
