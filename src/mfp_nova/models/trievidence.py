@@ -13,7 +13,7 @@ from .theraset import TheraSet, motif_classifier
 
 
 LOGIT_LIMIT = math.log((1 - 1e-6) / 1e-6)
-READER_HEADS = ("global", "local", "contrast")
+READER_HEADS = ("global", "local", "contrast", "dual")
 
 
 class LocalLabelReadout(nn.Module):
@@ -49,15 +49,24 @@ class AA34Reader(nn.Module):
         self.classifier = motif_classifier(4 * channels, num_labels, dropout)
         with torch.no_grad():
             self.classifier[-1].bias.copy_(prior_bias(statistics))
-        if reader_head != "global":
+        if reader_head == "dual":
+            self.review_classifier = motif_classifier(4 * channels, num_labels, dropout)
+            with torch.no_grad():
+                self.review_classifier[-1].bias.copy_(self.classifier[-1].bias)
+        elif reader_head != "global":
             with torch.random.fork_rng(devices=[]):
                 self.local = LocalLabelReadout(4 * channels, num_labels, reader_head == "contrast")
             self.local_gain = nn.Parameter(torch.full((num_labels,), .1))
 
-    def forward(self, batch):
+    def forward(self, batch, return_heads=False):
         maps = self.motifs(batch)
         pooled = maps.masked_fill(~batch["mask"][..., None], -torch.inf).amax(1)
         logits = self.classifier(pooled)
+        if hasattr(self, "review_classifier"):
+            review = self.review_classifier(pooled)
+            if return_heads:
+                return logits, review
+            return (logits + review) * .5
         if hasattr(self, "local"):
             logits = logits + self.local_gain * self.local(maps, batch["mask"])
         return logits

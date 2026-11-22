@@ -121,14 +121,30 @@ def tune_cnn_offset(y, theraset, aa34, latent, offsets):
 
 
 def pass_train(reader, loader, device, optimizer, statistics, unlabeled_weight,
-               teacher=None, teacher_offset=None, distill_weight=.5):
+               teacher=None, teacher_offset=None, distill_weight=.5, review_weight=.25):
     reader.train()
     loss_sum = 0.
     for batch in loader:
         batch = to_device(batch, device)
         optimizer.zero_grad(set_to_none=True)
-        logits = reader(batch)
-        loss = observed_label_loss(logits, batch["y"], statistics, unlabeled_weight)
+        targets = batch["y"]
+        if hasattr(reader, "review_classifier"):
+            primary, review = reader(batch, return_heads=True)
+            logits = (primary + review) * .5
+            primary_loss = observed_label_loss(primary, targets, statistics, unlabeled_weight)
+            review_loss = observed_label_loss(review, targets, statistics, unlabeled_weight)
+            if review_weight:
+                # Revisit the primary reader's strongest unrecorded candidates.
+                # The shared loss retains the original weak annotation weights.
+                candidates = primary.detach().masked_fill(targets > 0, -torch.inf)
+                values, indices = candidates.topk(min(3, targets.shape[1]), dim=1)
+                mask = torch.zeros_like(targets).scatter_(1, indices, values.isfinite().to(targets.dtype))
+                review_loss = review_loss + review_weight * observed_label_loss(
+                    review, targets, statistics, unlabeled_weight, mask=mask)
+            loss = (primary_loss + review_loss) * .5
+        else:
+            logits = reader(batch)
+            loss = observed_label_loss(logits, targets, statistics, unlabeled_weight)
         if teacher is not None and distill_weight > 0:
             with torch.no_grad():
                 target = teacher(batch)
@@ -212,7 +228,8 @@ def fit_aa34(args, reader, source, backbone, val_backbone, a, h, offsets, teache
     for epoch in range(1, args.epochs + 1):
         tick = time.perf_counter()
         loss = pass_train(reader, train_loader, args.device, optimizer, stats, args.unlabeled_weight,
-                          teacher, offsets[1].to(args.device), getattr(args, "distill_weight", .5))
+                          teacher, offsets[1].to(args.device), getattr(args, "distill_weight", .5),
+                          args.review_weight)
         schedule.step()
         reader.eval()
         b, = collect(lambda batch: (reader(batch),), val_loader, args.device)
@@ -280,6 +297,7 @@ def train(args, output):
     report = diagnostics(source, validation, a, b, h, chosen, "val", output)
     report.update(best_epoch=epoch, anchors=origin, history=history, train_rows=len(backbone),
                   source_reader=str(args.reader) if args.reader else None, reader_head=args.reader_head,
+                  review_weight=args.review_weight if args.reader_head == "dual" and not args.reader else None,
                   seed=args.seed, elapsed_seconds=time.perf_counter() - started,
                   cnn_parameters=sum(p.numel() for p in model.aa34.parameters()),
                   total_parameters=sum(p.numel() for p in model.parameters()),
@@ -318,6 +336,7 @@ def train_cached(args, output):
     chosen, b, epoch, history = fit_aa34(args, reader, source, backbone, validation, a, h, offsets, teacher)
     torch.save({"model_state": reader.state_dict(), "offsets": chosen, "epoch": epoch, "channels": args.channels,
                 "reader_head": args.reader_head,
+                "review_weight": args.review_weight if args.reader_head == "dual" else None,
                 "labels": source.data.labels, "dataset": source.statistics["dataset"]}, output / "reader.pt")
     report = diagnostics(source, validation, a, b, h, chosen, "val", output)
     report.update(best_epoch=epoch, history=history, train_rows=len(backbone), seed=args.seed,
@@ -329,6 +348,7 @@ def train_cached(args, output):
                   distill_weight=args.distill_weight if teacher is not None else None,
                   selection="fixed_final_epoch_and_teacher_offset" if teacher is not None else "validation_raw",
                   reader_head=args.reader_head,
+                  review_weight=args.review_weight if args.reader_head == "dual" else None,
                   learning_rate=args.learning_rate, unlabeled_weight=args.unlabeled_weight,
                   dataset=source.statistics["dataset"],
                   git_commit=subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip())
@@ -437,6 +457,8 @@ def main():
         command.add_argument("--channels", type=int, default=128)
         command.add_argument("--dropout", type=float, default=.2)
         command.add_argument("--reader-head", choices=READER_HEADS, default="global")
+        command.add_argument("--review-weight", type=float, default=.25,
+                             help="Dual AA34 auxiliary loss weight on high-scoring unrecorded labels; 0 uses equal supervision")
     score = commands.add_parser("evaluate", help="Evaluate a packed checkpoint with its saved cutoff")
     score.add_argument("checkpoint", type=Path)
     score.add_argument("--split", choices=("val", "test"), default="val")
