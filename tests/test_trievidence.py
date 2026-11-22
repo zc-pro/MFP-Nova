@@ -1,5 +1,6 @@
 """Check HelixSet exit parity and the packed train/evaluate path."""
 
+import json
 import sys
 from pathlib import Path
 
@@ -145,6 +146,21 @@ def test_packed_checkpoint_replays_validation_after_training(tmp_path, monkeypat
             np.testing.assert_array_equal(before[key], after[key])
     if reader_head == "global":
         import runpy
+
+        for mode in ("scores", "local"):
+            candidate, replay = tmp_path / f"candidate_{mode}", tmp_path / f"candidate_{mode}_evaluate"
+            monkeypatch.setattr(sys, "argv", ["trievidence", "fit-candidates", str(packed / "best.pt"), *data_args,
+                                             "--candidate-mode", mode, "--epochs", "1", "--output", str(candidate)])
+            main()
+            result = json.loads((candidate / "results.json").read_text(encoding="utf-8"))
+            assert result["history"][0]["changed_final_rows"] == 0
+            assert np.isfinite(result["history"][1]["train_loss"])
+            monkeypatch.setattr(sys, "argv", ["trievidence", "evaluate", str(candidate / "best.pt"), *data_args,
+                                             "--reuse-input-compute", "--output", str(replay)])
+            main()
+            with np.load(candidate / "val_predictions.npz") as before, np.load(replay / "val_predictions.npz") as after:
+                np.testing.assert_allclose(before["fusion_logits"], after["fusion_logits"], atol=1e-6)
+                np.testing.assert_array_equal(before["predicted"], after["predicted"])
 
         shallow = tmp_path / "shallow"
         script = Path(__file__).resolve().parents[1] / "scripts/refine_trievidence_depth.py"

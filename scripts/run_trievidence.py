@@ -13,7 +13,8 @@ from torch.utils.data import DataLoader, Subset
 
 from mfp_nova.metrics import evaluate_metrics
 from evaluate_fine39_fixed_fusion import logit, read_theraset
-from mfp_nova.models.trievidence import AA34Reader, READER_HEADS, TriEvidence, center_evidence, empty_top10, fuse_evidence
+from mfp_nova.models.trievidence import (AA34Reader, CandidateLabelReadout, READER_HEADS, TriEvidence,
+                                        center_evidence, empty_top10, fuse_evidence)
 from mfp_nova.multimodal import (BackbonePeptides, MultimodalData, MultimodalPeptides,
                                  collate_multimodal, independent_functions)
 from mfp_nova.research import to_device, validate_cache
@@ -157,10 +158,10 @@ def pass_train(reader, loader, device, optimizer, statistics, unlabeled_weight,
     return loss_sum / len(loader.dataset)
 
 
-def diagnostics(source, dataset, theraset, aa34, latent, offsets, split, output, shared=False):
+def diagnostics(source, dataset, theraset, aa34, latent, offsets, split, output, shared=False, fused_logits=None):
     y = source.data.y[dataset.indices].astype(bool)
     truth = torch.from_numpy(y)
-    mixed = fuse_evidence(theraset, aa34, latent, offsets)
+    mixed = fuse_evidence(theraset, aa34, latent, offsets) if fused_logits is None else fused_logits
     two = center_evidence(torch.stack((theraset, latent)), offsets[[0, 2]]).mean(0)
     sequence_two = center_evidence(torch.stack((theraset, aa34)), offsets[:2]).mean(0)
     third = "shared_readout" if shared else "helixset_latent"
@@ -209,6 +210,22 @@ def diagnostics(source, dataset, theraset, aa34, latent, offsets, split, output,
     report = {"model": MODEL_NAME, "split": split, "rows": len(y), "multifunction_rows": int(multi.sum()),
               "theraset_top5_misses": int(missed_top5.sum()), "third_branch": third,
               "branch_thresholds": offsets.sigmoid().tolist(), "arms": results}
+    if fused_logits is not None:
+        original = fuse_evidence(theraset, aa34, latent, offsets)
+        before = empty_top10(original, theraset)
+        before_hit, after_hit = before & truth, rescued & truth
+        unknown = torch.tensor([label.endswith("__unknown") for label in source.data.labels])
+        report["candidate_effect"] = {
+            "baseline_raw_acc": float(row_jaccard(truth, original >= 0).mean()),
+            "baseline_final_acc": float(row_jaccard(truth, before).mean()),
+            "changed_final_rows": int((before != rescued).any(1).sum()),
+            "rescued_zero_hits": int((~before_hit.any(1) & after_hit.any(1)).sum()),
+            "new_zero_hits": int((before_hit.any(1) & ~after_hit.any(1)).sum()),
+            "multifunction_gained_labels": int((after_hit & ~before_hit)[multi].sum()),
+            "multifunction_lost_labels": int((before_hit & ~after_hit)[multi].sum()),
+            "unknown_gained_labels": int((after_hit & ~before_hit)[:, unknown].sum()),
+            "unknown_lost_labels": int((before_hit & ~after_hit)[:, unknown].sum()),
+        }
     for name in ("theraset", "theraset_aa34" if shared else two_name, "fusion", "fusion_empty_top10"):
         print(f"{name} ACC={results[name]['sample_jaccard']:.4%} "
               f"ZeroHit={results[name]['zero_hit_rows']}", flush=True)
@@ -355,6 +372,145 @@ def train_cached(args, output):
     write_json(output / "results.json", report)
 
 
+def fit_candidates(args, output):
+    seed_everything(args.seed)
+    device = torch.device(args.device)
+    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
+    model_args = checkpoint["model_args"]
+    if (checkpoint["model_name"] != MODEL_NAME or checkpoint["track"] != "fine39"
+            or "helixset_args" not in model_args or model_args.get("candidate_mode")):
+        raise ValueError("Use an original packed Fine39 TriEvidence checkpoint")
+    model = TriEvidence(**model_args)
+    model.load_state_dict(checkpoint.pop("model_state"))
+    model.to(device).eval().requires_grad_(False)
+    model.reuse_input_compute = True
+
+    if args.probe_memory:
+        source, dataset = open_data(args, "train", checkpoint)
+        backbone = BackbonePeptides(source, "train", checkpoint["encoder"]["max_length"])
+        np.testing.assert_array_equal(backbone.indices, dataset.indices)
+        longest = np.argsort(-np.asarray(backbone.lengths), kind="stable")
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
+        batch = next(iter(batches(Subset(dataset, longest[:args.batch_size].tolist()), args.batch_size)))
+        batch = to_device(batch, device)
+        with torch.no_grad():
+            thera, helix = model.anchor_logits(batch)
+            aa34 = model.aa34(batch)
+        anchor_peak = torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None
+        del batch
+        head = CandidateLabelReadout(model.aa34.classifier[0].in_features, len(source.data.labels),
+                                     args.candidate_mode, args.max_delta).to(device)
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
+        batch = next(iter(batches(Subset(backbone, longest[:args.candidate_batch_size].tolist()),
+                                  args.candidate_batch_size)))
+        batch = to_device(batch, device)
+        count = len(batch["y"])
+        centered = center_evidence(torch.stack((thera, aa34, helix)), model.offsets)
+        centered = centered[:, torch.arange(count, device=device) % len(thera)]
+        with torch.no_grad():
+            maps = model.aa34.motifs(batch) if head.mode == "local" else None
+        logits, candidates = head(centered, maps, batch["mask"])
+        mask = torch.zeros_like(batch["y"]).scatter_(1, candidates, 1.)
+        loss = observed_label_loss(logits, batch["y"], source.statistics["labels"], args.unlabeled_weight, mask=mask)
+        loss.backward()
+        torch.optim.AdamW(head.parameters(), lr=args.learning_rate).step()
+        report = dict(mode=args.candidate_mode, batch_size=len(thera), candidate_batch_size=count,
+                      max_residues=batch["mask"].shape[1], loss=float(loss.detach()),
+                      anchor_peak_bytes=anchor_peak,
+                      candidate_peak_bytes=torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None)
+        write_json(output / "results.json", report)
+        print(json.dumps(report), flush=True)
+        return
+
+    def prepare(split):
+        print(f"Collect fixed evidence | split={split}", flush=True)
+        source, dataset = open_data(args, split, checkpoint)
+        backbone = BackbonePeptides(source, split, checkpoint["encoder"]["max_length"])
+        np.testing.assert_array_equal(backbone.indices, dataset.indices)
+
+        def read(batch):
+            thera, helix = model.anchor_logits(batch)
+            return thera, model.aa34(batch), helix
+
+        columns = collect(read, batches(dataset, args.batch_size), device, progress=True)
+        centered = center_evidence(torch.stack(columns), model.offsets.cpu())
+        rows = torch.as_tensor(source.data.rows[dataset.indices], device=device)
+        sorted_rows, order = rows.sort()
+        return source, backbone, columns, (sorted_rows, centered[:, order.cpu()].to(device))
+
+    source, train, _, train_scores = prepare("train")
+    _, validation, val_columns, val_scores = prepare("val")
+    head = CandidateLabelReadout(model.aa34.classifier[0].in_features, len(source.data.labels),
+                                 args.candidate_mode, args.max_delta).to(device)
+    model.candidate_readout = head
+    optimizer = torch.optim.AdamW(head.parameters(), lr=args.learning_rate)
+    train_loader = batches(train, args.candidate_batch_size, shuffle=True)
+    val_loader = batches(validation, args.candidate_batch_size)
+    stats = source.statistics["labels"]
+    labels = torch.from_numpy(source.data.y[validation.indices].astype(bool))
+    baseline = fuse_evidence(*val_columns, model.offsets.cpu())
+    baseline_raw = baseline >= 0
+    baseline_final = empty_top10(baseline, val_columns[0])
+
+    def run_batch(batch, cache):
+        row, scores = cache
+        centered = scores[:, torch.searchsorted(row, batch["row_id"])]
+        with torch.no_grad():
+            maps = model.aa34.motifs(batch) if head.mode == "local" else None
+        return head(centered, maps, batch["mask"])
+
+    history = []
+    best = None
+    for epoch in range(args.epochs + 1):
+        loss_sum = 0.
+        if epoch:
+            head.train()
+            for batch in train_loader:
+                batch = to_device(batch, device)
+                optimizer.zero_grad(set_to_none=True)
+                logits, candidates = run_batch(batch, train_scores)
+                mask = torch.zeros_like(batch["y"]).scatter_(1, candidates, 1.)
+                loss = observed_label_loss(logits, batch["y"], stats, args.unlabeled_weight, mask=mask)
+                loss.backward()
+                optimizer.step()
+                loss_sum += float(loss.detach()) * len(batch["y"])
+        head.eval()
+        fused, = collect(lambda batch: (run_batch(batch, val_scores)[0],), val_loader, device)
+        raw = fused >= 0
+        final = empty_top10(fused, val_columns[0])
+        if epoch == 0:
+            torch.testing.assert_close(fused, baseline, rtol=1e-6, atol=1e-7)
+            torch.testing.assert_close(raw, baseline_raw)
+            torch.testing.assert_close(final, baseline_final)
+        raw_acc = float(row_jaccard(labels, raw).mean())
+        final_acc = float(row_jaccard(labels, final).mean())
+        zero_hits = int((~(labels & final).any(1)).sum())
+        record = {"epoch": epoch, "train_loss": loss_sum / len(train) if epoch else None,
+                  "raw_val_acc": raw_acc, "fallback_val_acc": final_acc, "zero_hits": zero_hits,
+                  "changed_raw_rows": int((raw != baseline_raw).any(1).sum()),
+                  "changed_final_rows": int((final != baseline_final).any(1).sum())}
+        history.append(record)
+        print(json.dumps(record), flush=True)
+        key = (final_acc, -zero_hits, raw_acc)
+        if best is None or key > best[0]:
+            best = key, epoch, fused, {k: v.detach().cpu().clone() for k, v in head.state_dict().items()}
+
+    _, epoch, fused, weights = best
+    head.load_state_dict(weights)
+    report = diagnostics(source, validation, *val_columns, model.offsets.cpu(), "val", output, fused_logits=fused)
+    report.update(best_epoch=epoch, history=history, source_checkpoint=str(args.checkpoint), seed=args.seed,
+                  candidate_mode=args.candidate_mode, candidate_max_delta=args.max_delta,
+                  candidate_parameters=sum(p.numel() for p in head.parameters()),
+                  train_rows=len(train), train_predictions="full_train_checkpoint", selection="validation_fallback")
+    checkpoint.update(model_args=dict(model_args, candidate_mode=args.candidate_mode,
+                                      candidate_max_delta=args.max_delta), epoch=epoch,
+                      model_state={k: v.detach().cpu() for k, v in model.state_dict().items()})
+    torch.save(checkpoint, output / "best.pt")
+    write_json(output / "results.json", report)
+
+
 def evaluate(args, output):
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     if checkpoint["model_name"] != MODEL_NAME:
@@ -389,7 +545,8 @@ def evaluate(args, output):
 
     def read(batch):
         result = model(batch)
-        return result["theraset_logits"], result["aa34_logits"], result["latent_logits"]
+        columns = result["theraset_logits"], result["aa34_logits"], result["latent_logits"]
+        return (*columns, result["logits"]) if checkpoint["model_args"].get("candidate_mode") else columns
 
     device = torch.device(args.device)
     if device.type == "cuda":
@@ -416,9 +573,10 @@ def evaluate(args, output):
         if args.export_latent:
             pooled = states.float().mean(1) if args.export_latent_tokens else states
             np.savez_compressed(output / "val_latent_features.npz", row_id=rows, pooled_latent=pooled.numpy())
-    a, b, h = columns
+    a, b, h, *corrected = columns
     report = diagnostics(source, dataset, a, b, h, model.offsets.cpu(), args.split, output,
-                         shared="shared_mode" in checkpoint["model_args"])
+                         shared="shared_mode" in checkpoint["model_args"],
+                         fused_logits=corrected[0] if corrected else None)
     steady = timings[5:-1] or timings
     report.update(checkpoint=str(args.checkpoint), best_epoch=checkpoint["epoch"], anchors=checkpoint["anchors"],
                   latent_recovery_epoch=checkpoint.get("latent_recovery_epoch"),
@@ -459,6 +617,17 @@ def main():
         command.add_argument("--reader-head", choices=READER_HEADS, default="global")
         command.add_argument("--review-weight", type=float, default=.25,
                              help="Dual AA34 auxiliary loss weight on high-scoring unrecorded labels; 0 uses equal supervision")
+    candidate = commands.add_parser("fit-candidates", help="Fit a bounded candidate readout on frozen TriEvidence")
+    candidate.add_argument("checkpoint", type=Path)
+    candidate.add_argument("--candidate-mode", choices=("scores", "local"), required=True)
+    candidate.add_argument("--epochs", type=int, default=5)
+    candidate.add_argument("--seed", type=int, default=42)
+    candidate.add_argument("--learning-rate", type=float, default=3e-4)
+    candidate.add_argument("--unlabeled-weight", type=float, default=.3)
+    candidate.add_argument("--candidate-batch-size", type=int, default=128)
+    candidate.add_argument("--max-delta", type=float, default=1.)
+    candidate.add_argument("--probe-memory", action="store_true",
+                           help="Measure fixed-branch forward and candidate backward on long Train batches")
     score = commands.add_parser("evaluate", help="Evaluate a packed checkpoint with its saved cutoff")
     score.add_argument("checkpoint", type=Path)
     score.add_argument("--split", choices=("val", "test"), default="val")
@@ -471,17 +640,19 @@ def main():
     score.add_argument("--export-latent", action="store_true", help="Save pooled HelixSet Validation features")
     score.add_argument("--export-latent-tokens", action="store_true",
                        help="Save all final HelixSet latent tokens in float16 on Validation")
-    for command in (fit, cached, score):
+    for command in (fit, cached, candidate, score):
         command.add_argument("--data-root", type=Path, default=Path("data/therapeutic_2025"))
         command.add_argument("--device", default="cuda:0")
         command.add_argument("--output", type=Path, help="Fresh run directory")
-    for command in (fit, score):
+    for command in (fit, candidate, score):
         command.add_argument("--features", type=Path, default=Path("features/esm2_650m"))
         command.add_argument("--peptide-features", type=Path, default=Path("features/esm2_peptide_150m"))
         command.add_argument("--batch-size", type=int, default=16, help="Frozen branch inference batch size")
     args = parser.parse_args()
     if args.command != "evaluate" and args.epochs < 1:
         parser.error("--epochs must be positive")
+    if args.command == "fit-candidates" and not 0 < args.max_delta < float("inf"):
+        parser.error("--max-delta must be positive and finite")
     suffix = args.command.replace("-", "_") if args.command != "evaluate" else args.split
     output = args.output or Path("runs") / datetime.now().strftime(f"trievidence_{suffix}_%Y%m%d_%H%M%S_%f")
     output.mkdir(parents=True, exist_ok=False)
@@ -490,6 +661,8 @@ def main():
         train(args, output)
     elif args.command == "train-cached":
         train_cached(args, output)
+    elif args.command == "fit-candidates":
+        fit_candidates(args, output)
     else:
         evaluate(args, output)
 

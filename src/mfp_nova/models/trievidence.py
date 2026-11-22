@@ -58,7 +58,7 @@ class AA34Reader(nn.Module):
                 self.local = LocalLabelReadout(4 * channels, num_labels, reader_head == "contrast")
             self.local_gain = nn.Parameter(torch.full((num_labels,), .1))
 
-    def forward(self, batch, return_heads=False):
+    def forward(self, batch, return_heads=False, return_maps=False):
         maps = self.motifs(batch)
         pooled = maps.masked_fill(~batch["mask"][..., None], -torch.inf).amax(1)
         logits = self.classifier(pooled)
@@ -66,10 +66,10 @@ class AA34Reader(nn.Module):
             review = self.review_classifier(pooled)
             if return_heads:
                 return logits, review
-            return (logits + review) * .5
+            logits = (logits + review) * .5
         if hasattr(self, "local"):
             logits = logits + self.local_gain * self.local(maps, batch["mask"])
-        return logits
+        return (logits, maps) if return_maps else logits
 
 
 def center_evidence(logits, offsets):
@@ -79,6 +79,41 @@ def center_evidence(logits, offsets):
 
 def fuse_evidence(theraset, aa34, latent, offsets):
     return center_evidence(torch.stack((theraset, aa34, latent)), offsets).mean(0)
+
+
+class CandidateLabelReadout(nn.Module):
+    """Bounded corrections for the original fused Top-10 labels."""
+
+    def __init__(self, input_dim, num_labels, mode, max_delta):
+        super().__init__()
+        self.mode = mode
+        self.max_delta = max_delta
+        dim = 32
+        self.labels = nn.Embedding(num_labels, dim)
+        self.score = nn.Sequential(nn.Linear(dim + 6, dim), nn.GELU(), nn.Linear(dim, 1))
+        nn.init.zeros_(self.score[-1].weight)
+        nn.init.zeros_(self.score[-1].bias)
+        if mode == "local":
+            self.windows = nn.Sequential(nn.LayerNorm(input_dim), nn.Linear(input_dim, dim), nn.GELU())
+
+    def forward(self, centered, maps=None, mask=None):
+        fused = centered.mean(0)
+        candidates = torch.sort(fused, dim=1, descending=True, stable=True).indices[:, :10]
+        values = fused.gather(1, candidates)
+        branches = centered.permute(1, 2, 0).gather(1, candidates[..., None].expand(-1, -1, 3))
+        queries = self.labels(candidates)
+        local = values.new_zeros((*values.shape, 2))
+        if self.mode == "local":
+            response = self.windows(maps) @ queries.transpose(1, 2) / math.sqrt(queries.shape[-1])
+            valid = mask[..., None]
+            peak = response.masked_fill(~valid, -torch.inf).amax(dim=1)
+            peak = torch.where(mask.any(dim=1, keepdim=True), peak, 0)
+            mean = response.masked_fill(~valid, 0).sum(dim=1) / valid.sum(dim=1).clamp_min(1)
+            local = torch.stack((peak, peak - mean), dim=-1)
+        gap = values - values[:, :1]
+        inputs = torch.cat((queries, branches, gap[..., None], local), dim=-1)
+        delta = self.max_delta * self.score(inputs).squeeze(-1).tanh()
+        return fused.scatter(1, candidates, values + delta), candidates
 
 
 def empty_top10(logits, theraset_logits):
@@ -94,7 +129,8 @@ def empty_top10(logits, theraset_logits):
 
 
 class TriEvidence(nn.Module):
-    def __init__(self, theraset_args, helixset_args, cnn_channels=128, cnn_dropout=.2, reader_head="global"):
+    def __init__(self, theraset_args, helixset_args, cnn_channels=128, cnn_dropout=.2, reader_head="global",
+                 candidate_mode=None, candidate_max_delta=1.):
         super().__init__()
         # The frozen branches are loaded from checkpoints. Their initialization
         # should not affect the independently trained CNN's random stream.
@@ -102,6 +138,9 @@ class TriEvidence(nn.Module):
             self.theraset = TheraSet(**theraset_args).requires_grad_(False).eval()
             self.helixset = HelixSet(**helixset_args, direct_only=True).requires_grad_(False).eval()
         self.aa34 = AA34Reader(theraset_args["statistics"], cnn_channels, cnn_dropout, reader_head)
+        self.candidate_readout = (None if candidate_mode is None else CandidateLabelReadout(
+            4 * cnn_channels, len(theraset_args["statistics"]["labels"]),
+            candidate_mode, candidate_max_delta))
         self.register_buffer("offsets", torch.zeros(3))
         self.reuse_input_compute = False
         self.register_buffer("_packed_esm_weight", None, persistent=False)
@@ -149,7 +188,15 @@ class TriEvidence(nn.Module):
 
     def forward(self, batch):
         theraset, latent = self.anchor_logits(batch)
-        aa34 = self.aa34(batch)
-        logits = fuse_evidence(theraset, aa34, latent, self.offsets)
+        maps = None
+        if self.candidate_readout is not None and self.candidate_readout.mode == "local":
+            aa34, maps = self.aa34(batch, return_maps=True)
+        else:
+            aa34 = self.aa34(batch)
+        centered = center_evidence(torch.stack((theraset, aa34, latent)), self.offsets)
+        if self.candidate_readout is None:
+            logits = centered.mean(0)
+        else:
+            logits, _ = self.candidate_readout(centered, maps, batch["mask"])
         return {"logits": logits, "theraset_logits": theraset, "aa34_logits": aa34, "latent_logits": latent,
                 "predicted": empty_top10(logits, theraset)}
