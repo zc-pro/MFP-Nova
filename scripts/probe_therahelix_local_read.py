@@ -1,6 +1,7 @@
 """Compare an original-head update and a signed local update using frozen Fine39 features."""
 
 import argparse
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 
@@ -19,12 +20,13 @@ from run_trievidence import batches, open_data, row_jaccard
 
 
 class HeadUpdate(nn.Module):
-    def __init__(self, dim, labels, local=False):
+    def __init__(self, dim, labels, local=False, window_width=None):
         super().__init__()
         self.weight = nn.Parameter(torch.zeros(labels, 3 * dim))
         self.bias = nn.Parameter(torch.zeros(labels))
         if local:
-            self.windows = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, 32), nn.GELU())
+            width = window_width or dim
+            self.windows = nn.Sequential(nn.LayerNorm(width), nn.Linear(width, 32), nn.GELU())
             self.detectors = nn.Linear(32, labels, bias=False)
             self.context = nn.Linear(3 * dim, 1)
             self.correction = nn.Linear(3, 1)
@@ -35,6 +37,9 @@ class HeadUpdate(nn.Module):
         features = features.float()
         scores = base + (features * self.weight).sum(-1) + self.bias
         if hasattr(self, "windows"):
+            width = self.windows[0].normalized_shape[0]
+            if windows.size(-1) != width:
+                windows = F.pad(windows, (0, width - windows.size(-1)))
             evidence = self.detectors(self.windows(windows.float()))
             top = evidence.masked_fill(~mask[..., None], -torch.inf).topk(min(3, mask.size(1)), dim=1).values
             present = top.isfinite()
@@ -46,7 +51,7 @@ class HeadUpdate(nn.Module):
 
 
 @torch.no_grad()
-def extract(model, dataset, args):
+def extract(model, dataset, args, teacher=None):
     captured = {}
 
     def capture_windows(_module, _inputs, output):
@@ -61,10 +66,15 @@ def extract(model, dataset, args):
     try:
         loader = batches(dataset, args.batch_size)
         for step, batch in enumerate(loader, 1):
-            logits = model(to_device(batch, args.device))["logits"].float().cpu()
-            cache.append((captured["features"].to(device="cpu", dtype=torch.float16),
-                          captured["windows"].to(device="cpu", dtype=torch.float16),
-                          captured["mask"].cpu(), logits, batch["y"]))
+            inputs = to_device(batch, args.device)
+            logits = model(inputs)["logits"].float().cpu()
+            entry = (captured["features"].to(device="cpu", dtype=torch.float16),
+                     captured["windows"].to(device="cpu", dtype=torch.float16),
+                     captured["mask"].cpu(), logits, batch["y"])
+            if teacher is not None:
+                maps = torch.cat(teacher.cnn.residue_maps(inputs), dim=-1)
+                entry += (maps.to(device="cpu", dtype=torch.float16), batch["mask"])
+            cache.append(entry)
             if step == 1 or step % 128 == 0 or step == len(loader):
                 print(f"Frozen forward {step}/{len(loader)}", flush=True)
     finally:
@@ -87,8 +97,15 @@ def align(path, source, val):
 
 
 @torch.no_grad()
-def predict(head, cache, device, offset):
-    return torch.cat([head(*(x.to(device) for x in batch[:4]), offset).cpu() for batch in cache])
+def predict(head, cache, device, offset, use_cnn):
+    return torch.cat([head(*head_inputs(batch, device, use_cnn), offset).cpu() for batch in cache])
+
+
+def head_inputs(batch, device, use_cnn):
+    features, windows, mask, logits = batch[:4]
+    if use_cnn:
+        windows, mask = batch[5:]
+    return tuple(value.to(device) for value in (features, windows, mask, logits))
 
 
 def main(args):
@@ -97,6 +114,15 @@ def main(args):
     model, checkpoint = load_model(args.checkpoint, args.device)
     if checkpoint["model_name"] != "therahelix" or checkpoint["track"] != "fine39":
         raise ValueError("Use the selected Fine39 TheraHelix checkpoint")
+    teacher = None
+    if args.theraset_checkpoint:
+        teacher, teacher_checkpoint = load_model(args.theraset_checkpoint, args.device)
+        if (teacher_checkpoint["model_name"] != "theraset" or teacher_checkpoint["track"] != "fine39"
+                or teacher_checkpoint.get("best_epoch") != 53 or not teacher.cnn.chemical_evidence):
+            raise ValueError("Use the original epoch-53 Fine39 TheraSet baseline")
+        for key in ("dataset", "chemical_vocab", "localized_terminal_chemistry"):
+            if teacher_checkpoint["statistics"].get(key) != checkpoint["statistics"].get(key):
+                raise ValueError(f"Chemistry inputs differ between checkpoints: {key}")
     source, val = open_data(args, "val", checkpoint)
     rows = val.indices
     reference = align(args.checkpoint.with_name("best_validation.npz"), source, val)
@@ -104,7 +130,7 @@ def main(args):
     threshold = float(checkpoint["threshold"])
     offset = float(torch.tensor(threshold).logit())
     print("Extract Validation", flush=True)
-    val_cache = extract(model, val, args)
+    val_cache = extract(model, val, args, teacher)
     base = torch.cat([entry[3] for entry in val_cache]) - offset
     np.testing.assert_array_equal(base.numpy() >= 0, reference["probabilities"] >= threshold)
     y = source.data.y[rows].astype(bool)
@@ -126,25 +152,40 @@ def main(args):
     validate_cache(train, checkpoint["config"], checkpoint["encoder"])
     order = torch.randperm(len(train)).tolist()
     print("Extract Train", flush=True)
-    train_cache = extract(model, Subset(train, order), args)
-    del model
+    train_cache = extract(model, Subset(train, order), args, teacher)
+    del model, teacher
     dim = train_cache[0][1].size(-1)
-    heads = {"original_head": HeadUpdate(dim, y.shape[1]).to(args.device),
-             "local_residual": HeadUpdate(dim, y.shape[1], local=True).to(args.device)}
+    if args.theraset_checkpoint:
+        width = max(dim, train_cache[0][5].size(-1))
+        initial = HeadUpdate(dim, y.shape[1], local=True, window_width=width)
+        control, candidate = "therahelix_windows", "theraset_cnn"
+        heads = {control: initial.to(args.device), candidate: deepcopy(initial).to(args.device)}
+    else:
+        control, candidate = "original_head", "local_residual"
+        heads = {control: HeadUpdate(dim, y.shape[1]).to(args.device),
+                 candidate: HeadUpdate(dim, y.shape[1], local=True).to(args.device)}
     optimizers = {key: torch.optim.Adam(head.parameters(), lr=args.lr) for key, head in heads.items()}
     history = []
     for epoch in range(1, args.epochs + 1):
         losses = dict.fromkeys(heads, 0.)
         for idx in torch.randperm(len(train_cache)).tolist():
-            features, windows, mask, logits, labels = (x.to(args.device) for x in train_cache[idx])
+            batch = train_cache[idx]
+            labels = batch[4].to(args.device)
             for key, head in heads.items():
-                scores = head(features, windows, mask, logits, 0.)
+                scores = head(*head_inputs(batch, args.device, key == "theraset_cnn"), 0.)
                 loss = observed_label_loss(scores, labels, source.statistics["labels"])
                 optimizers[key].zero_grad(set_to_none=True)
                 loss.backward()
                 optimizers[key].step()
                 losses[key] += float(loss.detach()) * len(labels)
-        outputs = {key: predict(head, val_cache, args.device, offset) for key, head in heads.items()}
+        outputs = {key: predict(head, val_cache, args.device, offset, key == "theraset_cnn")
+                   for key, head in heads.items()}
+        fixed_count = {}
+        for key, scores in outputs.items():
+            keep = np.zeros_like(original)
+            ranks = np.argsort(-scores.numpy(), axis=1, kind="stable")
+            np.put_along_axis(keep, ranks, np.arange(y.shape[1]) < original.sum(1, keepdims=True), axis=1)
+            fixed_count[key] = keep
         cutoffs = {key: max(np.arange(-.5, .501, .05), key=lambda c: row_jaccard(
             torch.from_numpy(y), scores >= c).mean().item()) for key, scores in outputs.items()}
         metrics = {}
@@ -157,19 +198,23 @@ def main(args):
                 cutoff = cutoffs[key]
                 calibration[key] = {"val_fitted_logit_offset": float(cutoff),
                                     "acc_pct": 100 * row_jaccard(truth, scores[keep] >= cutoff).mean().item()}
-            metrics[group] = {"rows": int(keep.sum()), "arms": {
+            metrics[group] = {"rows": int(keep.sum()), "fixed_base_count_acc_pct": {
+                key: 100 * row_jaccard(truth, torch.from_numpy(mask[keep])).mean().item()
+                for key, mask in fixed_count.items()}, "arms": {
                 key: {"acc_pct": 100 * float(jac[key].mean()),
                       "zero_hit": int((~(mask & y[keep]).any(1)).sum()),
                       "added_unrecorded": int((mask & ~original[keep] & ~y[keep]).sum()),
                       "lost_observed": int((~mask & original[keep] & y[keep]).sum()),
                       **{name: int((mask & tracked_mask[keep]).sum()) for name, tracked_mask in tracked.items()}}
                 for key, mask in masks.items()},
-                "local_vs_original_head_ci95_pp": paired_cluster_interval(
-                    jac["local_residual"] - jac["original_head"], source.data.clusters[rows][keep]),
+                f"{candidate}_vs_{control}_ci95_pp": paired_cluster_interval(
+                    jac[candidate] - jac[control], source.data.clusters[rows][keep]),
                 "exploratory_calibrated": calibration}
         history.append({"epoch": epoch, "loss": {k: v/len(train) for k, v in losses.items()}, "groups": metrics})
         write_json(args.output / "results.json", {"checkpoint": str(args.checkpoint), "seed": args.seed,
                    "learning_rate": args.lr, "batch_size": args.batch_size, "planned_final_epoch": args.epochs,
+                   "theraset_checkpoint": str(args.theraset_checkpoint) if args.theraset_checkpoint else None,
+                   "head_parameters": {k: sum(p.numel() for p in head.parameters()) for k, head in heads.items()},
                    "history": history})
         print(f"Epoch {epoch}/{args.epochs} " + str({k: v["acc_pct"] for k, v in metrics["all"]["arms"].items()}), flush=True)
     torch.save({key: head.cpu().state_dict() for key, head in heads.items()}, args.output / "heads.pt")
@@ -181,6 +226,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("old_predictions", type=Path, help="Original packed TriEvidence val_predictions.npz")
+    parser.add_argument("--theraset-checkpoint", type=Path,
+                        help="Compare equal heads reading frozen TheraHelix windows and original TheraSet CNN maps")
     parser.add_argument("--nearest", type=Path)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--batch-size", type=int, default=16)
