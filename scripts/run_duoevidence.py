@@ -28,7 +28,8 @@ def decision_scores(theraset, aa34, weight, cutoff):
 
 MOMENT_MODES = ("aa34_only", "independent_moment", "aligned_moment")
 HARD_PAIR_MODES = ("hard_pair_global", "hard_pair_local")
-FIXED_MODES = (*MOMENT_MODES, "hard_pair_control", *HARD_PAIR_MODES)
+INTERACTION_MODES = ("interaction_control", "interaction_pointwise", "interaction_relative")
+FIXED_MODES = (*MOMENT_MODES, "hard_pair_control", *HARD_PAIR_MODES, *INTERACTION_MODES)
 
 
 class AA34HardPairReader(AA34Reader):
@@ -118,6 +119,33 @@ def neighbor_context(maps, mask, offsets):
     return total / valid.sum(2).clamp_min(1)[..., None]
 
 
+class AA34RelativeInteraction(AA34Reader):
+    """Matched pointwise or signed-neighborhood interactions before peak pooling."""
+
+    def __init__(self, statistics, relative):
+        super().__init__(statistics)
+        self.relative = relative
+        width = self.classifier[0].in_features
+        with torch.random.fork_rng(devices=[]):
+            self.center = nn.Linear(width, 32, bias=False)
+            self.left = nn.Linear(width, 32, bias=False)
+            self.right = nn.Linear(width, 32, bias=False)
+            self.update = nn.Linear(64, width, bias=False)
+            nn.init.zeros_(self.update.weight)
+
+    def forward(self, batch):
+        mask = batch["mask"]
+        maps = self.motifs(batch)
+        center = self.center(maps)
+        left, right = self.left(maps), self.right(maps)
+        if self.relative:
+            left = neighbor_context(left, mask, (-2, -4, -8))
+            right = neighbor_context(right, mask, (2, 4, 8))
+        interaction = torch.cat((center * left, center * right), dim=-1)
+        maps = maps + self.update(interaction).tanh()
+        return self.classifier(maps.masked_fill(~mask[..., None], -torch.inf).amax(1))
+
+
 class AA34BackboneInteraction(AA34Reader):
     def __init__(self, statistics):
         super().__init__(statistics)
@@ -188,6 +216,8 @@ class DuoEvidence(nn.Module):
             self.aa34 = AA34MomentReader(thera_args, context_mode)
         elif context_mode == "hard_pair_local":
             self.aa34 = AA34HardPairReader(statistics)
+        elif context_mode in ("interaction_pointwise", "interaction_relative"):
+            self.aa34 = AA34RelativeInteraction(statistics, context_mode == "interaction_relative")
         elif context_mode in ("pooled", "latent"):
             self.aa34 = DuoContextReader(thera_args["input_dim"], thera_args["peptide_input_dim"],
                                          statistics, context_mode)
@@ -228,7 +258,7 @@ def fit_reader(args, output, ckpt):
     model.eval()
     a, = collect(lambda batch: (model.theraset(batch)["logits"],),
                  batches(validation, args.batch_size), args.device, progress=True)
-    backbone_only = args.context_mode in ("hard_pair_control", *HARD_PAIR_MODES)
+    backbone_only = args.context_mode in ("hard_pair_control", *HARD_PAIR_MODES, *INTERACTION_MODES)
     if args.context_mode and not backbone_only:
         _, training = open_data(args, "train", ckpt)
         val = validation
