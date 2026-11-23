@@ -155,15 +155,65 @@ def screen_additions(reference, candidate, seed=42):
             "cluster_crossfit": summarize(held), "fold_scale_margin": selected}
 
 
+def two_label_diagnostics(reference, candidate):
+    with np.load(reference) as before, np.load(candidate) as after:
+        mask = before["targets"].sum(1) == 2
+        truth = before["targets"][mask].astype(bool)
+        def read(export):
+            pred = export["predicted"][mask].astype(bool)
+            scores = export["probabilities"][mask]
+            order = np.argsort(-scores, axis=1, kind="stable")
+            ranks = np.argsort(order, axis=1) + 1
+            return pred, ranks
+        old, old_ranks = read(before)
+        new, new_ranks = read(after)
+
+    lost = truth & old & ~new
+    gained = truth & new & ~old
+    added = ~truth & new & ~old
+    old_hits = (old & truth).sum(1)
+    new_hits = (new & truth).sum(1)
+    delta = new_hits / (2 + (new & ~truth).sum(1)) - old_hits / (2 + (old & ~truth).sum(1))
+    groups = {
+        "fewer_hits": new_hits < old_hits,
+        "more_hits": new_hits > old_hits,
+        "same_hits_more_unrecorded": (new_hits == old_hits) & ((new & ~truth).sum(1) > (old & ~truth).sum(1)),
+        "same_hits_fewer_unrecorded": (new_hits == old_hits) & ((new & ~truth).sum(1) < (old & ~truth).sum(1)),
+    }
+    return {
+        "rows": int(mask.sum()),
+        "hit_transitions_0_1_2": np.bincount(3 * old_hits + new_hits, minlength=9).reshape(3, 3).tolist(),
+        "lost_observed": int(lost.sum()),
+        "gained_observed": int(gained.sum()),
+        "added_unrecorded": int(added.sum()),
+        "lost_observed_candidate_rank_1_5_6_10_11plus": [
+            int((lost & (new_ranks >= lo) & (new_ranks <= hi)).sum())
+            for lo, hi in ((1, 5), (6, 10), (11, truth.shape[1]))
+        ],
+        "lost_observed_crossed_out_of_top5": int((lost & (old_ranks <= 5) & (new_ranks > 5)).sum()),
+        "lost_observed_crossed_out_of_top10": int((lost & (old_ranks <= 10) & (new_ranks > 10)).sum()),
+        "one_hit_other_observed_in_top5": [
+            int(((hits == 1) & (truth & ~pred & (ranks <= 5)).any(1)).sum())
+            for hits, pred, ranks in ((old_hits, old, old_ranks), (new_hits, new, new_ranks))
+        ],
+        "groups": {name: {"rows": int(group.sum()), "two_label_delta_contribution_pp":
+                         float(100 * delta[group].sum() / max(1, len(delta)))}
+                   for name, group in groups.items()},
+    }
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("reference", type=Path)
     parser.add_argument("candidate", type=Path)
     parser.add_argument("--screen-additions", action="store_true")
     parser.add_argument("--context-diagnostics", action="store_true")
+    parser.add_argument("--two-label-diagnostics", action="store_true")
     parser.add_argument("--nearest", type=Path, help="Optional nearest-Train similarities for context diagnostics")
     args = parser.parse_args()
     result = compare(args.reference, args.candidate)
+    if args.two_label_diagnostics:
+        result["two_label_diagnostics"] = two_label_diagnostics(args.reference, args.candidate)
     if args.screen_additions:
         result["addition_screen"] = screen_additions(args.reference, args.candidate)
     if args.context_diagnostics:
