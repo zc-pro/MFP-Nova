@@ -29,7 +29,8 @@ def decision_scores(theraset, aa34, weight, cutoff):
 MOMENT_MODES = ("aa34_only", "independent_moment", "aligned_moment")
 HARD_PAIR_MODES = ("hard_pair_global", "hard_pair_local")
 INTERACTION_MODES = ("interaction_control", "interaction_pointwise", "interaction_relative")
-FIXED_MODES = (*MOMENT_MODES, "hard_pair_control", *HARD_PAIR_MODES, *INTERACTION_MODES)
+WINDOW_MODES = ("window_control", "window_same_scale", "window_multiscale")
+FIXED_MODES = (*MOMENT_MODES, "hard_pair_control", *HARD_PAIR_MODES, *INTERACTION_MODES, *WINDOW_MODES)
 
 
 class AA34HardPairReader(AA34Reader):
@@ -117,6 +118,32 @@ def neighbor_context(maps, mask, offsets):
     valid = (neighbors == safe)[None] & mask[:, safe]
     total = maps[:, safe].masked_fill(~valid[..., None], 0).sum(2)
     return total / valid.sum(2).clamp_min(1)[..., None]
+
+
+class AA34WindowReader(AA34Reader):
+    """Add masked window summaries to the original motif peak classifier."""
+
+    def __init__(self, statistics, widths):
+        super().__init__(statistics)
+        self.widths = widths
+        with torch.random.fork_rng(devices=[]):
+            self.window_projection = nn.Linear(self.classifier[0].in_features, 96, bias=False)
+            self.window_update = nn.Linear(96, self.classifier[0].out_features, bias=False)
+            nn.init.zeros_(self.window_update.weight)
+
+    def forward(self, batch):
+        mask = batch["mask"][:, None, :]
+        maps = self.motifs(batch)
+        peaks = maps.masked_fill(~mask.transpose(1, 2), -torch.inf).amax(1)
+        projected = self.window_projection(maps).transpose(1, 2).masked_fill(~mask, 0)
+        summaries = []
+        for width, view in zip(self.widths, projected.chunk(3, dim=1)):
+            counts = torch.nn.functional.avg_pool1d(mask.float(), width, stride=1, padding=width // 2)
+            pooled = torch.nn.functional.avg_pool1d(view, width, stride=1, padding=width // 2)
+            pooled = pooled / counts.clamp_min(1 / width).to(pooled.dtype)
+            summaries.append(torch.nn.functional.gelu(pooled).masked_fill(~mask, -torch.inf).amax(2))
+        hidden = self.classifier[0](peaks) + self.window_update(torch.cat(summaries, dim=1))
+        return self.classifier[1:](hidden)
 
 
 class AA34RelativeInteraction(AA34Reader):
@@ -218,6 +245,9 @@ class DuoEvidence(nn.Module):
             self.aa34 = AA34HardPairReader(statistics)
         elif context_mode in ("interaction_pointwise", "interaction_relative"):
             self.aa34 = AA34RelativeInteraction(statistics, context_mode == "interaction_relative")
+        elif context_mode in ("window_same_scale", "window_multiscale"):
+            widths = (3, 7, 15) if context_mode == "window_multiscale" else (7, 7, 7)
+            self.aa34 = AA34WindowReader(statistics, widths)
         elif context_mode in ("pooled", "latent"):
             self.aa34 = DuoContextReader(thera_args["input_dim"], thera_args["peptide_input_dim"],
                                          statistics, context_mode)
@@ -258,7 +288,7 @@ def fit_reader(args, output, ckpt):
     model.eval()
     a, = collect(lambda batch: (model.theraset(batch)["logits"],),
                  batches(validation, args.batch_size), args.device, progress=True)
-    backbone_only = args.context_mode in ("hard_pair_control", *HARD_PAIR_MODES, *INTERACTION_MODES)
+    backbone_only = args.context_mode in ("hard_pair_control", *HARD_PAIR_MODES, *INTERACTION_MODES, *WINDOW_MODES)
     if args.context_mode and not backbone_only:
         _, training = open_data(args, "train", ckpt)
         val = validation
