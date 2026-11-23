@@ -54,6 +54,69 @@ def compare(reference, candidate):
     }
 
 
+def context_diagnostics(reference, candidate, nearest=None):
+    with np.load(reference) as before, np.load(candidate) as after:
+        y = before["targets"].astype(bool)
+        rows = before["row_id"]
+        raw = [z["predicted_raw"].astype(bool) for z in (before, after)]
+        final = [z["predicted"].astype(bool) for z in (before, after)]
+        branches = [(z["theraset_logits"], z["aa34_logits"]) for z in (before, after)]
+        thresholds = [z["offsets"].tolist() for z in (before, after)]
+        _, cluster, sizes = np.unique(before["cluster_id"], return_inverse=True, return_counts=True)
+    original_hit = (y & final[0]).any(1)
+    hard = raw[0].any(1) & ~original_hit
+    strata = {"all": np.ones(len(y), dtype=bool), "original_nonempty_zero": hard,
+              "original_nonempty_hit": raw[0].any(1) & original_hit,
+              "original_empty": ~raw[0].any(1), "multilabel_2": y.sum(1) == 2,
+              "multilabel_3plus": y.sum(1) >= 3}
+    if nearest is not None:
+        with np.load(nearest) as z:
+            order = np.argsort(z["row_id"])
+            np.testing.assert_array_equal(rows, z["row_id"][order])
+            strata["similarity_lt70"] = z["similarity"][order] < .7
+
+    def jaccard(pred):
+        return (pred & y).sum(1) / np.maximum(1, (pred | y).sum(1))
+
+    delta = jaccard(final[1]) - jaccard(final[0])
+    totals = np.bincount(cluster, weights=delta)
+    rng = np.random.default_rng(42)
+    bootstrap = []
+    for _ in range(2000):
+        sample = rng.integers(len(sizes), size=len(sizes))
+        bootstrap.append(100 * totals[sample].sum() / sizes[sample].sum())
+
+    def metrics(index, mask):
+        thera, reader = branches[index]
+        main_order = np.argsort(-thera, axis=1, kind="stable")
+        read_order = np.argsort(-reader, axis=1, kind="stable")
+        main_hit = np.take_along_axis(y, main_order, axis=1)
+        read_hit = np.take_along_axis(y, read_order, axis=1)
+        p = final[index]
+        hits = (p & y).sum(1)
+        return {
+            "raw_acc": float(jaccard(raw[index])[mask].mean()),
+            "final_acc": float(jaccard(p)[mask].mean()),
+            "empty_before_fallback": int((mask & ~raw[index].any(1)).sum()),
+            "zero_hit": int((mask & (hits == 0)).sum()),
+            "mean_labels": float(p[mask].sum(1).mean()),
+            "sample_precision": float((hits / np.maximum(1, p.sum(1)))[mask].mean()),
+            "sample_recall": float((hits / np.maximum(1, y.sum(1)))[mask].mean()),
+            "reader_top_hits": {k: int((mask & read_hit[:, :k].any(1)).sum()) for k in (1, 3, 5, 10)},
+            "reader_only_top_hits": {k: int((mask & read_hit[:, :k].any(1) & ~main_hit[:, :k].any(1)).sum())
+                                     for k in (1, 3, 5, 10)},
+            "branches_top1_agree": int((mask & (main_order[:, 0] == read_order[:, 0])).sum()),
+        }
+
+    return {
+        "paired_cluster_ci95_pp": np.quantile(bootstrap, [.025, .975]).tolist(),
+        "theraset_logits_max_abs_delta": float(np.abs(branches[1][0] - branches[0][0]).max()),
+        "thresholds": [[float(1 / (1 + np.exp(-value))) for value in offsets] for offsets in thresholds],
+        "groups": {key: {"rows": int(mask.sum()), "reference": metrics(0, mask), "candidate": metrics(1, mask)}
+                   for key, mask in strata.items() if mask.any()},
+    }
+
+
 def screen_additions(reference, candidate, seed=42):
     with np.load(reference) as before, np.load(candidate) as after:
         targets = before["targets"].astype(bool)
@@ -97,8 +160,12 @@ if __name__ == "__main__":
     parser.add_argument("reference", type=Path)
     parser.add_argument("candidate", type=Path)
     parser.add_argument("--screen-additions", action="store_true")
+    parser.add_argument("--context-diagnostics", action="store_true")
+    parser.add_argument("--nearest", type=Path, help="Optional nearest-Train similarities for context diagnostics")
     args = parser.parse_args()
     result = compare(args.reference, args.candidate)
     if args.screen_additions:
         result["addition_screen"] = screen_additions(args.reference, args.candidate)
+    if args.context_diagnostics:
+        result["context_diagnostics"] = context_diagnostics(args.reference, args.candidate, args.nearest)
     print(json.dumps(result, indent=2))
