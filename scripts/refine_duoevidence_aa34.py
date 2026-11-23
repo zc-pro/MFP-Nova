@@ -14,7 +14,7 @@ from mfp_nova.multimodal import BackbonePeptides
 from mfp_nova.research import to_device
 from mfp_nova.research_layers import observed_label_loss
 from mfp_nova.trainer import seed_everything, write_json
-from run_duoevidence import AA34PositionReadout, DuoEvidence
+from run_duoevidence import AA34FamilyReadout, AA34PositionReadout, DuoEvidence
 from run_trievidence import batches, collect, open_data, row_jaccard
 
 
@@ -30,7 +30,7 @@ def candidate_loss(thera, aa, targets, offsets):
 def run(args):
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     if (checkpoint["model_name"] != "duoevidence" or checkpoint["track"] != "fine39"
-            or checkpoint.get("aa34_readout_position")):
+            or checkpoint.get("aa34_readout_position") or checkpoint.get("aa34_family_mode")):
         raise ValueError("Use the original packed Fine39 DuoEvidence checkpoint")
     model = DuoEvidence(checkpoint["model_args"])
     model.load_state_dict(checkpoint["model_state"])
@@ -38,7 +38,7 @@ def run(args):
     model.theraset.to(args.device).eval().requires_grad_(False)
     args.output.mkdir(parents=True, exist_ok=False)
     cached = {}
-    for split in ("train", "val"):
+    for split in (("val",) if args.experiment == "family" else ("train", "val")):
         source, full = open_data(args, split, checkpoint)
         backbone = BackbonePeptides(source, split, checkpoint["encoder"]["max_length"])
         np.testing.assert_array_equal(backbone.indices, full.indices)
@@ -47,12 +47,14 @@ def run(args):
                           batches(full, args.feature_batch), args.device, progress=True)
         cached[split] = backbone, logits
     del model.theraset
-    train, train_logits = cached["train"]
     val, thera = cached["val"]
+    if args.experiment == "family":
+        train = BackbonePeptides(source, "train", checkpoint["encoder"]["max_length"])
+    else:
+        train, train_logits = cached["train"]
+        train_ids = torch.from_numpy(source.data.rows[train.indices]).long()
+        ordered_ids, positions = train_ids.sort()
     targets = torch.from_numpy(source.data.y[val.indices]).bool()
-    # Backbone samples carry their source row ID. Map it to the cached Train order.
-    train_ids = torch.from_numpy(source.data.rows[train.indices]).long()
-    ordered_ids, positions = train_ids.sort()
     train_loader = batches(train, args.batch_size, shuffle=True)
     val_loader = batches(val, args.batch_size)
 
@@ -60,30 +62,51 @@ def run(args):
         reader.eval()
         aa, = collect(lambda batch: (reader(batch),), val_loader, args.device)
         scores = center_evidence(torch.stack((thera, aa)), offsets.cpu()).mean(0)
-        return scores >= 0, empty_top10(scores, thera)
+        return scores >= 0, empty_top10(scores, thera), scores.argmax(1)
 
-    def summarize(raw, final):
+    names = source.data.labels
+    pairs = [(actual, wrong, names.index(actual), names.index(wrong)) for actual, wrong in (
+        ("antibacterial__unknown", "anti_gram_"),
+        ("antimicrobial__unknown", "anti_gram_"),
+        ("anti_gram+", "antimicrobial__unknown"),
+        ("anti_gram_", "antimicrobial__unknown"),
+        ("antifungal__unknown", "antimicrobial__unknown"),
+        ("antimicrobial__unknown", "anti_gram+"),
+    ) if actual in names and wrong in names]
+
+    def summarize(raw, final, top):
         hits = (targets & final).sum(1)
         label_count = targets.sum(1)
         recall = hits / label_count.clamp_min(1)
         groups = {"two": label_count == 2, "three_plus": label_count >= 3}
-        return {"raw_acc": float(row_jaccard(targets, raw).mean()),
+        report = {"raw_acc": float(row_jaccard(targets, raw).mean()),
                 "sample_jaccard": float(row_jaccard(targets, final).mean()),
                 "zero_hit": int((hits == 0).sum()),
                 "nonempty_zero_hit": int((raw.any(1) & (hits == 0)).sum()),
                 "group_recall": {key: float(recall[group].mean()) for key, group in groups.items() if group.any()}}
+        if args.experiment == "family":
+            hard = raw.any(1) & (hits == 0)
+            report["confusions"] = {
+                f"{actual} -> {wrong}": int((hard & targets[:, i] & (top == j)).sum())
+                for actual, wrong, i, j in pairs}
+        return report
 
-    base_raw, base = score(model.aa34.to(args.device))
+    base_raw, base, base_top = score(model.aa34.to(args.device))
     base_hit = (base & targets).any(1)
-    history = {"baseline": summarize(base_raw, base), "seed": args.seed, "lr": args.lr,
+    original_hard = base_raw.any(1) & ~base_hit
+    history = {"baseline": summarize(base_raw, base, base_top), "seed": args.seed, "lr": args.lr,
                "experiment": args.experiment, "epochs": args.epochs, "history": []}
     if args.experiment == "readout":
         arms = (("global", 0.), ("local", 0.))
+    elif args.experiment == "family":
+        arms = (("classification", 0.), ("auxiliary", 0.), ("decomposed", 0.))
+        history["family_weight"] = args.family_weight
     else:
         arms = (("classification", 0.), ("fused_ranking", args.ranking_weight))
         history["ranking_weight"] = args.ranking_weight
     for arm, weight in arms:
         readout_test = args.experiment == "readout"
+        family_test = arm in ("auxiliary", "decomposed")
         if readout_test:
             seed_everything(args.seed)
             reader = AA34PositionReadout(source.statistics["labels"], arm).to(args.device)
@@ -91,9 +114,15 @@ def run(args):
             reader.classifier.load_state_dict(model.aa34.classifier.state_dict())
             reader.motifs.requires_grad_(False)
             reader.classifier.requires_grad_(False)
-            initial_raw, initial_final = score(reader)
+            initial_raw, initial_final, _ = score(reader)
             if not torch.equal(initial_raw, base_raw) or not torch.equal(initial_final, base):
                 raise ValueError(f"{arm} readout changed the checkpoint predictions before training")
+        elif family_test:
+            seed_everything(args.seed)
+            reader = AA34FamilyReadout(source.statistics["labels"], arm).to(args.device)
+            reader.motifs.load_state_dict(model.aa34.motifs.state_dict())
+            reader.classifier.load_state_dict(model.aa34.classifier.state_dict())
+            reader.initialize_family()
         else:
             reader = copy.deepcopy(model.aa34)
         trainable = [p for p in reader.parameters() if p.requires_grad]
@@ -106,30 +135,41 @@ def run(args):
             if readout_test:
                 reader.motifs.eval()
                 reader.classifier.eval()
-            losses = torch.zeros(2, device=args.device)
+            losses = torch.zeros(3, device=args.device)
             for batch in train_loader:
-                indices = positions[torch.searchsorted(ordered_ids, batch["row_id"])]
-                fixed = train_logits[indices].to(args.device)
+                if readout_test or weight:
+                    indices = positions[torch.searchsorted(ordered_ids, batch["row_id"])]
+                    fixed = train_logits[indices].to(args.device)
                 batch = to_device(batch, args.device)
-                logits = reader(batch)
                 labels = batch["y"]
+                if family_test:
+                    logits, family = reader(batch, return_family=True)
+                    observed = (labels @ reader.family_projection > 0).to(family.dtype)
+                    weak = torch.where(observed > 0, 1., .3)
+                    family_loss = F.binary_cross_entropy_with_logits(family, observed, weight=weak)
+                else:
+                    logits = reader(batch)
+                    family_loss = logits.new_zeros(())
                 supervised = (center_evidence(torch.stack((fixed, logits)), offsets).mean(0)
                               if readout_test else logits)
                 classification = observed_label_loss(supervised, labels, source.statistics["labels"])
                 ranking = (candidate_loss(fixed, logits, labels, offsets) if weight
                            else classification.new_zeros(()))
                 optimizer.zero_grad(set_to_none=True)
-                (classification + weight * ranking).backward()
+                (classification + weight * ranking + args.family_weight * family_loss).backward()
                 optimizer.step()
-                losses += torch.stack((classification.detach(), ranking.detach())) * len(labels)
-            raw, final = score(reader)
+                losses += torch.stack((classification.detach(), ranking.detach(), family_loss.detach())) * len(labels)
+            raw, final, top = score(reader)
             hit = (final & targets).any(1)
-            classification_loss, ranking_loss = (losses.cpu() / len(train)).tolist()
-            record = dict(arm=arm, epoch=epoch, **summarize(raw, final),
+            classification_loss, ranking_loss, family_loss = (losses.cpu() / len(train)).tolist()
+            record = dict(arm=arm, epoch=epoch, **summarize(raw, final, top),
                           classification_loss=classification_loss, ranking_loss=ranking_loss,
                           zero_rescued=int((~base_hit & hit).sum()), zero_created=int((base_hit & ~hit).sum()),
+                          original_nonempty_zero_rescued=int((original_hard & hit).sum()),
                           changed_predictions=int((final != base).any(1).sum()),
                           trainable_parameters=sum(p.numel() for p in trainable))
+            if args.experiment == "family":
+                record["family_loss"] = family_loss
             history["history"].append(record)
             write_json(args.output / "results.json", history)
             print(json.dumps(record), flush=True)
@@ -138,6 +178,8 @@ def run(args):
             refined = dict(checkpoint, model_state=state, aa34_refinement=record)
             if readout_test:
                 refined["aa34_readout_position"] = arm
+            if family_test:
+                refined["aa34_family_mode"] = arm
             torch.save(refined, out / f"epoch_{epoch}.pt")
 
 
@@ -152,7 +194,8 @@ if __name__ == "__main__":
     parser.add_argument("--feature-batch", type=int, default=64)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--experiment", choices=("ranking", "readout"), default="ranking")
+    parser.add_argument("--experiment", choices=("ranking", "readout", "family"), default="ranking")
+    parser.add_argument("--family-weight", type=float, default=.02)
     parser.add_argument("--lr", type=float)
     parser.add_argument("--ranking-weight", type=float, default=.01)
     parser.add_argument("--seed", type=int, default=42)

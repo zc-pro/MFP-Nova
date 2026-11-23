@@ -12,7 +12,7 @@ from mfp_nova.cli import main as cli
 from mfp_nova.metrics import evaluate_metrics
 from mfp_nova.models.theraset import TheraSet
 from mfp_nova.models.trievidence import AA34Reader, LocalLabelReadout, center_evidence, empty_top10
-from mfp_nova.multimodal import BackbonePeptides
+from mfp_nova.multimodal import BackbonePeptides, function_projection
 from mfp_nova.trainer import seed_everything, write_json
 from run_trievidence import batches, collect, open_data, pass_train, read_anchor, row_jaccard
 
@@ -39,13 +39,46 @@ class AA34PositionReadout(AA34Reader):
         return logits + self.readout_gain * self.readout(maps, mask)
 
 
+class AA34FamilyReadout(AA34Reader):
+    def __init__(self, statistics, mode):
+        super().__init__(statistics)
+        projection = torch.tensor(function_projection(statistics["labels"], "fine39"))
+        # Only groups with multiple labels get a shared score. Singleton logits stay independent.
+        projection = projection[:, projection.sum(0) > 1]
+        self.register_buffer("family_projection", projection)
+        self.family = nn.Linear(self.classifier[-1].in_features, projection.shape[1])
+        self.mode = mode
+
+    def initialize_family(self):
+        mean = self.family_projection.T / self.family_projection.sum(0)[:, None]
+        with torch.no_grad():
+            self.family.weight.copy_(mean @ self.classifier[-1].weight)
+            self.family.bias.copy_(mean @ self.classifier[-1].bias)
+
+    def forward(self, batch, return_family=False):
+        maps = self.motifs(batch)
+        pooled = maps.masked_fill(~batch["mask"][..., None], -torch.inf).amax(1)
+        hidden = self.classifier[:-1](pooled)
+        fine = self.classifier[-1](hidden)
+        family = self.family(hidden)
+        if self.mode == "decomposed":
+            mean = (fine @ self.family_projection) / self.family_projection.sum(0)
+            fine = fine + (family - mean) @ self.family_projection.T
+        return (fine, family) if return_family else fine
+
+
 class DuoEvidence(nn.Module):
-    def __init__(self, thera_args, readout_position=None):
+    def __init__(self, thera_args, readout_position=None, family_mode=None):
         super().__init__()
         with torch.random.fork_rng(devices=[]):
             self.theraset = TheraSet(**thera_args)
-        self.aa34 = (AA34PositionReadout(thera_args["statistics"], readout_position)
-                     if readout_position else AA34Reader(thera_args["statistics"]))
+        statistics = thera_args["statistics"]
+        if readout_position:
+            self.aa34 = AA34PositionReadout(statistics, readout_position)
+        elif family_mode:
+            self.aa34 = AA34FamilyReadout(statistics, family_mode)
+        else:
+            self.aa34 = AA34Reader(statistics)
         self.register_buffer("offsets", torch.zeros(2))
 
     def forward(self, batch, decision=None):
@@ -108,7 +141,7 @@ def evaluate(args, checkpoint, split, output):
     packed = torch.load(checkpoint, map_location="cpu", weights_only=True)
     if packed["model_name"] != "duoevidence":
         raise ValueError("Expected a DuoEvidence checkpoint")
-    model = DuoEvidence(packed["model_args"], packed.get("aa34_readout_position"))
+    model = DuoEvidence(packed["model_args"], packed.get("aa34_readout_position"), packed.get("aa34_family_mode"))
     model.load_state_dict(packed["model_state"])
     model.to(args.device).eval()
     source, ds = open_data(args, split, packed)
@@ -132,6 +165,8 @@ def evaluate(args, checkpoint, split, output):
         result["decision"] = decision
     if "aa34_readout_position" in packed:
         result["aa34_readout_position"] = packed["aa34_readout_position"]
+    if "aa34_family_mode" in packed:
+        result["aa34_family_mode"] = packed["aa34_family_mode"]
     write_json(output/"results.json", result)
     np.savez_compressed(output/f"{split}_predictions.npz", row_id=source.data.rows[ds.indices],
                         cluster_id=source.data.clusters[ds.indices], label_names=source.data.labels,
