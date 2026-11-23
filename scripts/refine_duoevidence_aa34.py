@@ -38,7 +38,8 @@ def run(args):
     model.theraset.to(args.device).eval().requires_grad_(False)
     args.output.mkdir(parents=True, exist_ok=False)
     cached = {}
-    for split in (("val",) if args.experiment == "family" else ("train", "val")):
+    validation_only = args.experiment in ("family", "relative")
+    for split in (("val",) if validation_only else ("train", "val")):
         source, full = open_data(args, split, checkpoint)
         backbone = BackbonePeptides(source, split, checkpoint["encoder"]["max_length"])
         np.testing.assert_array_equal(backbone.indices, full.indices)
@@ -48,7 +49,7 @@ def run(args):
         cached[split] = backbone, logits
     del model.theraset
     val, thera = cached["val"]
-    if args.experiment == "family":
+    if validation_only:
         train = BackbonePeptides(source, "train", checkpoint["encoder"]["max_length"])
     else:
         train, train_logits = cached["train"]
@@ -84,7 +85,7 @@ def run(args):
                 "zero_hit": int((hits == 0).sum()),
                 "nonempty_zero_hit": int((raw.any(1) & (hits == 0)).sum()),
                 "group_recall": {key: float(recall[group].mean()) for key, group in groups.items() if group.any()}}
-        if args.experiment == "family":
+        if args.experiment in ("family", "relative"):
             hard = raw.any(1) & (hits == 0)
             report["confusions"] = {
                 f"{actual} -> {wrong}": int((hard & targets[:, i] & (top == j)).sum())
@@ -98,6 +99,8 @@ def run(args):
                "experiment": args.experiment, "epochs": args.epochs, "history": []}
     if args.experiment == "readout":
         arms = (("global", 0.), ("local", 0.))
+    elif args.experiment == "relative":
+        arms = (("context", 0.), ("relative", 0.))
     elif args.experiment == "family":
         arms = (("classification", 0.), ("auxiliary", 0.), ("decomposed", 0.))
         history["family_weight"] = args.family_weight
@@ -105,7 +108,7 @@ def run(args):
         arms = (("classification", 0.), ("fused_ranking", args.ranking_weight))
         history["ranking_weight"] = args.ranking_weight
     for arm, weight in arms:
-        readout_test = args.experiment == "readout"
+        readout_test = args.experiment in ("readout", "relative")
         family_test = arm in ("auxiliary", "decomposed")
         if readout_test:
             seed_everything(args.seed)
@@ -137,7 +140,7 @@ def run(args):
                 reader.classifier.eval()
             losses = torch.zeros(3, device=args.device)
             for batch in train_loader:
-                if readout_test or weight:
+                if not validation_only and (readout_test or weight):
                     indices = positions[torch.searchsorted(ordered_ids, batch["row_id"])]
                     fixed = train_logits[indices].to(args.device)
                 batch = to_device(batch, args.device)
@@ -151,7 +154,7 @@ def run(args):
                     logits = reader(batch)
                     family_loss = logits.new_zeros(())
                 supervised = (center_evidence(torch.stack((fixed, logits)), offsets).mean(0)
-                              if readout_test else logits)
+                              if args.experiment == "readout" else logits)
                 classification = observed_label_loss(supervised, labels, source.statistics["labels"])
                 ranking = (candidate_loss(fixed, logits, labels, offsets) if weight
                            else classification.new_zeros(()))
@@ -166,6 +169,11 @@ def run(args):
                           classification_loss=classification_loss, ranking_loss=ranking_loss,
                           zero_rescued=int((~base_hit & hit).sum()), zero_created=int((base_hit & ~hit).sum()),
                           original_nonempty_zero_rescued=int((original_hard & hit).sum()),
+                          original_nonempty_zero_delta_pp=float(
+                              100 * ((row_jaccard(targets, final) - row_jaccard(targets, base)) * original_hard).mean()),
+                          original_nonempty_hit_delta_pp=float(
+                              100 * ((row_jaccard(targets, final) - row_jaccard(targets, base))
+                                     * (base_raw.any(1) & base_hit)).mean()),
                           changed_predictions=int((final != base).any(1).sum()),
                           trainable_parameters=sum(p.numel() for p in trainable))
             if args.experiment == "family":
@@ -194,12 +202,12 @@ if __name__ == "__main__":
     parser.add_argument("--feature-batch", type=int, default=64)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--experiment", choices=("ranking", "readout", "family"), default="ranking")
+    parser.add_argument("--experiment", choices=("ranking", "readout", "family", "relative"), default="ranking")
     parser.add_argument("--family-weight", type=float, default=.02)
     parser.add_argument("--lr", type=float)
     parser.add_argument("--ranking-weight", type=float, default=.01)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
     if args.lr is None:
-        args.lr = 1e-3 if args.experiment == "readout" else 2e-5
+        args.lr = 1e-3 if args.experiment in ("readout", "relative") else 2e-5
     run(args)

@@ -26,7 +26,8 @@ class AA34PositionReadout(AA34Reader):
     def __init__(self, statistics, position):
         super().__init__(statistics)
         num_labels = len(statistics["labels"])
-        self.readout = LocalLabelReadout(512, num_labels, subtract_background=False)
+        width = 1536 if position in ("context", "relative") else 512
+        self.readout = LocalLabelReadout(width, num_labels, subtract_background=False)
         self.readout_gain = nn.Parameter(torch.zeros(num_labels))
         self.position = position
 
@@ -36,7 +37,26 @@ class AA34PositionReadout(AA34Reader):
         if self.position == "global":
             maps = maps.masked_fill(~mask[..., None], -torch.inf).amax(1, keepdim=True)
             mask = mask.any(1, keepdim=True)
+        elif self.position in ("context", "relative"):
+            valid = mask[..., None]
+            if self.position == "relative":
+                left, right = (neighbor_context(maps, mask, offsets) for offsets in ((-2, -4), (2, 4)))
+            else:
+                mean = maps.masked_fill(~valid, 0).sum(1, keepdim=True) / valid.sum(1, keepdim=True).clamp_min(1)
+                peak = maps.masked_fill(~valid, -torch.inf).amax(1, keepdim=True)
+                left, right = mean.expand_as(maps), peak.expand_as(maps)
+            maps = torch.cat((maps, left, right), dim=-1)
         return logits + self.readout_gain * self.readout(maps, mask)
+
+
+def neighbor_context(maps, mask, offsets):
+    """Average existing neighbors at signed offsets, ignoring boundaries and padding."""
+    positions = torch.arange(maps.shape[1], device=maps.device)
+    neighbors = positions[:, None] + positions.new_tensor(offsets)
+    safe = neighbors.clamp(0, maps.shape[1] - 1)
+    valid = (neighbors == safe)[None] & mask[:, safe]
+    total = maps[:, safe].masked_fill(~valid[..., None], 0).sum(2)
+    return total / valid.sum(2).clamp_min(1)[..., None]
 
 
 class AA34FamilyReadout(AA34Reader):
