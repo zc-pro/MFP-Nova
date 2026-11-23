@@ -11,6 +11,7 @@ from torch import nn
 from mfp_nova.cli import main as cli
 from mfp_nova.metrics import evaluate_metrics
 from mfp_nova.models.duo_reader import DuoContextReader
+from mfp_nova.models.sequence_features import FrozenFeatures
 from mfp_nova.models.theraset import TheraSet
 from mfp_nova.models.trievidence import AA34Reader, LocalLabelReadout, center_evidence, empty_top10
 from mfp_nova.multimodal import BackbonePeptides, function_projection
@@ -21,6 +22,38 @@ from run_trievidence import batches, collect, open_data, pass_train, read_anchor
 def decision_scores(theraset, aa34, weight, cutoff):
     scores = center_evidence(torch.stack((theraset, aa34)), theraset.new_zeros(2))
     return (1 - weight) * scores[0] + weight * scores[1] - cutoff
+
+
+MOMENT_MODES = ("aa34_only", "independent_moment", "aligned_moment")
+
+
+class AA34MomentReader(AA34Reader):
+    """Combine the original motif peaks with low-rank AA34 × ESM moments."""
+
+    def __init__(self, thera_args, mode):
+        super().__init__(thera_args["statistics"])
+        self.aligned = mode == "aligned_moment"
+        # Keep the original CNN initialization and minibatch RNG identical across arms.
+        with torch.random.fork_rng(devices=[]):
+            rank = 32
+            self.local_projection = nn.Linear(self.classifier[0].in_features, rank, bias=False)
+            self.context_projection = FrozenFeatures(thera_args["input_dim"], rank, thera_args["peptide_input_dim"])
+            self.to_hidden = nn.Linear(rank, self.classifier[0].out_features, bias=False)
+            nn.init.zeros_(self.to_hidden.weight)
+
+    def forward(self, batch):
+        maps = self.motifs(batch)
+        valid = batch["mask"][..., None]
+        count = valid.sum(1).clamp_min(1)
+        local = self.local_projection(maps).masked_fill(~valid, 0)
+        context = self.context_projection(batch)
+        if self.aligned:
+            moment = (local * context).sum(1) / count
+        else:
+            moment = (local.sum(1) / count) * (context.sum(1) / count)
+        peaks = maps.masked_fill(~valid, -torch.inf).amax(1)
+        hidden = self.classifier[0](peaks) + self.to_hidden(moment)
+        return self.classifier[1:](hidden)
 
 
 class AA34PositionReadout(AA34Reader):
@@ -126,7 +159,9 @@ class DuoEvidence(nn.Module):
         with torch.random.fork_rng(devices=[]):
             self.theraset = TheraSet(**thera_args)
         statistics = thera_args["statistics"]
-        if context_mode:
+        if context_mode in ("aligned_moment", "independent_moment"):
+            self.aa34 = AA34MomentReader(thera_args, context_mode)
+        elif context_mode in ("pooled", "latent"):
             self.aa34 = DuoContextReader(thera_args["input_dim"], thera_args["peptide_input_dim"],
                                          statistics, context_mode)
         elif readout_position == "pooled_supplement":
@@ -156,7 +191,13 @@ def fit_reader(args, output, ckpt):
     source, validation = open_data(args, "val", ckpt)
     seed_everything(args.seed)
     model = DuoEvidence(ckpt["model_args"], context_mode=args.context_mode).to(args.device)
-    model.theraset.load_state_dict(ckpt["model_state"])
+    fixed_protocol = args.context_mode in MOMENT_MODES
+    if fixed_protocol:
+        model.theraset.load_state_dict({k.removeprefix("theraset."): v for k, v in ckpt["model_state"].items()
+                                        if k.startswith("theraset.")})
+        fixed_offsets = ckpt["model_state"]["offsets"]
+    else:
+        model.theraset.load_state_dict(ckpt["model_state"])
     model.eval()
     a, = collect(lambda batch: (model.theraset(batch)["logits"],),
                  batches(validation, args.batch_size), args.device, progress=True)
@@ -175,7 +216,7 @@ def fit_reader(args, output, ckpt):
     y = torch.from_numpy(source.data.y[val.indices].astype(bool))
     optimizer = torch.optim.AdamW(model.aa34.parameters(), lr=3e-4, weight_decay=.01)
     schedule = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.reader_epochs)
-    cuts = torch.arange(4, 37) / 40
+    cuts = (ckpt["thresholds"][1],) if fixed_protocol else torch.arange(4, 37) / 40
     best = None
     for epoch in range(1, args.reader_epochs + 1):
         loss = pass_train(model.aa34, train, args.device, optimizer, source.statistics["labels"], .3)
@@ -185,7 +226,7 @@ def fit_reader(args, output, ckpt):
         stacked = torch.stack((a, b))
         epoch_best = None
         for cut in cuts:
-            offsets = torch.tensor([ckpt["threshold"], float(cut)]).logit()
+            offsets = fixed_offsets if fixed_protocol else torch.tensor([ckpt["threshold"], float(cut)]).logit()
             scores = center_evidence(stacked, offsets).mean(0)
             raw = scores >= 0
             pred = empty_top10(scores, a)
@@ -198,10 +239,11 @@ def fit_reader(args, output, ckpt):
         print(f"{args.context_mode or 'AA34'} {epoch}/{args.reader_epochs} loss={loss:.6f} "
               f"val={epoch_best[0][0]:.4%} best_val={best[0][0]:.4%}@{best[1]}", flush=True)
     model.aa34.load_state_dict(weights)
-    model.offsets.copy_(torch.tensor([ckpt["threshold"], best[2]]).logit())
+    model.offsets.copy_(fixed_offsets if fixed_protocol else torch.tensor([ckpt["threshold"], best[2]]).logit())
     packed = {key: ckpt[key] for key in ("config", "encoder", "statistics", "labels", "model_args", "track")}
     packed.update(model_name="duoevidence", model_state=model.cpu().state_dict(), seed=args.seed,
-                  theraset_epoch=ckpt["best_epoch"], aa34_epoch=best[1], thresholds=model.offsets.sigmoid().tolist())
+                  theraset_epoch=ckpt["theraset_epoch"] if fixed_protocol else ckpt["best_epoch"],
+                  aa34_epoch=best[1], thresholds=model.offsets.sigmoid().tolist())
     if args.context_mode:
         packed["aa34_context_mode"] = args.context_mode
     torch.save(packed, output/"best.pt")
@@ -322,8 +364,10 @@ def calibrate(predictions, output, seed):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("train", "train-reader", "evaluate", "calibrate"))
-    parser.add_argument("--checkpoint", type=Path, help="Packed model for evaluate or TheraSet anchor for train-reader")
-    parser.add_argument("--context-mode", choices=("pooled", "latent"), help="Contextual second reader for train-reader")
+    parser.add_argument("--checkpoint", type=Path, help="Packed DuoEvidence for evaluate or moment experiments; "
+                        "TheraSet anchor for pooled/latent")
+    parser.add_argument("--context-mode", choices=("pooled", "latent", *MOMENT_MODES),
+                        help="Moment experiments use a packed DuoEvidence baseline and keep its fusion thresholds")
     parser.add_argument("--decision", type=Path, help="Validation-fitted fusion weights and cutoff, for evaluate")
     parser.add_argument("--predictions", type=Path, help="Uncalibrated Validation predictions, for calibrate")
     parser.add_argument("--config", type=Path, default=Path("configs/theraset.yaml"))
@@ -366,7 +410,8 @@ def main():
         result = evaluate(args, output/"best.pt", "val", output)
         print(f"Packed replay delta={(result['sample_jaccard']-expected)*100:+.5f}pp")
     elif args.command == "train-reader":
-        expected = fit_reader(args, output, read_anchor(args.checkpoint, "theraset"))
+        anchor = "duoevidence" if args.context_mode in MOMENT_MODES else "theraset"
+        expected = fit_reader(args, output, read_anchor(args.checkpoint, anchor))
         result = evaluate(args, output/"best.pt", "val", output)
         print(f"Packed replay delta={(result['sample_jaccard']-expected)*100:+.5f}pp")
     elif args.command == "evaluate":
