@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch import nn
+from sklearn.metrics import average_precision_score
 
 from mfp_nova.cli import main as cli
 from mfp_nova.metrics import evaluate_metrics
@@ -30,7 +31,7 @@ MOMENT_MODES = ("aa34_only", "independent_moment", "aligned_moment")
 HARD_PAIR_MODES = ("hard_pair_global", "hard_pair_local")
 INTERACTION_MODES = ("interaction_control", "interaction_pointwise", "interaction_relative")
 WINDOW_MODES = ("window_control", "window_same_scale", "window_multiscale")
-FIXED_MODES = (*MOMENT_MODES, "hard_pair_control", *HARD_PAIR_MODES, *INTERACTION_MODES, *WINDOW_MODES)
+FIXED_MODES = (*MOMENT_MODES, "hard_pair_control", *HARD_PAIR_MODES, *INTERACTION_MODES, *WINDOW_MODES, "aa34_member")
 
 
 class AA34HardPairReader(AA34Reader):
@@ -288,7 +289,9 @@ def fit_reader(args, output, ckpt):
     model.eval()
     a, = collect(lambda batch: (model.theraset(batch)["logits"],),
                  batches(validation, args.batch_size), args.device, progress=True)
-    backbone_only = args.context_mode in ("hard_pair_control", *HARD_PAIR_MODES, *INTERACTION_MODES, *WINDOW_MODES)
+    standalone_selection = args.context_mode == "aa34_member"
+    backbone_only = standalone_selection or args.context_mode in ("hard_pair_control", *HARD_PAIR_MODES,
+                                                                   *INTERACTION_MODES, *WINDOW_MODES)
     if args.context_mode and not backbone_only:
         _, training = open_data(args, "train", ckpt)
         val = validation
@@ -308,6 +311,9 @@ def fit_reader(args, output, ckpt):
     auxiliary = (hard_pair_loss(args.hard_pairs, source, training, args.device, args.hard_pair_weight)
                  if args.context_mode in HARD_PAIR_MODES else None)
     best = None
+    best_standalone = None
+    if standalone_selection:
+        active = y.any(0).numpy()
     for epoch in range(1, args.reader_epochs + 1):
         loss = pass_train(model.aa34, train, args.device, optimizer, source.statistics["labels"], .3,
                           auxiliary_loss=auxiliary)
@@ -327,6 +333,13 @@ def fit_reader(args, output, ckpt):
         if best is None or epoch_best[0] > best[0]:
             best = epoch_best
             weights = {k: v.detach().cpu().clone() for k, v in model.aa34.state_dict().items()}
+        if standalone_selection:
+            ap = float(average_precision_score(y.numpy()[:, active], b.numpy()[:, active], average="macro"))
+            if best_standalone is None or ap > best_standalone[0]:
+                best_standalone = (ap, epoch_best)
+                standalone_weights = {k: v.detach().cpu().clone() for k, v in model.aa34.state_dict().items()}
+            print(f"standalone_macro_ap={ap:.6f} best={best_standalone[0]:.6f}@{best_standalone[1][1]}",
+                  flush=True)
         print(f"{args.context_mode or 'AA34'} {epoch}/{args.reader_epochs} loss={loss:.6f} "
               f"val={epoch_best[0][0]:.4%} best_val={best[0][0]:.4%}@{best[1]}", flush=True)
     model.aa34.load_state_dict(weights)
@@ -339,6 +352,12 @@ def fit_reader(args, output, ckpt):
         packed["aa34_context_mode"] = args.context_mode
     if auxiliary is not None:
         packed["hard_pair_weight"] = args.hard_pair_weight
+    if standalone_selection:
+        torch.save(packed, output / "best_fusion.pt")
+        ap, best = best_standalone
+        packed = dict(packed, aa34_epoch=best[1], aa34_selection="standalone_macro_ap", aa34_macro_ap=ap)
+        model.aa34.load_state_dict(standalone_weights)
+        packed["model_state"] = model.state_dict()
     torch.save(packed, output/"best.pt")
     return best[0][0]
 
@@ -388,6 +407,9 @@ def evaluate(args, checkpoint, split, output):
         result["aa34_family_mode"] = packed["aa34_family_mode"]
     if "aa34_context_mode" in packed:
         result["aa34_context_mode"] = packed["aa34_context_mode"]
+    if "aa34_selection" in packed:
+        result["aa34_selection"] = packed["aa34_selection"]
+        result["aa34_macro_ap"] = packed["aa34_macro_ap"]
     write_json(output/"results.json", result)
     np.savez_compressed(output/f"{split}_predictions.npz", row_id=source.data.rows[ds.indices],
                         cluster_id=source.data.clusters[ds.indices], label_names=source.data.labels,
