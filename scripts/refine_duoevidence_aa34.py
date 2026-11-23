@@ -14,7 +14,7 @@ from mfp_nova.multimodal import BackbonePeptides
 from mfp_nova.research import to_device
 from mfp_nova.research_layers import observed_label_loss
 from mfp_nova.trainer import seed_everything, write_json
-from run_duoevidence import AA34FamilyReadout, AA34PositionReadout, DuoEvidence
+from run_duoevidence import AA34BackboneInteraction, AA34FamilyReadout, AA34PositionReadout, DuoEvidence
 from run_trievidence import batches, collect, open_data, row_jaccard
 
 
@@ -38,7 +38,7 @@ def run(args):
     model.theraset.to(args.device).eval().requires_grad_(False)
     args.output.mkdir(parents=True, exist_ok=False)
     cached = {}
-    validation_only = args.experiment in ("family", "relative")
+    validation_only = args.experiment in ("family", "relative", "backbone_relative")
     for split in (("val",) if validation_only else ("train", "val")):
         source, full = open_data(args, split, checkpoint)
         backbone = BackbonePeptides(source, split, checkpoint["encoder"]["max_length"])
@@ -85,7 +85,7 @@ def run(args):
                 "zero_hit": int((hits == 0).sum()),
                 "nonempty_zero_hit": int((raw.any(1) & (hits == 0)).sum()),
                 "group_recall": {key: float(recall[group].mean()) for key, group in groups.items() if group.any()}}
-        if args.experiment in ("family", "relative"):
+        if args.experiment in ("family", "relative", "backbone_relative"):
             hard = raw.any(1) & (hits == 0)
             report["confusions"] = {
                 f"{actual} -> {wrong}": int((hard & targets[:, i] & (top == j)).sum())
@@ -101,6 +101,8 @@ def run(args):
         arms = (("global", 0.), ("local", 0.))
     elif args.experiment == "relative":
         arms = (("context", 0.), ("relative", 0.))
+    elif args.experiment == "backbone_relative":
+        arms = (("classification", 0.), ("backbone_relative", 0.))
     elif args.experiment == "family":
         arms = (("classification", 0.), ("auxiliary", 0.), ("decomposed", 0.))
         history["family_weight"] = args.family_weight
@@ -126,8 +128,19 @@ def run(args):
             reader.motifs.load_state_dict(model.aa34.motifs.state_dict())
             reader.classifier.load_state_dict(model.aa34.classifier.state_dict())
             reader.initialize_family()
+        elif arm == "backbone_relative":
+            reader = AA34BackboneInteraction(source.statistics["labels"]).to(args.device)
+            reader.motifs.load_state_dict(model.aa34.motifs.state_dict())
+            reader.classifier.load_state_dict(model.aa34.classifier.state_dict())
+            initial_raw, initial_final, _ = score(reader)
+            if not torch.equal(initial_raw, base_raw) or not torch.equal(initial_final, base):
+                raise ValueError("Backbone interaction changed predictions before training")
         else:
             reader = copy.deepcopy(model.aa34)
+        if args.experiment == "backbone_relative":
+            reader.motifs.requires_grad_(False)
+            reader.motifs.convs[-1].requires_grad_(True)
+            reader.motifs.norms[-1].requires_grad_(True)
         trainable = [p for p in reader.parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=.01)
         out = args.output / arm
@@ -186,6 +199,8 @@ def run(args):
             refined = dict(checkpoint, model_state=state, aa34_refinement=record)
             if readout_test:
                 refined["aa34_readout_position"] = arm
+            if arm == "backbone_relative":
+                refined["aa34_readout_position"] = arm
             if family_test:
                 refined["aa34_family_mode"] = arm
             torch.save(refined, out / f"epoch_{epoch}.pt")
@@ -202,7 +217,7 @@ if __name__ == "__main__":
     parser.add_argument("--feature-batch", type=int, default=64)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--experiment", choices=("ranking", "readout", "family", "relative"), default="ranking")
+    parser.add_argument("--experiment", choices=("ranking", "readout", "family", "relative", "backbone_relative"), default="ranking")
     parser.add_argument("--family-weight", type=float, default=.02)
     parser.add_argument("--lr", type=float)
     parser.add_argument("--ranking-weight", type=float, default=.01)

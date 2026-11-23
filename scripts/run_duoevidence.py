@@ -59,6 +59,22 @@ def neighbor_context(maps, mask, offsets):
     return total / valid.sum(2).clamp_min(1)[..., None]
 
 
+class AA34BackboneInteraction(AA34Reader):
+    def __init__(self, statistics):
+        super().__init__(statistics)
+        self.context = nn.Sequential(nn.Linear(1024, 32, bias=False), nn.GELU(),
+                                     nn.Linear(32, 512, bias=False))
+        nn.init.zeros_(self.context[-1].weight)
+
+    def forward(self, batch):
+        mask = batch["mask"]
+        maps = self.motifs(batch)
+        left = neighbor_context(maps, mask, (-2, -4))
+        right = neighbor_context(maps, mask, (2, 4))
+        maps = maps + maps * self.context(torch.cat((left, right), dim=-1)).tanh()
+        return self.classifier(maps.masked_fill(~mask[..., None], -torch.inf).amax(1))
+
+
 class AA34FamilyReadout(AA34Reader):
     def __init__(self, statistics, mode):
         super().__init__(statistics)
@@ -93,7 +109,9 @@ class DuoEvidence(nn.Module):
         with torch.random.fork_rng(devices=[]):
             self.theraset = TheraSet(**thera_args)
         statistics = thera_args["statistics"]
-        if readout_position:
+        if readout_position == "backbone_relative":
+            self.aa34 = AA34BackboneInteraction(statistics)
+        elif readout_position:
             self.aa34 = AA34PositionReadout(statistics, readout_position)
         elif family_mode:
             self.aa34 = AA34FamilyReadout(statistics, family_mode)
