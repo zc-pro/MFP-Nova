@@ -203,6 +203,52 @@ def two_label_diagnostics(reference, candidate):
     }
 
 
+def rank_diagnostics(reference, candidate, nearest=None):
+    with np.load(reference) as before, np.load(candidate) as after:
+        y = before["targets"].astype(bool)
+        row_ids = before["row_id"]
+        def read(export):
+            scores = (export["theraset_logits"], export["aa34_logits"], export["probabilities"])
+            orders = [np.argsort(-s, axis=1, kind="stable") for s in scores]
+            ranks = [np.argsort(order, axis=1) + 1 for order in orders]
+            return ranks, export["predicted"].astype(bool), export["predicted_raw"].astype(bool)
+        old, old_pred, old_raw = read(before)
+        new, new_pred, _ = read(after)
+
+    old_hit, new_hit = ((p & y).any(1) for p in (old_pred, new_pred))
+    best = np.where(y, np.minimum(old[0], old[1]), y.shape[1] + 1).min(1)
+    zero = ~old_hit
+    groups = {"all": np.ones(len(y), dtype=bool), "original_zero": zero,
+              "original_zero_rank6_10": zero & (best >= 6) & (best <= 10),
+              "original_zero_outside_top10": zero & (best > 10),
+              "original_zero_nonempty_same_top1": zero & old_raw.any(1) & (old[0].argmin(1) == old[1].argmin(1))}
+    if nearest is not None:
+        with np.load(nearest) as saved:
+            order = np.argsort(saved["row_id"])
+            np.testing.assert_array_equal(row_ids, saved["row_id"][order])
+            low = saved["similarity"][order] < .7
+        groups["original_zero_outside_top10_similarity_lt70"] = groups["original_zero_outside_top10"] & low
+
+    def summarize(mask):
+        result = {"rows": int(mask.sum()), "zero_rescued": int((mask & zero & new_hit).sum()),
+                  "zero_created": int((mask & old_hit & ~new_hit).sum())}
+        support = y[mask].sum(1).clip(min=1)
+        for k in (5, 10):
+            def hits(ranks):
+                thera, aa34, fused = (r[mask] <= k for r in ranks)
+                return [y[mask] & pool for pool in (aa34, thera | aa34, fused)]
+            for name, start, end in zip(("aa34", "union", "fused"), hits(old), hits(new)):
+                start_hit, end_hit = start.any(1), end.any(1)
+                result[f"{name}_top{k}"] = {
+                    "hit_rows": [int(start_hit.sum()), int(end_hit.sum())],
+                    "gained_rows": int((~start_hit & end_hit).sum()),
+                    "lost_rows": int((start_hit & ~end_hit).sum()),
+                    "sample_recall": [float((p.sum(1) / support).mean()) for p in (start, end)],
+                }
+        return result
+    return {name: summarize(mask) for name, mask in groups.items() if mask.any()}
+
+
 def zero_hit_diagnostics(reference, nearest=None):
     from mfp_nova.multimodal import function_projection
 
@@ -269,6 +315,7 @@ if __name__ == "__main__":
     parser.add_argument("--context-diagnostics", action="store_true")
     parser.add_argument("--two-label-diagnostics", action="store_true")
     parser.add_argument("--zero-hit-diagnostics", action="store_true")
+    parser.add_argument("--rank-diagnostics", action="store_true")
     parser.add_argument("--nearest", type=Path, help="Optional nearest-Train similarities for context diagnostics")
     args = parser.parse_args()
     if args.zero_hit_diagnostics:
@@ -277,6 +324,8 @@ if __name__ == "__main__":
     if args.candidate is None:
         parser.error("candidate is required for paired comparisons")
     result = compare(args.reference, args.candidate)
+    if args.rank_diagnostics:
+        result["rank_diagnostics"] = rank_diagnostics(args.reference, args.candidate, args.nearest)
     if args.two_label_diagnostics:
         result["two_label_diagnostics"] = two_label_diagnostics(args.reference, args.candidate)
     if args.screen_additions:

@@ -17,6 +17,7 @@ from mfp_nova.models.trievidence import AA34Reader, LocalLabelReadout, center_ev
 from mfp_nova.multimodal import BackbonePeptides, function_projection
 from mfp_nova.trainer import seed_everything, write_json
 from run_trievidence import batches, collect, open_data, pass_train, read_anchor, row_jaccard
+from duoevidence_hard_pairs import hard_pair_loss, prepare as prepare_hard_pairs
 
 
 def decision_scores(theraset, aa34, weight, cutoff):
@@ -25,6 +26,29 @@ def decision_scores(theraset, aa34, weight, cutoff):
 
 
 MOMENT_MODES = ("aa34_only", "independent_moment", "aligned_moment")
+HARD_PAIR_MODES = ("hard_pair_global", "hard_pair_local")
+FIXED_MODES = (*MOMENT_MODES, "hard_pair_control", *HARD_PAIR_MODES)
+
+
+class AA34HardPairReader(AA34Reader):
+    """Read label-specific residue evidence alongside the original peak score."""
+
+    def __init__(self, statistics):
+        super().__init__(statistics)
+        width = 64
+        num_labels = len(statistics["labels"])
+        with torch.random.fork_rng(devices=[]):
+            self.keys = nn.Linear(512, width, bias=False)
+            self.values = nn.Linear(512, width, bias=False)
+            self.queries = nn.Parameter(torch.randn(num_labels, width) * .02)
+            self.label_weights = nn.Parameter(torch.zeros(num_labels, width))
+
+    def forward(self, batch):
+        base, maps = super().forward(batch, return_maps=True)
+        affinity = self.keys(maps) @ self.queries.T
+        attention = (affinity / self.queries.shape[1] ** .5).masked_fill(~batch["mask"][..., None], -torch.inf)
+        regions = attention.softmax(1).transpose(1, 2) @ self.values(maps)
+        return base + (regions * self.label_weights).sum(-1)
 
 
 class AA34MomentReader(AA34Reader):
@@ -161,6 +185,8 @@ class DuoEvidence(nn.Module):
         statistics = thera_args["statistics"]
         if context_mode in ("aligned_moment", "independent_moment"):
             self.aa34 = AA34MomentReader(thera_args, context_mode)
+        elif context_mode == "hard_pair_local":
+            self.aa34 = AA34HardPairReader(statistics)
         elif context_mode in ("pooled", "latent"):
             self.aa34 = DuoContextReader(thera_args["input_dim"], thera_args["peptide_input_dim"],
                                          statistics, context_mode)
@@ -191,7 +217,7 @@ def fit_reader(args, output, ckpt):
     source, validation = open_data(args, "val", ckpt)
     seed_everything(args.seed)
     model = DuoEvidence(ckpt["model_args"], context_mode=args.context_mode).to(args.device)
-    fixed_protocol = args.context_mode in MOMENT_MODES
+    fixed_protocol = args.context_mode in FIXED_MODES
     if fixed_protocol:
         model.theraset.load_state_dict({k.removeprefix("theraset."): v for k, v in ckpt["model_state"].items()
                                         if k.startswith("theraset.")})
@@ -201,7 +227,8 @@ def fit_reader(args, output, ckpt):
     model.eval()
     a, = collect(lambda batch: (model.theraset(batch)["logits"],),
                  batches(validation, args.batch_size), args.device, progress=True)
-    if args.context_mode:
+    backbone_only = args.context_mode in ("hard_pair_control", *HARD_PAIR_MODES)
+    if args.context_mode and not backbone_only:
         _, training = open_data(args, "train", ckpt)
         val = validation
         reader_batch = args.batch_size
@@ -210,16 +237,19 @@ def fit_reader(args, output, ckpt):
         training = BackbonePeptides(source, "train", longest)
         val = BackbonePeptides(source, "val", longest)
         np.testing.assert_array_equal(val.indices, validation.indices)
-        reader_batch = 128
+        reader_batch = args.batch_size if backbone_only else 128
     train = batches(training, reader_batch, shuffle=True)
     val_loader = batches(val, reader_batch)
     y = torch.from_numpy(source.data.y[val.indices].astype(bool))
     optimizer = torch.optim.AdamW(model.aa34.parameters(), lr=3e-4, weight_decay=.01)
     schedule = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.reader_epochs)
     cuts = (ckpt["thresholds"][1],) if fixed_protocol else torch.arange(4, 37) / 40
+    auxiliary = (hard_pair_loss(args.hard_pairs, source, training, args.device, args.hard_pair_weight)
+                 if args.context_mode in HARD_PAIR_MODES else None)
     best = None
     for epoch in range(1, args.reader_epochs + 1):
-        loss = pass_train(model.aa34, train, args.device, optimizer, source.statistics["labels"], .3)
+        loss = pass_train(model.aa34, train, args.device, optimizer, source.statistics["labels"], .3,
+                          auxiliary_loss=auxiliary)
         schedule.step()
         model.eval()
         b, = collect(lambda batch: (model.aa34(batch),), val_loader, args.device)
@@ -246,6 +276,8 @@ def fit_reader(args, output, ckpt):
                   aa34_epoch=best[1], thresholds=model.offsets.sigmoid().tolist())
     if args.context_mode:
         packed["aa34_context_mode"] = args.context_mode
+    if auxiliary is not None:
+        packed["hard_pair_weight"] = args.hard_pair_weight
     torch.save(packed, output/"best.pt")
     return best[0][0]
 
@@ -363,11 +395,15 @@ def calibrate(predictions, output, seed):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("train", "train-reader", "evaluate", "calibrate"))
+    parser.add_argument("command", choices=("train", "train-reader", "evaluate", "calibrate", "prepare-hard-pairs"))
     parser.add_argument("--checkpoint", type=Path, help="Packed DuoEvidence for evaluate or moment experiments; "
                         "TheraSet anchor for pooled/latent")
-    parser.add_argument("--context-mode", choices=("pooled", "latent", *MOMENT_MODES),
-                        help="Moment experiments use a packed DuoEvidence baseline and keep its fusion thresholds")
+    parser.add_argument("--context-mode", choices=("pooled", "latent", *FIXED_MODES),
+                        help="Fixed-protocol experiments reuse a packed DuoEvidence baseline's thresholds")
+    parser.add_argument("--theraset-oof", nargs=3, type=Path, help="One full HH OOF TheraSet export per Train fold")
+    parser.add_argument("--hard-pairs", type=Path, help="Train pairs generated by prepare-hard-pairs")
+    parser.add_argument("--hard-pair-weight", type=float, default=.01)
+    parser.add_argument("--min-pair-clusters", type=int, default=3)
     parser.add_argument("--decision", type=Path, help="Validation-fitted fusion weights and cutoff, for evaluate")
     parser.add_argument("--predictions", type=Path, help="Uncalibrated Validation predictions, for calibrate")
     parser.add_argument("--config", type=Path, default=Path("configs/theraset.yaml"))
@@ -389,6 +425,10 @@ def main():
             parser.error("train-reader requires --checkpoint and --context-mode on Train/Validation")
     elif args.context_mode:
         parser.error("--context-mode requires train-reader")
+    if args.command == "prepare-hard-pairs" and (not args.checkpoint or not args.theraset_oof):
+        parser.error("prepare-hard-pairs requires --checkpoint and --theraset-oof")
+    if (args.context_mode in HARD_PAIR_MODES) != bool(args.hard_pairs):
+        parser.error("--hard-pairs is required for hard_pair_global and hard_pair_local")
     if training and (args.split != "val" or args.checkpoint or args.decision or args.predictions):
         parser.error("train starts fresh on Train/Validation")
     if args.command == "evaluate" and (not args.checkpoint or args.predictions):
@@ -410,12 +450,14 @@ def main():
         result = evaluate(args, output/"best.pt", "val", output)
         print(f"Packed replay delta={(result['sample_jaccard']-expected)*100:+.5f}pp")
     elif args.command == "train-reader":
-        anchor = "duoevidence" if args.context_mode in MOMENT_MODES else "theraset"
+        anchor = "duoevidence" if args.context_mode in FIXED_MODES else "theraset"
         expected = fit_reader(args, output, read_anchor(args.checkpoint, anchor))
         result = evaluate(args, output/"best.pt", "val", output)
         print(f"Packed replay delta={(result['sample_jaccard']-expected)*100:+.5f}pp")
     elif args.command == "evaluate":
         evaluate(args, args.checkpoint, args.split, output)
+    elif args.command == "prepare-hard-pairs":
+        prepare_hard_pairs(args, output, read_anchor(args.checkpoint, "duoevidence"))
     else:
         calibrate(args.predictions, output, args.seed)
 

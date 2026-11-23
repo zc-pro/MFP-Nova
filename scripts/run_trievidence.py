@@ -122,7 +122,8 @@ def tune_cnn_offset(y, theraset, aa34, latent, offsets):
 
 
 def pass_train(reader, loader, device, optimizer, statistics, unlabeled_weight,
-               teacher=None, teacher_offset=None, distill_weight=.5, review_weight=.25):
+               teacher=None, teacher_offset=None, distill_weight=.5, review_weight=.25,
+               auxiliary_loss=None):
     reader.train()
     loss_sum = 0.
     for batch in loader:
@@ -152,6 +153,8 @@ def pass_train(reader, loader, device, optimizer, statistics, unlabeled_weight,
                 weight = 1 + 2 * torch.exp(-(target - teacher_offset).abs())
             residual = torch.nn.functional.smooth_l1_loss(logits, target, reduction="none")
             loss = loss + distill_weight * (weight * residual).mean()
+        if auxiliary_loss is not None:
+            loss = loss + auxiliary_loss(logits, batch)
         loss.backward()
         optimizer.step()
         loss_sum += float(loss.detach()) * len(batch["y"])
