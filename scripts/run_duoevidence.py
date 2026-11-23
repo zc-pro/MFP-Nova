@@ -104,6 +104,22 @@ class AA34FamilyReadout(AA34Reader):
         return (fine, family) if return_family else fine
 
 
+class AA34PooledSupplement(AA34Reader):
+    def __init__(self, thera_args):
+        stats = thera_args["statistics"]
+        super().__init__(stats)
+        self.pooled = DuoContextReader(thera_args["input_dim"], thera_args["peptide_input_dim"],
+                                       stats, "pooled", features_only=True)
+        self.supplement = nn.Linear(128, len(stats["labels"]))
+        nn.init.zeros_(self.supplement.weight)
+        nn.init.zeros_(self.supplement.bias)
+
+    def forward(self, batch, return_base=False):
+        base = super().forward(batch)
+        logits = base + self.supplement(self.pooled(batch)).tanh()
+        return (logits, base) if return_base else logits
+
+
 class DuoEvidence(nn.Module):
     def __init__(self, thera_args, readout_position=None, family_mode=None, context_mode=None):
         super().__init__()
@@ -113,6 +129,8 @@ class DuoEvidence(nn.Module):
         if context_mode:
             self.aa34 = DuoContextReader(thera_args["input_dim"], thera_args["peptide_input_dim"],
                                          statistics, context_mode)
+        elif readout_position == "pooled_supplement":
+            self.aa34 = AA34PooledSupplement(thera_args)
         elif readout_position == "backbone_relative":
             self.aa34 = AA34BackboneInteraction(statistics)
         elif readout_position:

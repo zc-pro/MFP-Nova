@@ -8,7 +8,7 @@ from .sequence_features import FrozenFeatures, ResidueCNN, prior_bias
 
 
 class DuoContextReader(nn.Module):
-    def __init__(self, input_dim, peptide_input_dim, statistics, mode):
+    def __init__(self, input_dim, peptide_input_dim, statistics, mode, features_only=False):
         super().__init__()
         width = 128
         self.mode = mode
@@ -21,9 +21,11 @@ class DuoContextReader(nn.Module):
         self.read = nn.MultiheadAttention(width, 4, dropout=.1, batch_first=True)
         self.process = nn.TransformerEncoderLayer(width, 4, width * 2, dropout=.1,
                                                   activation="gelu", batch_first=True, norm_first=True)
-        self.classifier = nn.Sequential(nn.LayerNorm(width), nn.Linear(width, len(statistics["labels"])))
-        with torch.no_grad():
-            self.classifier[-1].bias.copy_(prior_bias(statistics))
+        self.classifier = nn.LayerNorm(width)
+        if not features_only:
+            self.classifier = nn.Sequential(self.classifier, nn.Linear(width, len(statistics["labels"])))
+            with torch.no_grad():
+                self.classifier[-1].bias.copy_(prior_bias(statistics))
 
     def forward(self, batch):
         mask = batch["mask"]

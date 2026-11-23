@@ -14,7 +14,7 @@ from mfp_nova.multimodal import BackbonePeptides
 from mfp_nova.research import to_device
 from mfp_nova.research_layers import observed_label_loss
 from mfp_nova.trainer import seed_everything, write_json
-from run_duoevidence import AA34BackboneInteraction, AA34FamilyReadout, AA34PositionReadout, DuoEvidence
+from run_duoevidence import AA34BackboneInteraction, AA34FamilyReadout, AA34PooledSupplement, AA34PositionReadout, DuoEvidence
 from run_trievidence import batches, collect, open_data, row_jaccard
 
 
@@ -27,11 +27,32 @@ def candidate_loss(thera, aa, targets, offsets):
     return (pair_loss * missed).sum() / missed.sum().clamp_min(1)
 
 
+def preserve_hits(original, updated, targets):
+    known = (targets > 0) & (original >= 0)
+    already_hit = known.any(1, keepdim=True)
+    new_unrecorded = already_hit & (targets == 0) & (original < 0)
+    lost = (F.relu(-updated).square() * known).sum() / known.sum().clamp_min(1)
+    added = (F.relu(updated).square() * new_unrecorded).sum() / already_hit.sum().clamp_min(1)
+    return lost + .3 * added
+
+
 def run(args):
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     if (checkpoint["model_name"] != "duoevidence" or checkpoint["track"] != "fine39"
-            or checkpoint.get("aa34_readout_position") or checkpoint.get("aa34_family_mode")):
+            or any(checkpoint.get(f"aa34_{kind}") for kind in ("readout_position", "family_mode", "context_mode"))):
         raise ValueError("Use the original packed Fine39 DuoEvidence checkpoint")
+    supplement_test = args.experiment == "pooled_supplement"
+    if supplement_test:
+        context = torch.load(args.context_checkpoint, map_location="cpu", weights_only=True)
+        if (context.get("aa34_context_mode") != "pooled" or context["labels"] != checkpoint["labels"]
+                or any(not torch.equal(value, context["model_state"][key])
+                       for key, value in checkpoint["model_state"].items() if key.startswith("theraset."))):
+            raise ValueError("The pooled checkpoint must use the same TheraSet and label order")
+        pooled_state = {}
+        for key, value in context["model_state"].items():
+            if key.startswith("aa34.") and not key.startswith("aa34.classifier.1."):
+                pooled_state[key.removeprefix("aa34.").replace("classifier.0.", "classifier.")] = value
+        del context
     model = DuoEvidence(checkpoint["model_args"])
     model.load_state_dict(checkpoint["model_state"])
     offsets = model.offsets.to(args.device)
@@ -46,7 +67,7 @@ def run(args):
         print(f"Cache fixed TheraSet | {split}", flush=True)
         logits, = collect(lambda batch: (model.theraset(batch)["logits"],),
                           batches(full, args.feature_batch), args.device, progress=True)
-        cached[split] = backbone, logits
+        cached[split] = (full if supplement_test else backbone), logits
     del model.theraset
     val, thera = cached["val"]
     if validation_only:
@@ -85,7 +106,7 @@ def run(args):
                 "zero_hit": int((hits == 0).sum()),
                 "nonempty_zero_hit": int((raw.any(1) & (hits == 0)).sum()),
                 "group_recall": {key: float(recall[group].mean()) for key, group in groups.items() if group.any()}}
-        if args.experiment in ("family", "relative", "backbone_relative"):
+        if args.experiment in ("family", "relative", "backbone_relative", "pooled_supplement"):
             hard = raw.any(1) & (hits == 0)
             report["confusions"] = {
                 f"{actual} -> {wrong}": int((hard & targets[:, i] & (top == j)).sum())
@@ -106,13 +127,25 @@ def run(args):
     elif args.experiment == "family":
         arms = (("classification", 0.), ("auxiliary", 0.), ("decomposed", 0.))
         history["family_weight"] = args.family_weight
+    elif supplement_test:
+        arms = (("pooled_free", 0.), ("pooled_protected", 0.))
+        history.update(protect_weight=args.protect_weight, context_checkpoint=str(args.context_checkpoint))
     else:
         arms = (("classification", 0.), ("fused_ranking", args.ranking_weight))
         history["ranking_weight"] = args.ranking_weight
     for arm, weight in arms:
         readout_test = args.experiment in ("readout", "relative")
         family_test = arm in ("auxiliary", "decomposed")
-        if readout_test:
+        if supplement_test:
+            reader = AA34PooledSupplement(checkpoint["model_args"]).to(args.device).requires_grad_(False)
+            reader.motifs.load_state_dict(model.aa34.motifs.state_dict())
+            reader.classifier.load_state_dict(model.aa34.classifier.state_dict())
+            reader.pooled.load_state_dict(pooled_state)
+            reader.supplement.requires_grad_(True)
+            initial_raw, initial_final, _ = score(reader)
+            if not torch.equal(initial_raw, base_raw) or not torch.equal(initial_final, base):
+                raise ValueError("Pooled supplement changed predictions before training")
+        elif readout_test:
             seed_everything(args.seed)
             reader = AA34PositionReadout(source.statistics["labels"], arm).to(args.device)
             reader.motifs.load_state_dict(model.aa34.motifs.state_dict())
@@ -148,17 +181,27 @@ def run(args):
         for epoch in range(1, args.epochs + 1):
             seed_everything(args.seed + epoch)
             reader.train()
-            if readout_test:
+            if readout_test or supplement_test:
                 reader.motifs.eval()
                 reader.classifier.eval()
-            losses = torch.zeros(3, device=args.device)
+            if supplement_test:
+                reader.pooled.eval()
+            losses = torch.zeros(4, device=args.device)
             for batch in train_loader:
-                if not validation_only and (readout_test or weight):
+                if not validation_only and (readout_test or weight or supplement_test):
                     indices = positions[torch.searchsorted(ordered_ids, batch["row_id"])]
                     fixed = train_logits[indices].to(args.device)
                 batch = to_device(batch, args.device)
                 labels = batch["y"]
-                if family_test:
+                protection = offsets.new_zeros(())
+                if supplement_test:
+                    logits, original = reader(batch, return_base=True)
+                    family_loss = logits.new_zeros(())
+                    if arm == "pooled_protected":
+                        original_fused = center_evidence(torch.stack((fixed, original)), offsets).mean(0)
+                        updated = center_evidence(torch.stack((fixed, logits)), offsets).mean(0)
+                        protection = preserve_hits(original_fused, updated, labels)
+                elif family_test:
                     logits, family = reader(batch, return_family=True)
                     observed = (labels @ reader.family_projection > 0).to(family.dtype)
                     weak = torch.where(observed > 0, 1., .3)
@@ -167,17 +210,19 @@ def run(args):
                     logits = reader(batch)
                     family_loss = logits.new_zeros(())
                 supervised = (center_evidence(torch.stack((fixed, logits)), offsets).mean(0)
-                              if args.experiment == "readout" else logits)
+                              if args.experiment in ("readout", "pooled_supplement") else logits)
                 classification = observed_label_loss(supervised, labels, source.statistics["labels"])
                 ranking = (candidate_loss(fixed, logits, labels, offsets) if weight
                            else classification.new_zeros(()))
                 optimizer.zero_grad(set_to_none=True)
-                (classification + weight * ranking + args.family_weight * family_loss).backward()
+                (classification + weight * ranking + args.family_weight * family_loss
+                 + args.protect_weight * protection).backward()
                 optimizer.step()
-                losses += torch.stack((classification.detach(), ranking.detach(), family_loss.detach())) * len(labels)
+                losses += torch.stack((classification.detach(), ranking.detach(), family_loss.detach(),
+                                       protection.detach())) * len(labels)
             raw, final, top = score(reader)
             hit = (final & targets).any(1)
-            classification_loss, ranking_loss, family_loss = (losses.cpu() / len(train)).tolist()
+            classification_loss, ranking_loss, family_loss, preservation_loss = (losses.cpu() / len(train)).tolist()
             record = dict(arm=arm, epoch=epoch, **summarize(raw, final, top),
                           classification_loss=classification_loss, ranking_loss=ranking_loss,
                           zero_rescued=int((~base_hit & hit).sum()), zero_created=int((base_hit & ~hit).sum()),
@@ -191,6 +236,8 @@ def run(args):
                           trainable_parameters=sum(p.numel() for p in trainable))
             if args.experiment == "family":
                 record["family_loss"] = family_loss
+            if supplement_test:
+                record["preservation_loss"] = preservation_loss
             history["history"].append(record)
             write_json(args.output / "results.json", history)
             print(json.dumps(record), flush=True)
@@ -201,6 +248,8 @@ def run(args):
                 refined["aa34_readout_position"] = arm
             if arm == "backbone_relative":
                 refined["aa34_readout_position"] = arm
+            if supplement_test:
+                refined["aa34_readout_position"] = "pooled_supplement"
             if family_test:
                 refined["aa34_family_mode"] = arm
             torch.save(refined, out / f"epoch_{epoch}.pt")
@@ -217,12 +266,17 @@ if __name__ == "__main__":
     parser.add_argument("--feature-batch", type=int, default=64)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--experiment", choices=("ranking", "readout", "family", "relative", "backbone_relative"), default="ranking")
+    parser.add_argument("--experiment", choices=("ranking", "readout", "family", "relative", "backbone_relative",
+                                                  "pooled_supplement"), default="ranking")
+    parser.add_argument("--context-checkpoint", type=Path)
+    parser.add_argument("--protect-weight", type=float, default=.1)
     parser.add_argument("--family-weight", type=float, default=.02)
     parser.add_argument("--lr", type=float)
     parser.add_argument("--ranking-weight", type=float, default=.01)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+    if (args.experiment == "pooled_supplement") != (args.context_checkpoint is not None):
+        parser.error("--context-checkpoint is required for pooled_supplement")
     if args.lr is None:
-        args.lr = 1e-3 if args.experiment in ("readout", "relative") else 2e-5
+        args.lr = 1e-3 if args.experiment in ("readout", "relative", "pooled_supplement") else 2e-5
     run(args)
