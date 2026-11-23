@@ -1,6 +1,7 @@
 """Explain per-row Jaccard changes between aligned DuoEvidence Validation exports."""
 
 import argparse
+from collections import Counter
 import json
 from pathlib import Path
 
@@ -202,15 +203,79 @@ def two_label_diagnostics(reference, candidate):
     }
 
 
+def zero_hit_diagnostics(reference, nearest=None):
+    from mfp_nova.multimodal import function_projection
+
+    with np.load(reference) as saved:
+        if str(saved["split"]) != "val":
+            raise ValueError("Use a Fine39 Validation export")
+        labels = saved["label_names"].tolist()
+        rows, clusters = saved["row_id"], saved["cluster_id"]
+        y, raw, final = (saved[key].astype(bool) for key in ("targets", "predicted_raw", "predicted"))
+        thera, aa34 = (saved[key] for key in ("theraset_logits", "aa34_logits"))
+        offsets = saved["offsets"]
+
+    families = np.asarray(function_projection(labels, "fine39")).argmax(1)
+    t_order, a_order = (np.argsort(-scores, axis=1, kind="stable") for scores in (thera, aa34))
+    limit = np.log(999999.)
+    fused = ((np.clip(thera, -limit, limit) - offsets[0]) +
+             (np.clip(aa34, -limit, limit) - offsets[1])) / 2
+    wrong = np.where(final, fused, -np.inf).argmax(1)
+    zero = ~(final & y).any(1)
+    nonempty = raw.any(1)
+    true_t, true_a = (np.take_along_axis(y, order, axis=1) for order in (t_order, a_order))
+    same_top1 = t_order[:, 0] == a_order[:, 0]
+    same_family = ((families[wrong, None] == families[None, :]) & y).any(1)
+    subsets = {"all_zero": zero, "nonempty_zero": zero & nonempty,
+               "fallback_zero": zero & ~nonempty}
+    if nearest is not None:
+        with np.load(nearest) as saved:
+            order = np.argsort(saved["row_id"])
+            np.testing.assert_array_equal(rows, saved["row_id"][order])
+            low = saved["similarity"][order] < .7
+        subsets.update({f"{name}_similarity_lt70": mask & low for name, mask in tuple(subsets.items())})
+
+    def summarize(mask):
+        coverage = {}
+        for k in (1, 5, 10):
+            t = true_t[:, :k].any(1)
+            a = true_a[:, :k].any(1)
+            coverage[f"top{k}"] = {"both": int((mask & t & a).sum()),
+                                   "theraset_only": int((mask & t & ~a).sum()),
+                                   "aa34_only": int((mask & ~t & a).sum()),
+                                   "neither": int((mask & ~t & ~a).sum())}
+        row, actual = np.where(y & mask[:, None])
+        pairs = Counter(zip(actual, wrong[row]))
+        return {"rows": int(mask.sum()), "clusters": int(len(np.unique(clusters[mask]))),
+                "same_branch_top1": int((mask & same_top1).sum()),
+                "top_final_prediction_matches_any_observed_family": int((mask & same_family).sum()),
+                "top_final_prediction_matches_no_observed_family": int((mask & ~same_family).sum()),
+                "candidate_coverage": coverage,
+                "top_confusions": [{"observed": labels[i], "predicted": labels[j], "rows": count,
+                                    "same_family": bool(families[i] == families[j])}
+                                   for (i, j), count in pairs.most_common(12)]}
+
+    hits = (final & y).sum(1)
+    union = (final | y).sum(1)
+    return {"rows": len(y), "sample_jaccard": float((hits / union.clip(min=1)).mean()),
+            "groups": {name: summarize(mask) for name, mask in subsets.items()}}
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("reference", type=Path)
-    parser.add_argument("candidate", type=Path)
+    parser.add_argument("candidate", type=Path, nargs="?")
     parser.add_argument("--screen-additions", action="store_true")
     parser.add_argument("--context-diagnostics", action="store_true")
     parser.add_argument("--two-label-diagnostics", action="store_true")
+    parser.add_argument("--zero-hit-diagnostics", action="store_true")
     parser.add_argument("--nearest", type=Path, help="Optional nearest-Train similarities for context diagnostics")
     args = parser.parse_args()
+    if args.zero_hit_diagnostics:
+        print(json.dumps(zero_hit_diagnostics(args.reference, args.nearest), indent=2))
+        raise SystemExit
+    if args.candidate is None:
+        parser.error("candidate is required for paired comparisons")
     result = compare(args.reference, args.candidate)
     if args.two_label_diagnostics:
         result["two_label_diagnostics"] = two_label_diagnostics(args.reference, args.candidate)
