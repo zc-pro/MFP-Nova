@@ -10,6 +10,7 @@ from torch import nn
 
 from mfp_nova.cli import main as cli
 from mfp_nova.metrics import evaluate_metrics
+from mfp_nova.models.duo_reader import DuoContextReader
 from mfp_nova.models.theraset import TheraSet
 from mfp_nova.models.trievidence import AA34Reader, LocalLabelReadout, center_evidence, empty_top10
 from mfp_nova.multimodal import BackbonePeptides, function_projection
@@ -104,12 +105,15 @@ class AA34FamilyReadout(AA34Reader):
 
 
 class DuoEvidence(nn.Module):
-    def __init__(self, thera_args, readout_position=None, family_mode=None):
+    def __init__(self, thera_args, readout_position=None, family_mode=None, context_mode=None):
         super().__init__()
         with torch.random.fork_rng(devices=[]):
             self.theraset = TheraSet(**thera_args)
         statistics = thera_args["statistics"]
-        if readout_position == "backbone_relative":
+        if context_mode:
+            self.aa34 = DuoContextReader(thera_args["input_dim"], thera_args["peptide_input_dim"],
+                                         statistics, context_mode)
+        elif readout_position == "backbone_relative":
             self.aa34 = AA34BackboneInteraction(statistics)
         elif readout_position:
             self.aa34 = AA34PositionReadout(statistics, readout_position)
@@ -133,15 +137,23 @@ class DuoEvidence(nn.Module):
 def fit_reader(args, output, ckpt):
     source, validation = open_data(args, "val", ckpt)
     seed_everything(args.seed)
-    model = DuoEvidence(ckpt["model_args"]).to(args.device)
+    model = DuoEvidence(ckpt["model_args"], context_mode=args.context_mode).to(args.device)
     model.theraset.load_state_dict(ckpt["model_state"])
     model.eval()
     a, = collect(lambda batch: (model.theraset(batch)["logits"],),
                  batches(validation, args.batch_size), args.device, progress=True)
-    longest = ckpt["encoder"]["max_length"]
-    train = batches(BackbonePeptides(source, "train", longest), 128, shuffle=True)
-    val = BackbonePeptides(source, "val", longest)
-    np.testing.assert_array_equal(val.indices, validation.indices)
+    if args.context_mode:
+        _, training = open_data(args, "train", ckpt)
+        val = validation
+        reader_batch = args.batch_size
+    else:
+        longest = ckpt["encoder"]["max_length"]
+        training = BackbonePeptides(source, "train", longest)
+        val = BackbonePeptides(source, "val", longest)
+        np.testing.assert_array_equal(val.indices, validation.indices)
+        reader_batch = 128
+    train = batches(training, reader_batch, shuffle=True)
+    val_loader = batches(val, reader_batch)
     y = torch.from_numpy(source.data.y[val.indices].astype(bool))
     optimizer = torch.optim.AdamW(model.aa34.parameters(), lr=3e-4, weight_decay=.01)
     schedule = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.reader_epochs)
@@ -151,7 +163,7 @@ def fit_reader(args, output, ckpt):
         loss = pass_train(model.aa34, train, args.device, optimizer, source.statistics["labels"], .3)
         schedule.step()
         model.eval()
-        b, = collect(lambda batch: (model.aa34(batch),), batches(val, 128), args.device)
+        b, = collect(lambda batch: (model.aa34(batch),), val_loader, args.device)
         stacked = torch.stack((a, b))
         epoch_best = None
         for cut in cuts:
@@ -165,12 +177,15 @@ def fit_reader(args, output, ckpt):
         if best is None or epoch_best[0] > best[0]:
             best = epoch_best
             weights = {k: v.detach().cpu().clone() for k, v in model.aa34.state_dict().items()}
-        print(f"AA34 {epoch}/{args.reader_epochs} loss={loss:.6f} best_val={best[0][0]:.4%}@{best[1]}", flush=True)
+        print(f"{args.context_mode or 'AA34'} {epoch}/{args.reader_epochs} loss={loss:.6f} "
+              f"val={epoch_best[0][0]:.4%} best_val={best[0][0]:.4%}@{best[1]}", flush=True)
     model.aa34.load_state_dict(weights)
     model.offsets.copy_(torch.tensor([ckpt["threshold"], best[2]]).logit())
     packed = {key: ckpt[key] for key in ("config", "encoder", "statistics", "labels", "model_args", "track")}
     packed.update(model_name="duoevidence", model_state=model.cpu().state_dict(), seed=args.seed,
                   theraset_epoch=ckpt["best_epoch"], aa34_epoch=best[1], thresholds=model.offsets.sigmoid().tolist())
+    if args.context_mode:
+        packed["aa34_context_mode"] = args.context_mode
     torch.save(packed, output/"best.pt")
     return best[0][0]
 
@@ -179,7 +194,8 @@ def evaluate(args, checkpoint, split, output):
     packed = torch.load(checkpoint, map_location="cpu", weights_only=True)
     if packed["model_name"] != "duoevidence":
         raise ValueError("Expected a DuoEvidence checkpoint")
-    model = DuoEvidence(packed["model_args"], packed.get("aa34_readout_position"), packed.get("aa34_family_mode"))
+    model = DuoEvidence(packed["model_args"], packed.get("aa34_readout_position"), packed.get("aa34_family_mode"),
+                        packed.get("aa34_context_mode"))
     model.load_state_dict(packed["model_state"])
     model.to(args.device).eval()
     source, ds = open_data(args, split, packed)
@@ -205,6 +221,8 @@ def evaluate(args, checkpoint, split, output):
         result["aa34_readout_position"] = packed["aa34_readout_position"]
     if "aa34_family_mode" in packed:
         result["aa34_family_mode"] = packed["aa34_family_mode"]
+    if "aa34_context_mode" in packed:
+        result["aa34_context_mode"] = packed["aa34_context_mode"]
     write_json(output/"results.json", result)
     np.savez_compressed(output/f"{split}_predictions.npz", row_id=source.data.rows[ds.indices],
                         cluster_id=source.data.clusters[ds.indices], label_names=source.data.labels,
@@ -285,8 +303,9 @@ def calibrate(predictions, output, seed):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("train", "evaluate", "calibrate"))
-    parser.add_argument("--checkpoint", type=Path, help="Packed model, for evaluate only")
+    parser.add_argument("command", choices=("train", "train-reader", "evaluate", "calibrate"))
+    parser.add_argument("--checkpoint", type=Path, help="Packed model for evaluate or TheraSet anchor for train-reader")
+    parser.add_argument("--context-mode", choices=("pooled", "latent"), help="Contextual second reader for train-reader")
     parser.add_argument("--decision", type=Path, help="Validation-fitted fusion weights and cutoff, for evaluate")
     parser.add_argument("--predictions", type=Path, help="Uncalibrated Validation predictions, for calibrate")
     parser.add_argument("--config", type=Path, default=Path("configs/theraset.yaml"))
@@ -303,6 +322,11 @@ def main():
     parser.add_argument("--split", choices=("val", "test"), default="val")
     args = parser.parse_args()
     training = args.command == "train"
+    if args.command == "train-reader":
+        if not args.checkpoint or not args.context_mode or args.split != "val" or args.decision or args.predictions:
+            parser.error("train-reader requires --checkpoint and --context-mode on Train/Validation")
+    elif args.context_mode:
+        parser.error("--context-mode requires train-reader")
     if training and (args.split != "val" or args.checkpoint or args.decision or args.predictions):
         parser.error("train starts fresh on Train/Validation")
     if args.command == "evaluate" and (not args.checkpoint or args.predictions):
@@ -321,6 +345,10 @@ def main():
              "--name", str((output/"theraset").resolve())])
         ckpt = read_anchor(output/"theraset/best.pt", "theraset")
         expected = fit_reader(args, output, ckpt)
+        result = evaluate(args, output/"best.pt", "val", output)
+        print(f"Packed replay delta={(result['sample_jaccard']-expected)*100:+.5f}pp")
+    elif args.command == "train-reader":
+        expected = fit_reader(args, output, read_anchor(args.checkpoint, "theraset"))
         result = evaluate(args, output/"best.pt", "val", output)
         print(f"Packed replay delta={(result['sample_jaccard']-expected)*100:+.5f}pp")
     elif args.command == "evaluate":
