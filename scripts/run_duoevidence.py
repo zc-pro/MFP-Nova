@@ -1,5 +1,6 @@
 """Fine39 TheraSet + AA34. Train both readers from random initialization."""
 import argparse
+import json
 from datetime import datetime
 from pathlib import Path
 
@@ -16,6 +17,11 @@ from mfp_nova.trainer import seed_everything, write_json
 from run_trievidence import batches, collect, open_data, pass_train, read_anchor, row_jaccard
 
 
+def decision_scores(theraset, aa34, weight, cutoff):
+    scores = center_evidence(torch.stack((theraset, aa34)), theraset.new_zeros(2))
+    return (1 - weight) * scores[0] + weight * scores[1] - cutoff
+
+
 class DuoEvidence(nn.Module):
     def __init__(self, thera_args):
         super().__init__()
@@ -24,11 +30,15 @@ class DuoEvidence(nn.Module):
         self.aa34 = AA34Reader(thera_args["statistics"])
         self.register_buffer("offsets", torch.zeros(2))
 
-    def forward(self, batch):
+    def forward(self, batch, decision=None):
         a = self.theraset(batch)["logits"]
         b = self.aa34(batch)
-        logits = center_evidence(torch.stack((a, b)), self.offsets).mean(0)
-        return {"logits": logits, "predicted": empty_top10(logits, a)}
+        if decision is None:
+            logits = center_evidence(torch.stack((a, b)), self.offsets).mean(0)
+        else:
+            logits = decision_scores(a, b, decision["aa34_weight"], decision["cutoff"])
+        return {"logits": logits, "predicted": empty_top10(logits, a),
+                "theraset_logits": a, "aa34_logits": b}
 
 
 def fit_reader(args, output, ckpt):
@@ -84,12 +94,13 @@ def evaluate(args, checkpoint, split, output):
     model.load_state_dict(packed["model_state"])
     model.to(args.device).eval()
     source, ds = open_data(args, split, packed)
+    decision = json.loads(args.decision.read_text(encoding="utf-8")) if args.decision else None
 
     def read(batch):
-        result = model(batch)
-        return result["logits"], result["predicted"]
+        result = model(batch, decision)
+        return tuple(result[key] for key in ("logits", "predicted", "theraset_logits", "aa34_logits"))
 
-    logits, pred = collect(read, batches(ds, args.batch_size), args.device, progress=True)
+    logits, pred, theraset, aa34 = collect(read, batches(ds, args.batch_size), args.device, progress=True)
     pred = pred.bool().numpy()
     y = source.data.y[ds.indices].astype(bool)
     prob = logits.sigmoid().numpy()
@@ -99,18 +110,92 @@ def evaluate(args, checkpoint, split, output):
                   raw_acc=float(row_jaccard(torch.from_numpy(y), logits>=0).mean()),
                   zero_hit=int((~(pred & y).any(1)).sum()), thresholds=packed["thresholds"],
                   seed=packed["seed"], theraset_epoch=packed["theraset_epoch"], aa34_epoch=packed["aa34_epoch"])
+    if decision is not None:
+        result["decision"] = decision
     write_json(output/"results.json", result)
     np.savez_compressed(output/f"{split}_predictions.npz", row_id=source.data.rows[ds.indices],
                         cluster_id=source.data.clusters[ds.indices], label_names=source.data.labels,
-                        targets=y, probabilities=prob, predicted=pred, predicted_raw=(logits>=0).numpy())
+                        targets=y, probabilities=prob, predicted=pred, predicted_raw=(logits>=0).numpy(),
+                        split=split, offsets=model.offsets.cpu().numpy(), theraset_logits=theraset.numpy(),
+                        aa34_logits=aa34.numpy())
     print(f"{split} raw={result['raw_acc']:.4%} final={result['sample_jaccard']:.4%}", flush=True)
     return result
 
 
+def calibrate(predictions, output, seed):
+    torch.set_num_threads(1)
+    with np.load(predictions) as saved:
+        if str(saved["split"]) != "val":
+            raise ValueError("Calibration requires original Validation predictions")
+        thera, aa34, targets, offsets, baseline_raw, baseline_final = (
+            torch.from_numpy(saved[key]) for key in ("theraset_logits", "aa34_logits", "targets",
+                                                     "offsets", "predicted_raw", "predicted"))
+        _, cluster = np.unique(saved["cluster_id"], return_inverse=True)
+    scores = center_evidence(torch.stack((thera, aa34)), offsets).mean(0)
+    raw, final = scores >= 0, empty_top10(scores, thera)
+    if not torch.equal(raw, baseline_raw) or not torch.equal(final, baseline_final):
+        raise ValueError("Export must come from an uncalibrated DuoEvidence evaluation")
+    # Keep all rows from each cluster on the same side of each calibration fit.
+    clusters = cluster.max() + 1
+    if clusters < 5:
+        raise ValueError("Five-fold calibration requires at least five clusters")
+    fold = np.random.default_rng(seed).permutation(clusters)[cluster] % 5
+    target_count = targets.sum(1)
+
+    def summarize(raw, final):
+        hits = (targets & final).sum(1)
+        recall = hits / target_count.clamp_min(1)
+        return {"raw_acc": float(row_jaccard(targets, raw).mean()),
+                "sample_jaccard": float(row_jaccard(targets, final).mean()),
+                "zero_hit": int((hits == 0).sum()),
+                "empty_before_fallback": int((~raw.any(1)).sum()),
+                "recall_exactly_two_labels": float(recall[target_count == 2].mean()) if (target_count == 2).any() else None,
+                "recall_at_least_three_labels": float(recall[target_count >= 3].mean()) if (target_count >= 3).any() else None}
+
+    base_rule = (.5, float(offsets.mean()))
+    candidates = [base_rule] + [
+        (weight, tick / 10) for weight in (.25, .375, .5, .625, .75) for tick in range(-5, 14)]
+    # Cache scores for selection and recompute decisions only for the selected rules.
+    def predict(index):
+        if index == 0:
+            return raw, final
+        weight, cutoff = candidates[index]
+        logits = decision_scores(thera, aa34, weight, cutoff)
+        return logits >= 0, empty_top10(logits, thera)
+
+    values = np.stack([row_jaccard(targets, predict(i)[1]).numpy() for i in range(len(candidates))])
+    report = {"split": "val", "rows": len(targets), "clusters": int(clusters), "seed": seed,
+              "baseline": summarize(raw, final)}
+    for name, indices in (("threshold_only", [i for i, (weight, _) in enumerate(candidates) if weight == .5]),
+                          ("weight_and_threshold", list(range(len(candidates))))):
+        held_raw, held_final = torch.empty_like(raw), torch.empty_like(final)
+        choices = []
+        for k in range(5):
+            held = fold == k
+            winner = indices[values[indices][:, ~held].mean(1).argmax()]
+            raw_k, final_k = predict(winner)
+            held_raw[held], held_final[held] = raw_k[held], final_k[held]
+            choices.append(candidates[winner])
+        metrics = summarize(held_raw, held_final)
+        metrics["delta_pp"] = 100 * (metrics["sample_jaccard"] - report["baseline"]["sample_jaccard"])
+        metrics["fold_weight_cutoff"] = choices
+        report[name] = metrics
+        print(f"{name}: {metrics['sample_jaccard']:.4%} ({metrics['delta_pp']:+.4f} pp)", flush=True)
+        winner = indices[values[indices].mean(1).argmax()]
+        # A baseline winner uses the checkpoint's exact threshold and tie behavior.
+        if winner == 0:
+            continue
+        weight, cutoff = candidates[winner]
+        write_json(output/f"{name}_decision.json", {"aa34_weight": weight, "cutoff": cutoff})
+    write_json(output/"results.json", report)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("train", "evaluate"))
+    parser.add_argument("command", choices=("train", "evaluate", "calibrate"))
     parser.add_argument("--checkpoint", type=Path, help="Packed model, for evaluate only")
+    parser.add_argument("--decision", type=Path, help="Validation-fitted fusion weights and cutoff, for evaluate")
+    parser.add_argument("--predictions", type=Path, help="Uncalibrated Validation predictions, for calibrate")
     parser.add_argument("--config", type=Path, default=Path("configs/theraset.yaml"))
     parser.add_argument("--output", type=Path)
     parser.add_argument("--data-root", type=Path, default=Path("data/therapeutic_2025"))
@@ -125,8 +210,12 @@ def main():
     parser.add_argument("--split", choices=("val", "test"), default="val")
     args = parser.parse_args()
     training = args.command == "train"
-    if training == (args.checkpoint is not None) or (training and args.split != "val"):
-        parser.error("train starts fresh on Train/Validation; evaluate requires --checkpoint")
+    if training and (args.split != "val" or args.checkpoint or args.decision or args.predictions):
+        parser.error("train starts fresh on Train/Validation")
+    if args.command == "evaluate" and (not args.checkpoint or args.predictions):
+        parser.error("evaluate requires --checkpoint")
+    if args.command == "calibrate" and (not args.predictions or args.split != "val" or args.decision or args.checkpoint):
+        parser.error("calibrate requires --predictions from an uncalibrated Validation evaluation")
     output = args.output or Path("runs") / f"duoevidence_{args.command}_s{args.seed}_{datetime.now():%Y%m%d_%H%M%S}"
     output.mkdir(parents=True, exist_ok=False)
     if training:
@@ -141,8 +230,10 @@ def main():
         expected = fit_reader(args, output, ckpt)
         result = evaluate(args, output/"best.pt", "val", output)
         print(f"Packed replay delta={(result['sample_jaccard']-expected)*100:+.5f}pp")
-    else:
+    elif args.command == "evaluate":
         evaluate(args, args.checkpoint, args.split, output)
+    else:
+        calibrate(args.predictions, output, args.seed)
 
 
 if __name__ == "__main__":
