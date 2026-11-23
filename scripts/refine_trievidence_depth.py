@@ -70,10 +70,11 @@ def refine(args, output):
     if args.ablate:
         if args.epochs or args.depth != original_depth:
             raise ValueError("Ablation compares original-depth weights without recovery training")
-        flag = {"geometry": "structure_evidence", "triangles": "triangles"}[args.ablate]
-        if model_args["helixset_args"].get(flag, True) is False:
-            raise ValueError(f"The reference already disables {flag}")
-        model_args["helixset_args"][flag] = False
+        if args.ablate != "pair_blocks":
+            flag = {"geometry": "structure_evidence", "triangles": "triangles"}[args.ablate]
+            if model_args["helixset_args"].get(flag, True) is False:
+                raise ValueError(f"The reference already disables {flag}")
+            model_args["helixset_args"][flag] = False
     model_args["helixset_args"]["latent_depth"] = args.depth
     state = packed["model_state"]
     if args.ffn_rank is not None:
@@ -87,6 +88,9 @@ def refine(args, output):
     # Evaluation needs only the changing branch. The other two were exported
     # from this packed model on the same Validation rows.
     helix = model.helixset.to(args.device).eval()
+    if args.ablate == "pair_blocks":
+        helix.pair_blocks = torch.nn.ModuleList()
+        model_args["helixset_args"]["pair_depth"] = 0
     loader = batches(val, args.batch_size)
     train = None
     if args.epochs:
@@ -167,8 +171,8 @@ if __name__ == "__main__":
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("--depth", type=int, required=True)
     parser.add_argument("--ffn-rank", type=int, help="SVD rank for the two FFN linear layers in each latent block")
-    parser.add_argument("--ablate", choices=("geometry", "triangles"),
-                        help="Disable only HelixSet explicit geometry or only its triangle updates")
+    parser.add_argument("--ablate", choices=("geometry", "triangles", "pair_blocks"),
+                        help="Ablate explicit geometry, triangles, or the complete pair update stack")
     parser.add_argument("--epochs", type=int, default=0)
     parser.add_argument("--representation", action="store_true",
                         help="Tune the last two pair and latent blocks and use the fixed final epoch")

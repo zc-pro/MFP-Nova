@@ -11,7 +11,7 @@ import numpy as np
 from mfp_nova.reference_fallback import paired_cluster_interval
 
 
-def compare(base, helix):
+def compare(base, helix, masks=None):
     order = np.argsort(helix["row_id"])
     idx = order[np.searchsorted(helix["row_id"][order], base["row_id"])]
     for key in ("row_id", "targets", "cluster_id"):
@@ -37,6 +37,9 @@ def compare(base, helix):
     groups = {"nonempty_zero": nonempty & ~old_hit,
               "both_prefer_error_true_top5": nonempty & ~old_hit & both_wrong & (ranks[rows, truth] < 5),
               "nonempty_already_hit": nonempty & old_hit}
+    if masks is not None:
+        masks.update({name: group & ~old_hit & new_hit for name, group in groups.items()
+                      if name != "nonempty_already_hit"})
     return {"rows": len(y), "acc_before": float(scores[0].mean()), "acc_after": float(scores[1].mean()),
             "delta_pp": float(100 * delta.mean()), "ci95_pp": paired_cluster_interval(delta, base["cluster_id"]),
             "rescued": int((~old_hit & new_hit).sum()), "new_zero": int((old_hit & ~new_hit).sum()),
@@ -51,10 +54,23 @@ if __name__ == "__main__":
     parser.add_argument("base", type=Path)
     parser.add_argument("helix", type=Path)
     parser.add_argument("--member", help="DuoEvidence prediction member in a tar archive")
+    parser.add_argument("--reference-helix", type=Path, help="Full HelixSet export for paired rescue overlap")
     args = parser.parse_args()
     source = args.base
     if args.member:
         with tarfile.open(source) as archive:
             source = io.BytesIO(archive.extractfile(args.member).read())
     with np.load(source) as base, np.load(args.helix) as helix:
-        print(json.dumps(compare(base, helix), indent=2))
+        candidate = {}
+        report = compare(base, helix, candidate)
+        if args.reference_helix:
+            reference = {}
+            with np.load(args.reference_helix) as full:
+                compare(base, full, reference)
+            report["rescue_overlap_vs_full"] = {
+                name: {"retained": int((old & candidate[name]).sum()),
+                       "lost": int((old & ~candidate[name]).sum()),
+                       "gained": int((~old & candidate[name]).sum())}
+                for name, old in reference.items()
+            }
+        print(json.dumps(report, indent=2))
