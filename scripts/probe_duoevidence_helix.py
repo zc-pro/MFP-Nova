@@ -11,7 +11,7 @@ import numpy as np
 from mfp_nova.reference_fallback import paired_cluster_interval
 
 
-def compare(base, helix, masks=None):
+def compare(base, helix, masks=None, cohorts=None):
     order = np.argsort(helix["row_id"])
     idx = order[np.searchsorted(helix["row_id"][order], base["row_id"])]
     for key in ("row_id", "targets", "cluster_id"):
@@ -37,6 +37,8 @@ def compare(base, helix, masks=None):
     groups = {"nonempty_zero": nonempty & ~old_hit,
               "both_prefer_error_true_top5": nonempty & ~old_hit & both_wrong & (ranks[rows, truth] < 5),
               "nonempty_already_hit": nonempty & old_hit}
+    if cohorts is not None:
+        cohorts.update(groups)
     if masks is not None:
         masks.update({name: group & ~old_hit & new_hit for name, group in groups.items()
                       if name != "nonempty_already_hit"})

@@ -70,7 +70,11 @@ def refine(args, output):
     if args.ablate:
         if args.epochs or args.depth != original_depth:
             raise ValueError("Ablation compares original-depth weights without recovery training")
-        if args.ablate != "pair_blocks":
+        if args.ablate == "multiscale":
+            model_args["helixset_args"]["residue_only_motifs"] = True
+        elif args.ablate == "latent_mixing":
+            model_args["helixset_args"]["mix_latents"] = False
+        elif args.ablate != "pair_blocks":
             flag = {"geometry": "structure_evidence", "triangles": "triangles"}[args.ablate]
             if model_args["helixset_args"].get(flag, True) is False:
                 raise ValueError(f"The reference already disables {flag}")
@@ -171,8 +175,8 @@ if __name__ == "__main__":
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("--depth", type=int, required=True)
     parser.add_argument("--ffn-rank", type=int, help="SVD rank for the two FFN linear layers in each latent block")
-    parser.add_argument("--ablate", choices=("geometry", "triangles", "pair_blocks"),
-                        help="Ablate explicit geometry, triangles, or the complete pair update stack")
+    parser.add_argument("--ablate", choices=("geometry", "triangles", "pair_blocks", "multiscale", "latent_mixing"),
+                        help="Ablate one evidence or interaction path at the original depth")
     parser.add_argument("--epochs", type=int, default=0)
     parser.add_argument("--representation", action="store_true",
                         help="Tune the last two pair and latent blocks and use the fixed final epoch")

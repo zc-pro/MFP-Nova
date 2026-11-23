@@ -281,7 +281,10 @@ class LatentFusionBlock(nn.Module):
         # Uniform low reliability cancels inside softmax. Scale after LN so the
         # absolute source quality survives both attention and normalization.
         evidence[2] = evidence[2] * structure_strength(reliability, masks[2])
-        return self.process(latent + self.combine(torch.cat(evidence, -1)), latent_mask)
+        updated = latent + self.combine(torch.cat(evidence, -1))
+        if not getattr(self, "mix_latents", True):
+            return self.process.ff(updated, latent_mask)
+        return self.process(updated, latent_mask)
 
 
 class SetDecoderBlock(nn.Module):
@@ -334,7 +337,7 @@ class HelixSet(nn.Module):
                  geometry_context=True, geometry_quality=True, distance_multiscale=True,
                  scale_balance=True, pair_interactions=True, structure_evidence=True,
                  esm_tail=None, evidence_readout=False, peptide_input_dim=0, direct_only=False,
-                 latent_ffn_rank=None):
+                 latent_ffn_rank=None, residue_only_motifs=False, mix_latents=True):
         super().__init__()
         if direct_only and evidence_readout:
             raise ValueError("The latent-only exit does not use the early evidence decoder")
@@ -364,10 +367,14 @@ class HelixSet(nn.Module):
             ResiduePairBlock(dim, pair_dim, heads, dropout, incoming=(i % 2 == 1)) for i in range(pair_depth)
         ])
         self.pyramid = MotifPyramid(dim, dropout)
+        if residue_only_motifs:
+            self.pyramid.widths = ()
         self.latents = nn.Parameter(torch.randn(latent_count, dim) * .02)
         self.latent_blocks = nn.ModuleList([
             LatentFusionBlock(dim, heads, dropout, latent_ffn_rank) for _ in range(latent_depth)
         ])
+        for block in self.latent_blocks:
+            block.mix_latents = mix_latents
         prior = torch.tensor(statistics["observed_prior"]).clamp(1e-4, 1 - 1e-4)
         if not direct_only:
             self.label_queries = nn.Parameter(torch.randn(num_labels, dim) * .02)
