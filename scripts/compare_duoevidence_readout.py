@@ -54,9 +54,51 @@ def compare(reference, candidate):
     }
 
 
+def screen_additions(reference, candidate, seed=42):
+    with np.load(reference) as before, np.load(candidate) as after:
+        targets = before["targets"].astype(bool)
+        base = before["predicted"].astype(bool)
+        added = after["predicted_raw"] & ~base & before["predicted_raw"].any(1, keepdims=True)
+        def logits(export):
+            branches = np.stack([export[key] for key in ("theraset_logits", "aa34_logits")])
+            limit = np.log(999999.)
+            return (branches.clip(-limit, limit) - export["offsets"][:, None, None]).mean(0)
+        original, revised = map(logits, (before, after))
+        _, clusters = np.unique(before["cluster_id"], return_inverse=True)
+    fold = np.random.default_rng(seed).permutation(clusters.max() + 1)[clusters] % 5
+    hits, union = (base & targets).sum(1), (base | targets).sum(1)
+    settings = [(0., 0.)] + [(scale, margin) for scale in (.25, .5, .75, 1.)
+                              for margin in (0., .05, .1, .2, .4)]
+    masks = [added & (original + scale * (revised - original) >= margin)
+             if scale else np.zeros_like(added) for scale, margin in settings]
+    baseline = hits / np.maximum(1, union)
+    def jaccard(extra):
+        return (hits + (extra & targets).sum(1)) / np.maximum(1, union + (extra & ~targets).sum(1))
+    values = np.stack([jaccard(extra) for extra in masks])
+    held = np.zeros_like(added)
+    selected = []
+    for k in range(5):
+        test = fold == k
+        winner = values[:, ~test].mean(1).argmax()
+        held[test] = masks[winner][test]
+        selected.append(settings[winner])
+    def summarize(extra):
+        delta = jaccard(extra) - baseline
+        return {"acc": float((baseline + delta).mean()), "delta_pp": float(100 * delta.mean()),
+                "zero_rescued": int(((hits == 0) & (delta > 0)).sum()),
+                "added_observed": int((extra & targets).sum()),
+                "added_unrecorded": int((extra & ~targets).sum())}
+    return {"baseline_acc": float(baseline.mean()), "unfiltered": summarize(added),
+            "cluster_crossfit": summarize(held), "fold_scale_margin": selected}
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("reference", type=Path)
     parser.add_argument("candidate", type=Path)
+    parser.add_argument("--screen-additions", action="store_true")
     args = parser.parse_args()
-    print(json.dumps(compare(args.reference, args.candidate), indent=2))
+    result = compare(args.reference, args.candidate)
+    if args.screen_additions:
+        result["addition_screen"] = screen_additions(args.reference, args.candidate)
+    print(json.dumps(result, indent=2))
