@@ -14,7 +14,7 @@ from mfp_nova.multimodal import BackbonePeptides
 from mfp_nova.research import to_device
 from mfp_nova.research_layers import observed_label_loss
 from mfp_nova.trainer import seed_everything, write_json
-from run_duoevidence import DuoEvidence
+from run_duoevidence import AA34PositionReadout, DuoEvidence
 from run_trievidence import batches, collect, open_data, row_jaccard
 
 
@@ -29,8 +29,9 @@ def candidate_loss(thera, aa, targets, offsets):
 
 def run(args):
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
-    if checkpoint["model_name"] != "duoevidence" or checkpoint["track"] != "fine39":
-        raise ValueError("Use a packed Fine39 DuoEvidence checkpoint")
+    if (checkpoint["model_name"] != "duoevidence" or checkpoint["track"] != "fine39"
+            or checkpoint.get("aa34_readout_position")):
+        raise ValueError("Use the original packed Fine39 DuoEvidence checkpoint")
     model = DuoEvidence(checkpoint["model_args"])
     model.load_state_dict(checkpoint["model_state"])
     offsets = model.offsets.to(args.device)
@@ -75,15 +76,36 @@ def run(args):
     base_raw, base = score(model.aa34.to(args.device))
     base_hit = (base & targets).any(1)
     history = {"baseline": summarize(base_raw, base), "seed": args.seed, "lr": args.lr,
-               "ranking_weight": args.ranking_weight, "epochs": args.epochs, "history": []}
-    for arm, weight in (("classification", 0.), ("fused_ranking", args.ranking_weight)):
-        reader = copy.deepcopy(model.aa34)
-        optimizer = torch.optim.AdamW(reader.parameters(), lr=args.lr, weight_decay=.01)
+               "experiment": args.experiment, "epochs": args.epochs, "history": []}
+    if args.experiment == "readout":
+        arms = (("global", 0.), ("local", 0.))
+    else:
+        arms = (("classification", 0.), ("fused_ranking", args.ranking_weight))
+        history["ranking_weight"] = args.ranking_weight
+    for arm, weight in arms:
+        readout_test = args.experiment == "readout"
+        if readout_test:
+            seed_everything(args.seed)
+            reader = AA34PositionReadout(source.statistics["labels"], arm).to(args.device)
+            reader.motifs.load_state_dict(model.aa34.motifs.state_dict())
+            reader.classifier.load_state_dict(model.aa34.classifier.state_dict())
+            reader.motifs.requires_grad_(False)
+            reader.classifier.requires_grad_(False)
+            initial_raw, initial_final = score(reader)
+            if not torch.equal(initial_raw, base_raw) or not torch.equal(initial_final, base):
+                raise ValueError(f"{arm} readout changed the checkpoint predictions before training")
+        else:
+            reader = copy.deepcopy(model.aa34)
+        trainable = [p for p in reader.parameters() if p.requires_grad]
+        optimizer = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=.01)
         out = args.output / arm
         out.mkdir()
         for epoch in range(1, args.epochs + 1):
             seed_everything(args.seed + epoch)
             reader.train()
+            if readout_test:
+                reader.motifs.eval()
+                reader.classifier.eval()
             losses = torch.zeros(2, device=args.device)
             for batch in train_loader:
                 indices = positions[torch.searchsorted(ordered_ids, batch["row_id"])]
@@ -91,7 +113,9 @@ def run(args):
                 batch = to_device(batch, args.device)
                 logits = reader(batch)
                 labels = batch["y"]
-                classification = observed_label_loss(logits, labels, source.statistics["labels"])
+                supervised = (center_evidence(torch.stack((fixed, logits)), offsets).mean(0)
+                              if readout_test else logits)
+                classification = observed_label_loss(supervised, labels, source.statistics["labels"])
                 ranking = (candidate_loss(fixed, logits, labels, offsets) if weight
                            else classification.new_zeros(()))
                 optimizer.zero_grad(set_to_none=True)
@@ -103,13 +127,18 @@ def run(args):
             classification_loss, ranking_loss = (losses.cpu() / len(train)).tolist()
             record = dict(arm=arm, epoch=epoch, **summarize(raw, final),
                           classification_loss=classification_loss, ranking_loss=ranking_loss,
-                          zero_rescued=int((~base_hit & hit).sum()), zero_created=int((base_hit & ~hit).sum()))
+                          zero_rescued=int((~base_hit & hit).sum()), zero_created=int((base_hit & ~hit).sum()),
+                          changed_predictions=int((final != base).any(1).sum()),
+                          trainable_parameters=sum(p.numel() for p in trainable))
             history["history"].append(record)
             write_json(args.output / "results.json", history)
             print(json.dumps(record), flush=True)
             state = dict(checkpoint["model_state"])
             state.update({f"aa34.{key}": value.cpu() for key, value in reader.state_dict().items()})
-            torch.save(dict(checkpoint, model_state=state, aa34_refinement=record), out / f"epoch_{epoch}.pt")
+            refined = dict(checkpoint, model_state=state, aa34_refinement=record)
+            if readout_test:
+                refined["aa34_readout_position"] = arm
+            torch.save(refined, out / f"epoch_{epoch}.pt")
 
 
 if __name__ == "__main__":
@@ -123,7 +152,11 @@ if __name__ == "__main__":
     parser.add_argument("--feature-batch", type=int, default=64)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--experiment", choices=("ranking", "readout"), default="ranking")
+    parser.add_argument("--lr", type=float)
     parser.add_argument("--ranking-weight", type=float, default=.01)
     parser.add_argument("--seed", type=int, default=42)
-    run(parser.parse_args())
+    args = parser.parse_args()
+    if args.lr is None:
+        args.lr = 1e-3 if args.experiment == "readout" else 2e-5
+    run(args)

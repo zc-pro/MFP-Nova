@@ -11,7 +11,7 @@ from torch import nn
 from mfp_nova.cli import main as cli
 from mfp_nova.metrics import evaluate_metrics
 from mfp_nova.models.theraset import TheraSet
-from mfp_nova.models.trievidence import AA34Reader, center_evidence, empty_top10
+from mfp_nova.models.trievidence import AA34Reader, LocalLabelReadout, center_evidence, empty_top10
 from mfp_nova.multimodal import BackbonePeptides
 from mfp_nova.trainer import seed_everything, write_json
 from run_trievidence import batches, collect, open_data, pass_train, read_anchor, row_jaccard
@@ -22,12 +22,30 @@ def decision_scores(theraset, aa34, weight, cutoff):
     return (1 - weight) * scores[0] + weight * scores[1] - cutoff
 
 
+class AA34PositionReadout(AA34Reader):
+    def __init__(self, statistics, position):
+        super().__init__(statistics)
+        num_labels = len(statistics["labels"])
+        self.readout = LocalLabelReadout(512, num_labels, subtract_background=False)
+        self.readout_gain = nn.Parameter(torch.zeros(num_labels))
+        self.position = position
+
+    def forward(self, batch):
+        logits, maps = super().forward(batch, return_maps=True)
+        mask = batch["mask"]
+        if self.position == "global":
+            maps = maps.masked_fill(~mask[..., None], -torch.inf).amax(1, keepdim=True)
+            mask = mask.any(1, keepdim=True)
+        return logits + self.readout_gain * self.readout(maps, mask)
+
+
 class DuoEvidence(nn.Module):
-    def __init__(self, thera_args):
+    def __init__(self, thera_args, readout_position=None):
         super().__init__()
         with torch.random.fork_rng(devices=[]):
             self.theraset = TheraSet(**thera_args)
-        self.aa34 = AA34Reader(thera_args["statistics"])
+        self.aa34 = (AA34PositionReadout(thera_args["statistics"], readout_position)
+                     if readout_position else AA34Reader(thera_args["statistics"]))
         self.register_buffer("offsets", torch.zeros(2))
 
     def forward(self, batch, decision=None):
@@ -90,7 +108,7 @@ def evaluate(args, checkpoint, split, output):
     packed = torch.load(checkpoint, map_location="cpu", weights_only=True)
     if packed["model_name"] != "duoevidence":
         raise ValueError("Expected a DuoEvidence checkpoint")
-    model = DuoEvidence(packed["model_args"])
+    model = DuoEvidence(packed["model_args"], packed.get("aa34_readout_position"))
     model.load_state_dict(packed["model_state"])
     model.to(args.device).eval()
     source, ds = open_data(args, split, packed)
@@ -112,6 +130,8 @@ def evaluate(args, checkpoint, split, output):
                   seed=packed["seed"], theraset_epoch=packed["theraset_epoch"], aa34_epoch=packed["aa34_epoch"])
     if decision is not None:
         result["decision"] = decision
+    if "aa34_readout_position" in packed:
+        result["aa34_readout_position"] = packed["aa34_readout_position"]
     write_json(output/"results.json", result)
     np.savez_compressed(output/f"{split}_predictions.npz", row_id=source.data.rows[ds.indices],
                         cluster_id=source.data.clusters[ds.indices], label_names=source.data.labels,
