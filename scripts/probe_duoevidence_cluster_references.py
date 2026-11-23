@@ -10,7 +10,7 @@ import numpy as np
 from threadpoolctl import threadpool_limits
 
 from mfp_nova.data import CachedPeptides, PeptideData
-from mfp_nova.models.theraset import residue_encoding
+from mfp_nova.reference_fallback import aa34_summary, fallback_comparison, select_fallback, support_scores
 from mfp_nova.trainer import write_json
 
 
@@ -19,55 +19,6 @@ def pool_esm(data, root, split):
     offsets = cache.offsets
     return np.stack([cache.values[offsets[i]:offsets[i + 1]].mean(0, dtype=np.float32)
                      for i in cache.positions])
-
-
-def aa34_summary(sequences):
-    alphabet = {aa: i + 1 for i, aa in enumerate("ACDEFGHIKLMNPQRSTVWY")}
-    table = residue_encoding().numpy()
-    features = []
-    for sequence in sequences:
-        tokens = np.array([alphabet.get(aa, 0) for aa in sequence])
-        props = table[tokens]
-        pairs = np.bincount(21 * tokens[:-1] + tokens[1:], minlength=441)[1:].astype(np.float32)
-        pairs = pairs / max(1, len(tokens) - 1)
-        features.append(np.concatenate((props.mean(0), np.sqrt(pairs))))
-    return np.stack(features)
-
-
-def support_scores(fit, query, targets, clusters, batch_size=128):
-    """For each label, average the best matches from two distinct Train clusters."""
-    center = fit.mean(0)
-    fit, query = fit - center, query - center
-    fit /= np.linalg.norm(fit, axis=1, keepdims=True).clip(min=1e-12)
-    query /= np.linalg.norm(query, axis=1, keepdims=True).clip(min=1e-12)
-    label_groups = []
-    for positives in targets.T:
-        idx = np.flatnonzero(positives)
-        idx = idx[np.argsort(clusters[idx], kind="stable")]
-        starts = np.flatnonzero(np.r_[True, clusters[idx][1:] != clusters[idx][:-1]]) if len(idx) else idx
-        label_groups.append((idx, starts))
-    support = np.full((len(query), targets.shape[1]), np.nan, dtype=np.float32)
-    for start in range(0, len(query), batch_size):
-        end = min(start + batch_size, len(query))
-        similarities = query[start:end] @ fit.T
-        for label, (idx, starts) in enumerate(label_groups):
-            if len(starts) < 2:
-                continue
-            by_cluster = np.maximum.reduceat(similarities[:, idx], starts, axis=1)
-            top_two = np.partition(by_cluster, -2, axis=1)[:, -2:]
-            support[start:end, label] = top_two.mean(1)
-    return support
-
-
-def paired_cluster_interval(delta, clusters):
-    _, inverse, sizes = np.unique(clusters, return_inverse=True, return_counts=True)
-    totals = np.bincount(inverse, weights=delta)
-    rng = np.random.default_rng(42)
-    changes = []
-    for _ in range(2000):
-        sample = rng.integers(len(sizes), size=len(sizes))
-        changes.append(100 * totals[sample].sum() / sizes[sample].sum())
-    return np.quantile(changes, [.025, .975]).tolist()
 
 
 def diagnose(y, raw, final, logits, t_logits, a_logits, support, low, clusters):
@@ -98,23 +49,9 @@ def diagnose(y, raw, final, logits, t_logits, a_logits, support, low, clusters):
     eligible = (np.isfinite(support) | ~in_top5).all(1)
     reference_top = np.where(in_top5 & np.isfinite(support), support, -np.inf).argmax(1)
     original_hit, reference_hit = y[rows, original_top], y[rows, reference_top]
-    # Compare the existing one-label fallback against reference ranking on its exact pool.
-    thera_top10 = np.argsort(-t_logits, axis=1, kind="stable")[:, :10]
-    pool_support = np.take_along_axis(support, thera_top10, axis=1)
-    fallback_rows = ~nonempty & np.isfinite(pool_support).all(1)
-    fallback_label = thera_top10[rows, np.where(np.isfinite(pool_support), pool_support, -np.inf).argmax(1)]
-    fallback_hit = y[rows, fallback_label]
-    gain = fallback_rows & ~hit & fallback_hit
-    loss = fallback_rows & hit & ~fallback_hit
-    delta = (gain.astype(int) - loss) / y.sum(1).clip(min=1)
+    eligible_rows, updated = select_fallback(raw, final, t_logits, support)
     return {"pair_diagnostics": pair,
-            "fixed_theraset_top10_fallback": {
-                "eligible": int(fallback_rows.sum()),
-                "rescued": int(gain.sum()),
-                "new_zero": int(loss.sum()),
-                "all_validation_delta_pp": float(100 * delta.mean()),
-                "paired_cluster_ci95_pp": paired_cluster_interval(delta, clusters),
-            },
+            "fixed_theraset_top10_fallback": fallback_comparison(y, final, updated, eligible_rows, clusters),
             "fixed_fused_top5_probe": {
                 "eligible": int(eligible.sum()),
                 "top1_hit_before": int((eligible & original_hit).sum()),

@@ -15,6 +15,7 @@ from mfp_nova.models.sequence_features import FrozenFeatures
 from mfp_nova.models.theraset import TheraSet
 from mfp_nova.models.trievidence import AA34Reader, LocalLabelReadout, center_evidence, empty_top10
 from mfp_nova.multimodal import BackbonePeptides, function_projection
+from mfp_nova.reference_fallback import apply_train_reference, fallback_comparison
 from mfp_nova.trainer import seed_everything, write_json
 from run_trievidence import batches, collect, open_data, pass_train, read_anchor, row_jaccard
 from duoevidence_hard_pairs import hard_pair_loss, prepare as prepare_hard_pairs
@@ -300,15 +301,27 @@ def evaluate(args, checkpoint, split, output):
     logits, pred, theraset, aa34 = collect(read, batches(ds, args.batch_size), args.device, progress=True)
     pred = pred.bool().numpy()
     y = source.data.y[ds.indices].astype(bool)
+    raw = (logits >= 0).numpy()
+    reference_report = {}
+    extra_predictions = {}
+    if getattr(args, "reference_fallback", False):
+        baseline = pred
+        eligible, pred = apply_train_reference(source.data, ds.indices, raw, baseline, theraset.numpy())
+        reference_report = fallback_comparison(y, baseline, pred, eligible, source.data.clusters[ds.indices])
+        reference_report.update(rule="aa34_dipeptides_two_train_clusters_theraset_top10",
+                                baseline_sample_jaccard=float(row_jaccard(torch.from_numpy(y), torch.from_numpy(baseline)).mean()))
+        extra_predictions["predicted_original_fallback"] = baseline
     prob = logits.sigmoid().numpy()
     result = evaluate_metrics(y, prob, train_support=source.statistics["labels"]["support"],
                               function_projection=source.statistics["function_projection"], predicted=pred)
     result.update(split=split, rows=len(y), parameters=sum(p.numel() for p in model.parameters()),
-                  raw_acc=float(row_jaccard(torch.from_numpy(y), logits>=0).mean()),
+                  raw_acc=float(row_jaccard(torch.from_numpy(y), torch.from_numpy(raw)).mean()),
                   zero_hit=int((~(pred & y).any(1)).sum()), thresholds=packed["thresholds"],
                   seed=packed["seed"], theraset_epoch=packed["theraset_epoch"], aa34_epoch=packed["aa34_epoch"])
     if decision is not None:
         result["decision"] = decision
+    if reference_report:
+        result["reference_fallback"] = reference_report
     if "aa34_readout_position" in packed:
         result["aa34_readout_position"] = packed["aa34_readout_position"]
     if "aa34_family_mode" in packed:
@@ -318,9 +331,9 @@ def evaluate(args, checkpoint, split, output):
     write_json(output/"results.json", result)
     np.savez_compressed(output/f"{split}_predictions.npz", row_id=source.data.rows[ds.indices],
                         cluster_id=source.data.clusters[ds.indices], label_names=source.data.labels,
-                        targets=y, probabilities=prob, predicted=pred, predicted_raw=(logits>=0).numpy(),
+                        targets=y, probabilities=prob, predicted=pred, predicted_raw=raw,
                         split=split, offsets=model.offsets.cpu().numpy(), theraset_logits=theraset.numpy(),
-                        aa34_logits=aa34.numpy())
+                        aa34_logits=aa34.numpy(), **extra_predictions)
     print(f"{split} raw={result['raw_acc']:.4%} final={result['sample_jaccard']:.4%}", flush=True)
     return result
 
@@ -405,6 +418,8 @@ def main():
     parser.add_argument("--hard-pair-weight", type=float, default=.01)
     parser.add_argument("--min-pair-clusters", type=int, default=3)
     parser.add_argument("--decision", type=Path, help="Validation-fitted fusion weights and cutoff, for evaluate")
+    parser.add_argument("--reference-fallback", action="store_true",
+                        help="Use the fixed AA34 Train reference for empty predictions in evaluate")
     parser.add_argument("--predictions", type=Path, help="Uncalibrated Validation predictions, for calibrate")
     parser.add_argument("--config", type=Path, default=Path("configs/theraset.yaml"))
     parser.add_argument("--output", type=Path)
@@ -419,6 +434,8 @@ def main():
     parser.add_argument("--reader-epochs", type=int, default=25)
     parser.add_argument("--split", choices=("val", "test"), default="val")
     args = parser.parse_args()
+    if args.reference_fallback and (args.command != "evaluate" or args.decision):
+        parser.error("--reference-fallback requires evaluate with the checkpoint's fusion rule")
     training = args.command == "train"
     if args.command == "train-reader":
         if not args.checkpoint or not args.context_mode or args.split != "val" or args.decision or args.predictions:
