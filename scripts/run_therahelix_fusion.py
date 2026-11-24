@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.nn import functional as F
+from sklearn.metrics import average_precision_score
 
 from compare_duoevidence_pairs import align
 from probe_duoevidence_helix import compare as helix_probe
@@ -121,7 +122,12 @@ def evaluate(args):
         model = TheraHelixFusion(**checkpoint["model_args"])
     else:
         raise ValueError(f"Expected a {MODEL_NAME} or {THERAHELIX_JOINT} checkpoint")
-    model.load_state_dict(checkpoint["model_state"])
+    if args.ema_last:
+        state = {key.removeprefix("module."): value for key, value in checkpoint["ema_state"].items()
+                 if key.startswith("module.")}
+        model.load_state_dict(state)
+    else:
+        model.load_state_dict(checkpoint["model_state"])
     model.to(args.device).eval()
     source, dataset = open_data(args, args.split, checkpoint)
     data, indices = source.data, dataset.indices
@@ -138,7 +144,8 @@ def evaluate(args):
     branch_predictions = (theraset >= offsets[0], helixset >= offsets[1])
     a_hit, h_hit = ((labels & y).any(1) for labels in branch_predictions)
     report = {
-        "model": name, "epoch": checkpoint.get("best_epoch", checkpoint.get("epoch")),
+        "model": name, "epoch": checkpoint.get("epoch") if args.ema_last else
+        checkpoint.get("best_epoch", checkpoint.get("epoch")),
         "split": args.split, "rows": len(y), "raw_acc": float(jaccard(y, raw).mean()),
         "acc": float(jaccard(y, final).mean()), "zero_hits": int((~(final & y).any(1)).sum()),
         "reuse_inputs": not args.separate_inputs,
@@ -146,6 +153,12 @@ def evaluate(args):
         "branches": {
             "theraset_raw_acc": float(jaccard(y, branch_predictions[0]).mean()),
             "helixset_raw_acc": float(jaccard(y, branch_predictions[1]).mean()),
+            "theraset_macro_ap": float(np.mean([average_precision_score(y[:, i], theraset[:, i])
+                                                for i in range(y.shape[1]) if y[:, i].any()])),
+            "helixset_macro_ap": float(np.mean([average_precision_score(y[:, i], helixset[:, i])
+                                                for i in range(y.shape[1]) if y[:, i].any()])),
+            "theraset_top1_hits": int(y[np.arange(len(y)), theraset.argmax(1)].sum()),
+            "helixset_top1_hits": int(y[np.arange(len(y)), helixset.argmax(1)].sum()),
             "theraset_only_hits": int((a_hit & ~h_hit).sum()),
             "helixset_only_hits": int((h_hit & ~a_hit).sum()),
             "both_hit": int((a_hit & h_hit).sum()),
@@ -161,6 +174,28 @@ def evaluate(args):
         theraset_logits=theraset, latent_logits=helixset, logits=score, predicted_raw=raw, predicted=final)
     result = json.dumps(report, indent=2)
     (args.output / "results.json").write_text(result + "\n", encoding="utf-8")
+    print(result)
+
+
+def compare_runs(args):
+    with np.load(args.baseline) as old, np.load(args.candidate) as new:
+        idx = align(old, new, "val")
+        y = old["targets"].astype(bool)
+        before, after = old["predicted"].astype(bool), new["predicted"][idx].astype(bool)
+        delta = jaccard(y, after) - jaccard(y, before)
+        first_hit, second_hit = ((p & y).any(1) for p in (before, after))
+        report = {
+            "rows": len(y), "baseline_acc": float(jaccard(y, before).mean()),
+            "candidate_acc": float(jaccard(y, after).mean()),
+            "delta_pp": float(100 * delta.mean()),
+            "ci95_pp": paired_cluster_interval(delta, old["cluster_id"]),
+            "changed_rows": int((before != after).any(1).sum()),
+            "rescued": int((~first_hit & second_hit).sum()),
+            "new_zero": int((first_hit & ~second_hit).sum()),
+        }
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    result = json.dumps(report, indent=2)
+    args.output.write_text(result + "\n", encoding="utf-8")
     print(result)
 
 
@@ -276,7 +311,12 @@ def main():
     compare.add_argument("--peptide-features", type=Path, default=Path("features/esm2_peptide_150m"))
     compare.add_argument("--reference", type=Path, nargs=2, metavar=("DUO_NPZ", "STRIP_NPZ"))
     compare.add_argument("--separate-inputs", action="store_true")
+    compare.add_argument("--ema-last", action="store_true", help="Evaluate EMA weights stored in last.pt")
     compare.add_argument("--output", type=Path, required=True)
+    pair = commands.add_parser("compare")
+    pair.add_argument("baseline", type=Path)
+    pair.add_argument("candidate", type=Path)
+    pair.add_argument("--output", type=Path, required=True)
     fit = commands.add_parser("train")
     fit.add_argument("checkpoint", type=Path)
     fit.add_argument("--device", default="cuda:0")
@@ -292,7 +332,7 @@ def main():
     fit.add_argument("--peptide-features", type=Path, default=Path("features/esm2_peptide_150m"))
     fit.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    {"pack": pack, "evaluate": evaluate, "train": train}[args.command](args)
+    {"pack": pack, "evaluate": evaluate, "train": train, "compare": compare_runs}[args.command](args)
 
 
 if __name__ == "__main__":

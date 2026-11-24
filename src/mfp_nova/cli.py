@@ -1,11 +1,13 @@
 import argparse
 import json
+import math
 from pathlib import Path
 
 import yaml
 
 from .models import RESEARCH_MODELS, LEGACY_MODELS, HH_MODELS, HH_V15_RANKER, HH_V16, HH_V17, HH_V20, HH_V20_CHEMICAL_MODES
-from .models import PEPTIDE_V3, PEPTIDE_V6, PEPTIDE_V7, V3_MODES, V7_HEADS, XBRIDGE, THERASET_BRIDGE, THERAHELIX
+from .models import (PEPTIDE_V3, PEPTIDE_V6, PEPTIDE_V7, V3_MODES, V7_HEADS, XBRIDGE,
+                     THERASET_BRIDGE, THERAHELIX, THERAHELIX_JOINT)
 from .metric_protocol import SUITES
 from .models.hypotheses import MODELS as HYPOTHESIS_MODELS
 from .data import TRACKS
@@ -145,6 +147,8 @@ def main(argv=None):
             sub.add_argument("--name")
             sub.add_argument("--seed", type=int)
             sub.add_argument("--epochs", type=int)
+            sub.add_argument("--patience", type=int, help="Early-stopping patience in epochs; 0 disables early stopping")
+            sub.add_argument("--fusion-loss-weight", type=float, help="TheraHelix-Joint: weight of the fused output loss")
             sub.add_argument("--loss", choices=("asl", "bce"))
             sub.add_argument("--global-only", action="store_true", help="Disable the local CNN branch")
     evaluate = commands.add_parser("evaluate")
@@ -234,6 +238,13 @@ def main(argv=None):
         config_path = args.config or f"configs/{model_name}.yaml"
         config = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
         if args.command == "train":
+            if args.fusion_loss_weight is not None:
+                if (model_name != THERAHELIX_JOINT or not math.isfinite(args.fusion_loss_weight)
+                        or args.fusion_loss_weight < 0):
+                    parser.error("--fusion-loss-weight requires TheraHelix-Joint and a finite nonnegative weight")
+                config["loss"]["fusion_loss_weight"] = args.fusion_loss_weight
+            if args.patience is not None and args.patience < 0:
+                parser.error("--patience must be nonnegative")
             if args.theraset_bridge is not None:
                 if model_name != THERASET_BRIDGE or args.resume:
                     parser.error("--theraset-bridge selects an arm of a fresh --model theraset_bridge run")
@@ -480,7 +491,7 @@ def main(argv=None):
                 if args.reconstruction_decay is not None or args.reconstruction_floor is not None:
                     raise ValueError("Reconstruction scheduling is a research-model option")
                 from .trainer import train
-            for key in ("seed", "epochs", "num_workers", "learning_rate"):
+            for key in ("seed", "epochs", "patience", "num_workers", "learning_rate"):
                 value = getattr(args, key)
                 if value is not None:
                     config["train"][key] = value

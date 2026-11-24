@@ -36,6 +36,7 @@ model:
     latent_count: 32
     latent_depth: 6
 loss:
+  fusion_loss_weight: 1.0
   unlabeled_weight: 0.3
   modality_dropout: 0.1
   theraset: 0.5

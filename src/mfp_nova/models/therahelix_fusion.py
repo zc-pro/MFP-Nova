@@ -67,7 +67,7 @@ class TheraHelixFusion(nn.Module):
         view = training_views(batch, settings.get("modality_dropout", .1), 0.)[0] if self.training else batch
         output = self(view)
         weights = {
-            "logits": 1.,
+            "logits": settings.get("fusion_loss_weight", 1.),
             "theraset_logits": settings.get("theraset", .5),
             "latent_logits": settings.get("helixset", .5),
             "theraset_direct": settings.get("theraset_direct", .1),
