@@ -10,9 +10,11 @@ import torch
 from torch.nn import functional as F
 
 from compare_duoevidence_pairs import align
+from probe_duoevidence_helix import compare as helix_probe
+from mfp_nova.models import THERAHELIX_JOINT
 from mfp_nova.models.therahelix_fusion import TheraHelixFusion
 from mfp_nova.reference_fallback import apply_train_reference, paired_cluster_interval
-from mfp_nova.research import to_device
+from mfp_nova.research import make_model, to_device
 from mfp_nova.research_layers import observed_label_loss
 from run_trievidence import batches, collect, open_data
 
@@ -74,16 +76,33 @@ def compare_reference(paths, data, indices, split, theraset, helixset, score, ra
         limit = np.log(999999.)
         ref_score = ((a.clip(-limit, limit) - duo["offsets"][0])
                      + (h.clip(-limit, limit) - np.log(.64 / .36))) / 2
+        cohorts = {}
+        helix_probe(duo, strip, cohorts=cohorts)
     ref_raw, ref_final = decisions(data, indices, ref_score, a)
     y = data.y[indices].astype(bool)
     baseline = jaccard(y, ref_final)
     delta = jaccard(y, final) - baseline
+    reference_hit = (ref_final & y).any(1)
+    hit = (final & y).any(1)
+    cohorts["reference_already_hit"] = reference_hit
     return {
         "baseline_acc": float(baseline.mean()),
         "delta_pp": float(delta.mean() * 100),
         "ci95_pp": paired_cluster_interval(delta, data.clusters[indices]),
         "changed_raw_rows": int((raw != ref_raw).any(1).sum()),
         "changed_final_rows": int((final != ref_final).any(1).sum()),
+        "groups": {
+            name: {
+                "rows": int(mask.sum()),
+                "reference_hits": int((mask & reference_hit).sum()),
+                "hits": int((mask & hit).sum()),
+                "retained": int((mask & reference_hit & hit).sum()),
+                "rescued": int((mask & ~reference_hit & hit).sum()),
+                "new_zero": int((mask & reference_hit & ~hit).sum()),
+                "delta_contribution_pp": float(delta[mask].sum() / len(y) * 100),
+            }
+            for name, mask in cohorts.items()
+        },
         "max_abs_delta": {
             name: float(np.abs(observed - expected).max())
             for name, observed, expected in (("theraset_logits", theraset, a),
@@ -95,9 +114,13 @@ def compare_reference(paths, data, indices, split, theraset, helixset, score, ra
 
 def evaluate(args):
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
-    if checkpoint["model_name"] != MODEL_NAME:
-        raise ValueError(f"Expected a {MODEL_NAME} checkpoint")
-    model = TheraHelixFusion(**checkpoint["model_args"])
+    name = checkpoint["model_name"]
+    if name == THERAHELIX_JOINT:
+        model = make_model(name, checkpoint["model_args"])
+    elif name == MODEL_NAME:
+        model = TheraHelixFusion(**checkpoint["model_args"])
+    else:
+        raise ValueError(f"Expected a {MODEL_NAME} or {THERAHELIX_JOINT} checkpoint")
     model.load_state_dict(checkpoint["model_state"])
     model.to(args.device).eval()
     source, dataset = open_data(args, args.split, checkpoint)
@@ -111,11 +134,22 @@ def evaluate(args):
         read, batches(dataset, args.batch_size), args.device, progress=True))
     raw, final = decisions(data, indices, score, theraset)
     y = data.y[indices].astype(bool)
+    offsets = model.offsets.cpu().numpy()
+    branch_predictions = (theraset >= offsets[0], helixset >= offsets[1])
+    a_hit, h_hit = ((labels & y).any(1) for labels in branch_predictions)
     report = {
+        "model": name, "epoch": checkpoint.get("best_epoch", checkpoint.get("epoch")),
         "split": args.split, "rows": len(y), "raw_acc": float(jaccard(y, raw).mean()),
         "acc": float(jaccard(y, final).mean()), "zero_hits": int((~(final & y).any(1)).sum()),
         "reuse_inputs": not args.separate_inputs,
         "parameters": sum(parameter.numel() for parameter in model.parameters()),
+        "branches": {
+            "theraset_raw_acc": float(jaccard(y, branch_predictions[0]).mean()),
+            "helixset_raw_acc": float(jaccard(y, branch_predictions[1]).mean()),
+            "theraset_only_hits": int((a_hit & ~h_hit).sum()),
+            "helixset_only_hits": int((h_hit & ~a_hit).sum()),
+            "both_hit": int((a_hit & h_hit).sum()),
+        },
     }
     if args.reference:
         report["reference"] = compare_reference(

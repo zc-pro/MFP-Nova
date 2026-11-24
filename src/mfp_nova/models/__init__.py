@@ -13,8 +13,9 @@ PEPTIDE_V7 = "peptide_v7"
 XBRIDGE = "xbridge"
 THERASET_BRIDGE = "theraset_bridge"
 THERAHELIX = "therahelix"
+THERAHELIX_JOINT = "therahelix_joint"
 V3_MODES = ("cnn", "additive", "product", "centered")
 V7_HEADS = ("flat", "structured")
 SEQUENCE_ONLY_MODELS = ("termiscale", "motifspan", HH_V15_RANKER, HH_V20, PEPTIDE_V3, PEPTIDE_V6, PEPTIDE_V7)
 RESEARCH_MODELS = (*LEGACY_MODELS, *SEQUENCE_ONLY_MODELS, "privilegedbridge", "setreread",
-                   *HH_MODELS, HH_V16, HH_V17, XBRIDGE, THERASET_BRIDGE, THERAHELIX)
+                   *HH_MODELS, HH_V16, HH_V17, XBRIDGE, THERASET_BRIDGE, THERAHELIX, THERAHELIX_JOINT)

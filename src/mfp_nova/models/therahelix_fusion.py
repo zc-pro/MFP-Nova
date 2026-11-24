@@ -1,20 +1,25 @@
-"""Single model loaded from the trained TheraSet and compact HelixSet readers."""
+"""Joint and pretrained TheraSet–compact HelixSet fusion."""
+
+from contextlib import nullcontext
 
 import torch
 from torch import nn
 
-from ..research_layers import Attention, residue_distances
+from ..research_layers import Attention, observed_label_loss, residue_distances, training_views
 from .helixset import HelixSet
 from .theraset import TheraSet
 from .trievidence import center_evidence
 
 
 class TheraHelixFusion(nn.Module):
-    def __init__(self, theraset_args, helixset_args, interaction=False):
+    def __init__(self, theraset_args, helixset_args, interaction=False, train_readers=False,
+                 branch_thresholds=(.5, .5)):
         super().__init__()
+        self.train_readers = train_readers
+        self.statistics = theraset_args["statistics"]
         self.theraset = TheraSet(**theraset_args)
         self.helixset = HelixSet(**helixset_args, direct_only=True)
-        self.register_buffer("offsets", torch.zeros(2))
+        self.register_buffer("offsets", torch.tensor(branch_thresholds).logit())
         if interaction:
             dim = theraset_args.get("dim", 256)
             latent_dim = helixset_args.get("dim", 384)
@@ -26,8 +31,9 @@ class TheraHelixFusion(nn.Module):
 
     def train(self, mode=True):
         super().train(mode)
-        self.theraset.eval()
-        self.helixset.eval()
+        if not self.train_readers:
+            self.theraset.eval()
+            self.helixset.eval()
         return self
 
     def forward(self, batch, reuse_inputs=True):
@@ -37,7 +43,7 @@ class TheraHelixFusion(nn.Module):
             if self.theraset.structure_evidence and self.helixset.structure_evidence:
                 structural = batch["struct_mask"] & batch["mask"]
                 batch["_trievidence_distances"] = residue_distances(batch, structural)
-        with torch.no_grad():
+        with nullcontext() if self.train_readers else torch.no_grad():
             thera_output = self.theraset(batch, return_states=hasattr(self, "interaction"))
             helix_output = self.helixset(batch, return_evidence=hasattr(self, "interaction"))
         theraset = thera_output["logits"]
@@ -51,5 +57,26 @@ class TheraHelixFusion(nn.Module):
             lmask = torch.ones(latent.shape[:2], device=latent.device, dtype=torch.bool)
             read = self.interaction(queries, latent, qmask, lmask)
             logits = logits + self.interaction_output(read).squeeze(-1)
-        return {"logits": logits, "baseline_logits": baseline,
-                "theraset_logits": theraset, "latent_logits": helixset}
+        output = {"logits": logits, "baseline_logits": baseline,
+                  "theraset_logits": theraset, "latent_logits": helixset}
+        if self.train_readers:
+            output.update(theraset_direct=thera_output["direct"], theraset_evidence=thera_output["evidence_logits"])
+        return output
+
+    def compute_loss(self, batch, settings, return_output=False):
+        view = training_views(batch, settings.get("modality_dropout", .1), 0.)[0] if self.training else batch
+        output = self(view)
+        weights = {
+            "logits": 1.,
+            "theraset_logits": settings.get("theraset", .5),
+            "latent_logits": settings.get("helixset", .5),
+            "theraset_direct": settings.get("theraset_direct", .1),
+            "theraset_evidence": settings.get("theraset_evidence", .05),
+        }
+        terms = {
+            name: observed_label_loss(output[name], batch["y"], self.statistics,
+                                      settings.get("unlabeled_weight", .3))
+            for name in weights
+        }
+        loss = sum(weights[name] * term for name, term in terms.items())
+        return (loss, terms, output) if return_output else (loss, terms)

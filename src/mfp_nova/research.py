@@ -17,7 +17,8 @@ from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
 from .metrics import evaluate_metrics, evaluate_groups, format_epoch, fit_global_threshold, fit_label_thresholds
 from .models import (HH_MODELS, HH_V15_RANKER, HH_V16, HH_V17, HH_V20, HH_V20_CHEMICAL_MODES,
-                     PEPTIDE_V3, PEPTIDE_V6, PEPTIDE_V7, SEQUENCE_ONLY_MODELS, XBRIDGE, THERASET_BRIDGE, THERAHELIX)
+                     PEPTIDE_V3, PEPTIDE_V6, PEPTIDE_V7, SEQUENCE_ONLY_MODELS, XBRIDGE, THERASET_BRIDGE,
+                     THERAHELIX, THERAHELIX_JOINT)
 from .multimodal import BackbonePeptides, MultimodalData, MultimodalPeptides, backbone_inputs, collate_multimodal
 from .research_layers import observed_label_loss
 from .consistency import bernoulli_consistency, consistency_weight
@@ -27,6 +28,13 @@ from .metric_protocol import (FIXED_THRESHOLD_SUITES, JACCARD_ORDER, protocol_de
 
 
 def make_model(name, arguments):
+    if name == THERAHELIX_JOINT:
+        from .models.therahelix_fusion import TheraHelixFusion
+        shared = {key: arguments[key] for key in
+                  ("input_dim", "peptide_input_dim", "num_labels", "vocab_size", "statistics")}
+        helix = dict(arguments["helixset"], triangles=False, mix_latents=False, compact_inactive=True)
+        return TheraHelixFusion(dict(shared, **arguments["theraset"]), dict(shared, **helix),
+                                train_readers=True, branch_thresholds=arguments["branch_thresholds"])
     if name == THERAHELIX:
         from .models.therahelix import TheraHelix
         return TheraHelix(**arguments)
@@ -296,12 +304,12 @@ def validate_cache(dataset, config, reference=None):
     settings = config.get("peptide_encoder")
     if (peptide is None) != (settings is None):
         raise ValueError("Peptide encoder configuration and cache must be supplied together")
-    if config.get("model_name") in (PEPTIDE_V7, XBRIDGE, THERASET_BRIDGE, THERAHELIX) and peptide is None:
+    if config.get("model_name") in (PEPTIDE_V7, XBRIDGE, THERASET_BRIDGE, THERAHELIX, THERAHELIX_JOINT) and peptide is None:
         raise ValueError(f"{config['model_name']} requires both frozen ESM caches")
     if peptide is not None:
         if config["model_name"] not in (
                 "helixset", "theraset", "privilegedbridge", *SEQUENCE_ONLY_MODELS,
-                *HH_MODELS, HH_V16, HH_V17, XBRIDGE, THERASET_BRIDGE, THERAHELIX):
+                *HH_MODELS, HH_V16, HH_V17, XBRIDGE, THERASET_BRIDGE, THERAHELIX, THERAHELIX_JOINT):
             raise ValueError("This architecture does not support dual frozen encoders")
         if peptide["name"] != settings["name"] or peptide["max_length"] != settings["max_length"]:
             raise ValueError("Configured peptide encoder differs from cache")
@@ -466,7 +474,7 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     peptide_v3 = config["model_name"] == PEPTIDE_V3
     if peptide_v3 and config["data"]["track"] not in ("fine39", "major15", "rich48"):
         raise ValueError("V3 uses the project Fine39, Major15 or Rich48 split")
-    if config["model_name"] in (PEPTIDE_V6, PEPTIDE_V7, XBRIDGE) and config["data"]["track"] != "fine39":
+    if config["model_name"] in (PEPTIDE_V6, PEPTIDE_V7, XBRIDGE, THERAHELIX_JOINT) and config["data"]["track"] != "fine39":
         raise ValueError(f"{config['model_name']} uses the project Fine39 split")
     anchor = None
     if xbridge:
