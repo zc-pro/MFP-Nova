@@ -82,6 +82,13 @@ def refine(args, output):
                 raise ValueError(f"The reference already disables {flag}")
             model_args["helixset_args"][flag] = False
     model_args["helixset_args"]["latent_depth"] = args.depth
+    if args.pair_depth is not None:
+        original_pair_depth = model_args["helixset_args"].get("pair_depth", 4)
+        if args.epochs or args.ablate or not 0 <= args.pair_depth <= original_pair_depth:
+            raise ValueError("--pair-depth is a frozen prefix comparison up to the checkpoint depth")
+        model_args["helixset_args"]["pair_depth"] = args.pair_depth
+    if args.compact_inactive:
+        model_args["helixset_args"]["compact_inactive"] = True
     state = packed["model_state"]
     if args.ffn_rank is not None:
         if args.ablate or args.depth != original_depth or model_args["helixset_args"].get("latent_ffn_rank") is not None:
@@ -164,6 +171,8 @@ def refine(args, output):
     _, epoch, h = best
     report = diagnostics(source, val, a, c, h, offsets, "val", output)
     report.update(reference_checkpoint=str(args.checkpoint), depth=args.depth, ablation=args.ablate,
+                  pair_depth=model_args["helixset_args"].get("pair_depth", 4),
+                  compact_inactive=model_args["helixset_args"].get("compact_inactive", False),
                   ffn_rank=args.ffn_rank, best_epoch=epoch,
                   representation=args.representation, ranking_weight=args.ranking_weight,
                   selection="fixed_final_epoch" if args.representation else "validation",
@@ -176,6 +185,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("--depth", type=int, required=True)
+    parser.add_argument("--pair-depth", type=int, help="Keep this prefix of the residual pair-update stack")
+    parser.add_argument("--compact-inactive", action="store_true",
+                        help="Omit weights from triangle or latent-attention paths already disabled")
     parser.add_argument("--ffn-rank", type=int, help="SVD rank for the two FFN linear layers in each latent block")
     parser.add_argument("--ablate", choices=("geometry", "triangles", "pair_blocks", "multiscale",
                                                "latent_mixing", "latent_mixing_triangles"),

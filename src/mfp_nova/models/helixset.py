@@ -337,7 +337,8 @@ class HelixSet(nn.Module):
                  geometry_context=True, geometry_quality=True, distance_multiscale=True,
                  scale_balance=True, pair_interactions=True, structure_evidence=True,
                  esm_tail=None, evidence_readout=False, peptide_input_dim=0, direct_only=False,
-                 latent_ffn_rank=None, residue_only_motifs=False, mix_latents=True):
+                 latent_ffn_rank=None, residue_only_motifs=False, mix_latents=True,
+                 compact_inactive=False):
         super().__init__()
         if direct_only and evidence_readout:
             raise ValueError("The latent-only exit does not use the early evidence decoder")
@@ -375,6 +376,13 @@ class HelixSet(nn.Module):
         ])
         for block in self.latent_blocks:
             block.mix_latents = mix_latents
+            if compact_inactive and not mix_latents:
+                del block.process.attention
+        if compact_inactive and not triangles:
+            for block in self.pair_blocks:
+                for name in ("triangle_left", "triangle_right", "triangle_out", "geometry_left",
+                             "geometry_right", "geometry_out", "geometry_scale"):
+                    delattr(block, name)
         prior = torch.tensor(statistics["observed_prior"]).clamp(1e-4, 1 - 1e-4)
         if not direct_only:
             self.label_queries = nn.Parameter(torch.randn(num_labels, dim) * .02)
