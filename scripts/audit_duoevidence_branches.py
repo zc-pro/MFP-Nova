@@ -90,14 +90,66 @@ def audit(base, members, nearest=None):
     return report
 
 
+def diagnose_failures(base, helix):
+    order = np.argsort(helix["row_id"])
+    idx = order[np.searchsorted(helix["row_id"][order], base["row_id"])]
+    for key in ("row_id", "targets", "cluster_id"):
+        np.testing.assert_array_equal(base[key], helix[key][idx])
+    np.testing.assert_array_equal(base["label_names"], helix["label_names"])
+    y = base["targets"].astype(bool)
+    final = base["predicted"].astype(bool)
+    scores = np.stack((base["theraset_logits"], base["aa34_logits"]))
+    fused = center_evidence(torch.from_numpy(scores), torch.from_numpy(base["offsets"])).mean(0).numpy()
+    size = final.sum(1, keepdims=True)
+
+    def ranks(score):
+        return np.argsort(np.argsort(-score, axis=1, kind="stable"), axis=1)
+
+    tr, ar = ranks(base["theraset_logits"]), ranks(base["aa34_logits"])
+    t_hit, a_hit = ((y & (r < size)).any(1) for r in (tr, ar))
+    final_hit = (y & final).any(1)
+    best_branch_rank = np.where(y, np.minimum(tr, ar), y.shape[1]).min(1)
+    best_score = np.where(y, fused, -np.inf).max(1)
+    helix_rank = ranks(helix["latent_logits"][idx])
+    groups = {"branch_hit_fusion_missed": (t_hit | a_hit) & ~final_hit,
+              "neither_branch_hit_at_matched_size": ~t_hit & ~a_hit}
+    report = {}
+    for name, group in groups.items():
+        report[name] = {
+            "rows": int(group.sum()),
+            "only_theraset": int((group & t_hit & ~a_hit).sum()),
+            "only_aa34": int((group & ~t_hit & a_hit).sum()),
+            "both_branches": int((group & t_hit & a_hit).sum()),
+            "fusion_hit": int((group & final_hit).sum()),
+            "has_observed_label_above_fusion_cutoff": int((group & (best_score >= 0)).sum()),
+            "best_observed_within_half_logit_below_cutoff": int(
+                (group & (best_score >= -.5) & (best_score < 0)).sum()),
+            "best_observed_branch_rank": {
+                key: int((group & band).sum()) for key, band in (
+                    ("top5", best_branch_rank < 5),
+                    ("rank6_10", (best_branch_rank >= 5) & (best_branch_rank < 10)),
+                    ("outside_top10", best_branch_rank >= 10))
+            },
+            "helix_top1_hits": int((group & (y & (helix_rank == 0)).any(1)).sum()),
+            "helix_matched_size_hits": int((group & (y & (helix_rank < size)).any(1)).sum()),
+            "helix_top10_hits_on_branch_top10_misses": int(
+                (group & (best_branch_rank >= 10) & (y & (helix_rank < 10)).any(1)).sum()),
+        }
+    return report
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("base", type=Path)
     parser.add_argument("members", type=Path, nargs="*")
     parser.add_argument("--nearest", type=Path)
+    parser.add_argument("--helix", type=Path, help="Historical latent-direct export for failure attribution")
     args = parser.parse_args()
     with ExitStack() as files:
         base = files.enter_context(np.load(args.base))
         members = {p.parent.name: files.enter_context(np.load(p)) for p in args.members}
         nearest = files.enter_context(np.load(args.nearest)) if args.nearest else None
-        print(json.dumps(audit(base, members, nearest), indent=2))
+        report = audit(base, members, nearest)
+        if args.helix:
+            report["failure_diagnostics"] = diagnose_failures(base, files.enter_context(np.load(args.helix)))
+        print(json.dumps(report, indent=2))
