@@ -90,7 +90,7 @@ def audit(base, members, nearest=None):
     return report
 
 
-def diagnose_failures(base, helix):
+def diagnose_failures(base, helix, members=None):
     order = np.argsort(helix["row_id"])
     idx = order[np.searchsorted(helix["row_id"][order], base["row_id"])]
     for key in ("row_id", "targets", "cluster_id"):
@@ -135,6 +135,33 @@ def diagnose_failures(base, helix):
             "helix_top10_hits_on_branch_top10_misses": int(
                 (group & (best_branch_rank >= 10) & (y & (helix_rank < 10)).any(1)).sum()),
         }
+    if members:
+        neither = groups["neither_branch_hit_at_matched_size"]
+        has_candidate = neither & (best_branch_rank < 5)
+        no_candidate = neither & (best_branch_rank >= 10)
+        helix_top10 = (y & (helix_rank < 10)).any(1)
+        def margin(values):
+            return np.where(y, values, -np.inf).max(1) - np.where(~y, values, -np.inf).max(1)
+        reference_margin = margin(fused)
+        report["candidate_models"] = {}
+        for name, export in members.items():
+            values = np.stack((export["theraset_logits"], export["aa34_logits"]))
+            scores = center_evidence(torch.from_numpy(values), torch.from_numpy(base["offsets"])).numpy()
+            candidate_fused = scores.mean(0)
+            hit = (y & export["predicted"]).any(1)
+            branch_top10 = (y & ((ranks(values[0]) < 10) | (ranks(values[1]) < 10))).any(1)
+            report["candidate_models"][name] = {
+                "original_neither_top5_rows": int(has_candidate.sum()),
+                "original_neither_top5_rescued": int((has_candidate & ~final_hit & hit).sum()),
+                "original_neither_top5_median_margin_change": (
+                    float(np.median((margin(candidate_fused) - reference_margin)[has_candidate]))
+                    if has_candidate.any() else None),
+                "original_outside_top10_rows": int(no_candidate.sum()),
+                "original_outside_top10_now_branch_top10": int((no_candidate & branch_top10).sum()),
+                "original_outside_top10_now_branch_top10_shared_with_helix":
+                    int((no_candidate & branch_top10 & helix_top10).sum()),
+                "original_outside_top10_rescued": int((no_candidate & ~final_hit & hit).sum()),
+            }
     return report
 
 
@@ -151,5 +178,5 @@ if __name__ == "__main__":
         nearest = files.enter_context(np.load(args.nearest)) if args.nearest else None
         report = audit(base, members, nearest)
         if args.helix:
-            report["failure_diagnostics"] = diagnose_failures(base, files.enter_context(np.load(args.helix)))
+            report["failure_diagnostics"] = diagnose_failures(base, files.enter_context(np.load(args.helix)), members)
         print(json.dumps(report, indent=2))

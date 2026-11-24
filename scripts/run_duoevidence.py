@@ -31,7 +31,9 @@ MOMENT_MODES = ("aa34_only", "independent_moment", "aligned_moment")
 HARD_PAIR_MODES = ("hard_pair_global", "hard_pair_local")
 INTERACTION_MODES = ("interaction_control", "interaction_pointwise", "interaction_relative")
 WINDOW_MODES = ("window_control", "window_same_scale", "window_multiscale")
-FIXED_MODES = (*MOMENT_MODES, "hard_pair_control", *HARD_PAIR_MODES, *INTERACTION_MODES, *WINDOW_MODES, "aa34_member")
+WINDOW_READ_MODES = ("window_read_shared", "window_read_label")
+FIXED_MODES = (*MOMENT_MODES, "hard_pair_control", *HARD_PAIR_MODES, *INTERACTION_MODES,
+               *WINDOW_MODES, *WINDOW_READ_MODES, "aa34_member")
 
 
 class AA34HardPairReader(AA34Reader):
@@ -147,6 +149,39 @@ class AA34WindowReader(AA34Reader):
         return self.classifier[1:](hidden)
 
 
+class AA34WindowEvidenceReader(AA34Reader):
+    """Compare shared versus label-conditioned selection of identical windows."""
+
+    def __init__(self, statistics, label_conditioned):
+        super().__init__(statistics)
+        self.label_conditioned = label_conditioned
+        width = self.classifier[0].in_features
+        labels = len(statistics["labels"])
+        with torch.random.fork_rng(devices=[]):
+            self.project = nn.Linear(width, 96, bias=False)
+            self.shared_score = nn.Linear(32, 1, bias=False)
+            self.label_score = nn.Linear(32, labels, bias=False)
+            self.gain = nn.Parameter(torch.zeros(labels))
+
+    def forward(self, batch):
+        base, maps = super().forward(batch, return_maps=True)
+        mask = batch["mask"][:, None, :]
+        projected = self.project(maps).transpose(1, 2).masked_fill(~mask, 0)
+        evidence = []
+        for width, view in zip((3, 7, 15), projected.chunk(3, dim=1)):
+            counts = torch.nn.functional.avg_pool1d(mask.float(), width, stride=1, padding=width // 2)
+            means = torch.nn.functional.avg_pool1d(view, width, stride=1, padding=width // 2)
+            means = means / counts.clamp_min(1 / width).to(means.dtype)
+            windows = torch.nn.functional.gelu(means.transpose(1, 2))
+            local = self.label_score(windows)
+            attention = self.shared_score(windows)
+            if self.label_conditioned:
+                attention = attention + local
+            attention = attention.masked_fill(~mask.transpose(1, 2), -torch.inf).softmax(1)
+            evidence.append((local * attention).sum(1))
+        return base + self.gain * torch.stack(evidence).mean(0)
+
+
 class AA34RelativeInteraction(AA34Reader):
     """Matched pointwise or signed-neighborhood interactions before peak pooling."""
 
@@ -249,6 +284,8 @@ class DuoEvidence(nn.Module):
         elif context_mode in ("window_same_scale", "window_multiscale"):
             widths = (3, 7, 15) if context_mode == "window_multiscale" else (7, 7, 7)
             self.aa34 = AA34WindowReader(statistics, widths)
+        elif context_mode in WINDOW_READ_MODES:
+            self.aa34 = AA34WindowEvidenceReader(statistics, context_mode == "window_read_label")
         elif context_mode in ("pooled", "latent"):
             self.aa34 = DuoContextReader(thera_args["input_dim"], thera_args["peptide_input_dim"],
                                          statistics, context_mode)
@@ -291,7 +328,7 @@ def fit_reader(args, output, ckpt):
                  batches(validation, args.batch_size), args.device, progress=True)
     standalone_selection = args.context_mode == "aa34_member"
     backbone_only = standalone_selection or args.context_mode in ("hard_pair_control", *HARD_PAIR_MODES,
-                                                                   *INTERACTION_MODES, *WINDOW_MODES)
+                                                                   *INTERACTION_MODES, *WINDOW_MODES, *WINDOW_READ_MODES)
     if args.context_mode and not backbone_only:
         _, training = open_data(args, "train", ckpt)
         val = validation
