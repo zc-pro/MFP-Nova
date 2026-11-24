@@ -9,10 +9,12 @@ import numpy as np
 import torch
 from torch.utils.data import Subset
 
+from mfp_nova.models.helixset import HelixSet
 from mfp_nova.models.trievidence import TriEvidence
 from mfp_nova.research import to_device, validate_cache
 from mfp_nova.trainer import write_json
 from run_trievidence import batches, open_data
+from run_duoevidence import DuoEvidence
 
 
 @torch.inference_mode()
@@ -57,7 +59,20 @@ def benchmark(args):
     inputs = [to_device(batch, device) for batch in loader]
 
     models = []
-    for path in paths:
+    if args.duo_vs_helix:
+        packed = torch.load(paths[1], map_location="cpu", weights_only=True)
+        if baseline["model_name"] != "duoevidence" or packed["model_name"] != "trievidence":
+            raise ValueError("Use the original DuoEvidence and packed TriEvidence checkpoints")
+        np.testing.assert_array_equal(baseline["labels"], packed["labels"])
+        validate_cache(dataset, packed["config"], packed["encoder"])
+        duo = DuoEvidence(baseline["model_args"])
+        duo.load_state_dict(baseline["model_state"])
+        helix = HelixSet(**packed["model_args"]["helixset_args"], direct_only=True)
+        helix.load_state_dict({k.removeprefix("helixset."): v for k, v in packed["model_state"].items()
+                              if k.startswith("helixset.")})
+        models = [PairForward(duo.theraset, duo.aa34).to(device).eval(),
+                  PairForward(duo.theraset, helix).to(device).eval()]
+    for path in (() if args.duo_vs_helix else paths):
         state = torch.load(path, map_location="cpu", weights_only=True) if path != paths[0] else baseline
         if state["model_name"] != "trievidence" or "helixset_args" not in state["model_args"]:
             raise ValueError("Use the original and low-rank three-branch checkpoints")
@@ -71,7 +86,9 @@ def benchmark(args):
         models[1].pack_esm_projections()
     full, candidate = time_models(models, inputs, args.repeats)
     difference = candidate - full
-    report = {"hardware": torch.cuda.get_device_name(device), "precision": "fp32", "reuse_input_compute": True,
+    report = {"hardware": torch.cuda.get_device_name(device), "precision": "fp32",
+              "reuse_input_compute": not args.duo_vs_helix,
+              "scope": "GPU-resident cached features to branch logits" if args.duo_vs_helix else "packed model forward",
               "batch_size": args.batch_size, "batches": args.batches, "repeats": args.repeats,
               "batch_indices": indices.tolist(),
               "pack_candidate_esm_projections": args.pack_candidate_esm_projections,
@@ -82,12 +99,36 @@ def benchmark(args):
         report["models"][name] = {"checkpoint": str(path), "parameters": sum(p.numel() for p in model.parameters()),
                                   "p50_ms": float(np.median(values)), "p95_ms": float(np.quantile(values, .95)),
                                   "samples_ms": values.tolist()}
+        if args.duo_vs_helix:
+            report["models"][name]["weights_bytes"] = sum(
+                tensor.numel() * tensor.element_size() for tensor in model.state_dict().values())
+            report["models"][name]["peak_forward_extra_cuda_bytes"] = peak_forward_memory(model, inputs, device)
     output = args.output or Path("runs") / datetime.now().strftime("trievidence_gpu_%Y%m%d_%H%M%S_%f")
     output.mkdir(parents=True, exist_ok=False)
     write_json(output / "results.json", report)
     for entry in report["models"].values():
         entry.pop("samples_ms")
     print(json.dumps(report, indent=2), output, sep="\n")
+
+
+class PairForward(torch.nn.Module):
+    def __init__(self, first, second):
+        super().__init__()
+        self.first, self.second = first, second
+
+    def forward(self, batch):
+        return self.first(batch), self.second(batch)
+
+
+@torch.inference_mode()
+def peak_forward_memory(model, inputs, device):
+    torch.cuda.synchronize(device)
+    start = torch.cuda.memory_allocated(device)
+    torch.cuda.reset_peak_memory_stats(device)
+    for batch in inputs:
+        model(batch)
+    torch.cuda.synchronize(device)
+    return torch.cuda.max_memory_allocated(device) - start
 
 
 if __name__ == "__main__":
@@ -102,7 +143,11 @@ if __name__ == "__main__":
     parser.add_argument("--features", type=Path, default=Path("features/esm2_650m"))
     parser.add_argument("--peptide-features", type=Path, default=Path("features/esm2_peptide_150m"))
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--duo-vs-helix", action="store_true",
+                        help="Compare TheraSet plus original AA34 versus TheraSet plus latent-direct")
     parser.add_argument("--pack-candidate-esm-projections", action="store_true",
                         help="Pack the candidate's original ESM projections before timing")
     args = parser.parse_args()
+    if args.duo_vs_helix and args.pack_candidate_esm_projections:
+        parser.error("--pack-candidate-esm-projections is only available for packed three-branch runs")
     benchmark(args)

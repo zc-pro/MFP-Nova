@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 
 from mfp_nova.reference_fallback import paired_cluster_interval
+from probe_duoevidence_helix import compare as three_branch_probe
 
 
 def compare(base, helix):
@@ -31,6 +32,8 @@ def compare(base, helix):
               "helix": helix["latent_logits"][idx].clip(-limit, limit)}
     offsets = {"theraset": a, "aa34": b, "helix": np.log(.64/.36)}
     reference_zero = ~(old & y).any(1)
+    three_branch_rescues, cohorts = {}, {}
+    three_branch_probe(base, helix, masks=three_branch_rescues, cohorts=cohorts)
     def jaccard(p):
         return (p & y).sum(1) / (p | y).sum(1).clip(min=1)
 
@@ -58,6 +61,17 @@ def compare(base, helix):
             "left_only_top1": int((lhit & ~rhit).sum()),
             "right_only_top1": int((rhit & ~lhit).sum()),
         }
+        results[key]["fixed_original_cohorts"] = {}
+        for name, mask in cohorts.items():
+            entry = {"rows": int(mask.sum()), "rescued": int((mask & reference_zero & hit).sum()),
+                     "new_zero": int((mask & ~reference_zero & ~hit).sum()),
+                     "delta_contribution_pp": float(100 * delta[mask].sum() / len(y))}
+            if name in three_branch_rescues:
+                reference = three_branch_rescues[name]
+                entry.update(shared_rescues=int((reference & hit).sum()),
+                             lost_three_branch_rescues=int((reference & ~hit).sum()),
+                             additional_rescues=int((mask & ~reference & hit).sum()))
+            results[key]["fixed_original_cohorts"][name] = entry
         outputs[key] = jaccard(proposed)
     same_rule = outputs["theraset_aa34"]
     for key, result in results.items():
