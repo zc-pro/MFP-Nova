@@ -9,11 +9,12 @@ from pathlib import Path
 
 import numpy as np
 
-from mfp_nova.reference_fallback import paired_cluster_interval
+from mfp_nova.data import PeptideData
+from mfp_nova.reference_fallback import apply_train_reference, paired_cluster_interval
 from probe_duoevidence_helix import compare as three_branch_probe
 
 
-def compare(base, helix):
+def compare(base, helix, data=None):
     order = np.argsort(helix["row_id"])
     idx = order[np.searchsorted(helix["row_id"][order], base["row_id"])]
     for key in ("row_id", "targets", "cluster_id"):
@@ -38,6 +39,12 @@ def compare(base, helix):
         return (p & y).sum(1) / (p | y).sum(1).clip(min=1)
 
     results, outputs = {}, {}
+    fixed, raw_outputs = {}, {}
+    if data is not None:
+        val = data.indices("val")
+        for key, expected in (("row_id", data.rows[val]), ("cluster_id", data.clusters[val]),
+                              ("targets", data.y[val]), ("label_names", data.labels)):
+            np.testing.assert_array_equal(base[key], expected)
     for left, right in itertools.combinations(logits, 2):
         key = f"{left}_{right}"
         score = ((logits[left] - offsets[left]) + (logits[right] - offsets[right])) / 2
@@ -73,12 +80,39 @@ def compare(base, helix):
                              additional_rescues=int((mask & ~reference & hit).sum()))
             results[key]["fixed_original_cohorts"][name] = entry
         outputs[key] = jaccard(proposed)
+        if data is not None and left == "theraset":
+            # Apply the same frozen Train reference on each pair's own empty rows.
+            initial = old if right == "aa34" else proposed
+            _, fixed[key] = apply_train_reference(data, val, raw, initial, base["theraset_logits"])
+            raw_outputs[key] = raw
     same_rule = outputs["theraset_aa34"]
     for key, result in results.items():
         d = outputs[key] - same_rule
         result.update(delta_vs_theraset_aa34_same_rule_pp=float(100 * d.mean()),
                       ci95_vs_theraset_aa34_same_rule_pp=paired_cluster_interval(d, clusters))
-    return {"rows": len(y), "original_protocol_acc": float(jaccard(old).mean()), "pairs": results}
+    report = {"rows": len(y), "original_protocol_acc": float(jaccard(old).mean()), "pairs": results}
+    if fixed:
+        control, candidate = (fixed[key] for key in ("theraset_aa34", "theraset_helix"))
+        delta = jaccard(candidate) - jaccard(control)
+        control_hit, candidate_hit = ((p & y).any(1) for p in (control, candidate))
+        old_empty = ~raw_outputs["theraset_aa34"].any(1)
+        new_empty = ~raw_outputs["theraset_helix"].any(1)
+        groups = {"original_empty_candidate_direct": old_empty & ~new_empty,
+                  "both_need_fallback": old_empty & new_empty,
+                  "original_direct_candidate_empty": ~old_empty & new_empty,
+                  "both_direct": ~old_empty & ~new_empty}
+        report["fixed_reference_comparison"] = {
+            "theraset_aa34_acc": float(jaccard(control).mean()),
+            "theraset_helix_acc": float(jaccard(candidate).mean()),
+            "delta_pp": float(100 * delta.mean()),
+            "ci95_pp": paired_cluster_interval(delta, clusters),
+            "groups": {name: {"rows": int(mask.sum()),
+                              "delta_contribution_pp": float(100 * delta[mask].sum() / len(y)),
+                              "rescued": int((mask & ~control_hit & candidate_hit).sum()),
+                              "new_zero": int((mask & control_hit & ~candidate_hit).sum())}
+                       for name, mask in groups.items()},
+        }
+    return report
 
 
 if __name__ == "__main__":
@@ -86,10 +120,13 @@ if __name__ == "__main__":
     parser.add_argument("base", type=Path)
     parser.add_argument("helix", type=Path)
     parser.add_argument("--member", help="Base prediction member in a tar archive")
+    parser.add_argument("--fixed-reference", action="store_true", help="Use the fixed Train fallback on both TheraSet pairs")
+    parser.add_argument("--data-root", type=Path, default=Path("data/therapeutic_2025"))
     args = parser.parse_args()
     source = args.base
     if args.member:
         with tarfile.open(source) as archive:
             source = io.BytesIO(archive.extractfile(args.member).read())
     with np.load(source) as base, np.load(args.helix) as helix:
-        print(json.dumps(compare(base, helix), indent=2))
+        data = PeptideData(args.data_root) if args.fixed_reference else None
+        print(json.dumps(compare(base, helix, data), indent=2))
