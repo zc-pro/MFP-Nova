@@ -509,7 +509,10 @@ class HelixSet(nn.Module):
             latent = block(latent, latent_mask, memories, masks, reliability, motif_weights)
         direct = self.read_latent(latent, seq, seq_mask)
         if self.direct_only:
-            return {"logits": direct, "direct": direct}
+            output = {"logits": direct, "direct": direct}
+            if return_evidence:
+                output["latent"] = latent
+            return output
         intermediate = []
         for block in self.decoder:
             labels, pair_attention = block(
