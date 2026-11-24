@@ -65,6 +65,9 @@ def prepare(args, output, checkpoint):
     })
     np.savez_compressed(output / "hard_pairs.npz", row_id=source.data.rows[indices],
                         label_names=labels, targets=targets, competitors=candidates, pairs=pairs)
+    np.savez_compressed(output / "oof_branch_logits.npz", row_id=source.data.rows[indices],
+                        cluster_id=clusters, label_names=labels, targets=targets,
+                        theraset_logits=thera, aa34_logits=aa34, split="train_oof")
     print(output / "hard_pairs.npz", flush=True)
 
 
