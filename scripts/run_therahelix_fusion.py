@@ -152,6 +152,10 @@ def train(args):
     args.output.mkdir(parents=True)
     for epoch in range(args.epochs + 1):
         loss_sum = 0.
+        hard_labels = 0
+        hard_rows = 0
+        hard_loss_sum = 0.
+        batches_seen = 0
         if epoch:
             model.train()
             for step, batch in enumerate(batches(training, args.batch_size, shuffle=True), 1):
@@ -161,10 +165,17 @@ def train(args):
                 supervised = observed_label_loss(output["logits"], batch["y"],
                                                   source.statistics["labels"], args.unlabeled_weight)
                 protection = F.mse_loss(output["logits"], output["baseline_logits"])
-                loss = supervised + args.protection_weight * protection
+                missed = (batch["y"] > 0) & (output["baseline_logits"] < 0)
+                hard_loss = (F.softplus(-output["logits"]) * missed).sum() / missed.sum().clamp_min(1)
+                loss = (supervised + args.protection_weight * protection
+                        + args.hard_positive_weight * hard_loss)
                 loss.backward()
                 optimizer.step()
                 loss_sum += float(loss.detach()) * len(batch["y"])
+                hard_labels += int(missed.sum())
+                hard_rows += int(missed.any(1).sum())
+                hard_loss_sum += float(hard_loss.detach())
+                batches_seen += 1
                 if step == 1 or step % 256 == 0:
                     print(f"Epoch {epoch} train {step} loss={float(loss):.6f}", flush=True)
         model.eval()
@@ -192,6 +203,13 @@ def train(args):
             "rescued": int((~baseline_hit & hit).sum()),
             "new_zero": int((baseline_hit & ~hit).sum()),
             "already_hit_delta_pp": float(delta[baseline_hit].sum() / len(truth) * 100),
+            "changed_raw_rows": int((raw != (base >= 0)).any(1).sum()),
+            "changed_final_rows": int((pred != baseline_pred).any(1).sum()),
+            "train_missed_positive_labels": hard_labels if epoch else None,
+            "train_rows_with_missed_positive": hard_rows if epoch else None,
+            "train_hard_positive_loss": hard_loss_sum / batches_seen if batches_seen else None,
+            "hard_positive_weight": args.hard_positive_weight,
+            "protection_weight": args.protection_weight,
         }
         history.append(record)
         print(json.dumps(record), flush=True)
@@ -234,6 +252,7 @@ def main():
     fit.add_argument("--seed", type=int, default=42)
     fit.add_argument("--unlabeled-weight", type=float, default=.3)
     fit.add_argument("--protection-weight", type=float, default=.1)
+    fit.add_argument("--hard-positive-weight", type=float, default=0.)
     fit.add_argument("--data-root", type=Path, default=Path("data/therapeutic_2025"))
     fit.add_argument("--features", type=Path, default=Path("features/esm2_650m"))
     fit.add_argument("--peptide-features", type=Path, default=Path("features/esm2_peptide_150m"))
