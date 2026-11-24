@@ -14,19 +14,19 @@ from mfp_nova.reference_fallback import apply_train_reference, paired_cluster_in
 from probe_duoevidence_helix import compare as three_branch_probe
 
 
-def align(base, helix):
+def align(base, helix, split="val"):
     order = np.argsort(helix["row_id"])
     idx = order[np.searchsorted(helix["row_id"][order], base["row_id"])]
     for key in ("row_id", "targets", "cluster_id"):
         np.testing.assert_array_equal(base[key], helix[key][idx])
     np.testing.assert_array_equal(base["label_names"], helix["label_names"])
-    if any(str(export["split"]) != "val" for export in (base, helix)):
-        raise ValueError("Use the aligned Fine39 Validation exports")
+    if any(str(export["split"]) != split for export in (base, helix)):
+        raise ValueError(f"Use aligned Fine39 {split} exports")
     return idx
 
 
-def compare(base, helix, data=None, full_helix=None):
-    idx = align(base, helix)
+def compare(base, helix, data=None, full_helix=None, split="val"):
+    idx = align(base, helix, split)
     y = base["targets"].astype(bool)
     rows = np.arange(len(y))
     old = base["predicted"].astype(bool)
@@ -46,7 +46,7 @@ def compare(base, helix, data=None, full_helix=None):
     results, outputs = {}, {}
     fixed, raw_outputs = {}, {}
     if data is not None:
-        val = data.indices("val")
+        val = data.indices(split)
         for key, expected in (("row_id", data.rows[val]), ("cluster_id", data.clusters[val]),
                               ("targets", data.y[val]), ("label_names", data.labels)):
             np.testing.assert_array_equal(base[key], expected)
@@ -95,7 +95,7 @@ def compare(base, helix, data=None, full_helix=None):
         d = outputs[key] - same_rule
         result.update(delta_vs_theraset_aa34_same_rule_pp=float(100 * d.mean()),
                       ci95_vs_theraset_aa34_same_rule_pp=paired_cluster_interval(d, clusters))
-    report = {"rows": len(y), "original_protocol_acc": float(jaccard(old).mean()), "pairs": results}
+    report = {"split": split, "rows": len(y), "original_protocol_acc": float(jaccard(old).mean()), "pairs": results}
     if fixed:
         control, candidate = (fixed[key] for key in ("theraset_aa34", "theraset_helix"))
         delta = jaccard(candidate) - jaccard(control)
@@ -118,7 +118,7 @@ def compare(base, helix, data=None, full_helix=None):
                        for name, mask in groups.items()},
         }
         if full_helix is not None:
-            full_idx = align(base, full_helix)
+            full_idx = align(base, full_helix, split)
             h = full_helix["latent_logits"][full_idx].clip(-limit, limit)
             full_score = ((logits["theraset"] - a) + (h - offsets["helix"])) / 2
             full_raw = full_score >= 0
@@ -134,6 +134,9 @@ def compare(base, helix, data=None, full_helix=None):
                 "candidate_acc": float(jaccard(candidate).mean()),
                 "delta_pp": float(100 * delta_full.mean()),
                 "ci95_pp": paired_cluster_interval(delta_full, clusters),
+                "original_fixed_acc": float(jaccard(control).mean()),
+                "fixed_zero_hits": {"original": int((~control_hit).sum()), "full": int((~full_hit).sum()),
+                                    "candidate": int((~candidate_hit).sum())},
                 "groups": {},
             }
             for name, group in cohorts.items():
@@ -157,6 +160,7 @@ if __name__ == "__main__":
     parser.add_argument("--member", help="Base prediction member in a tar archive")
     parser.add_argument("--fixed-reference", action="store_true", help="Use the fixed Train fallback on both TheraSet pairs")
     parser.add_argument("--data-root", type=Path, default=Path("data/therapeutic_2025"))
+    parser.add_argument("--split", choices=("val", "test"), default="val")
     parser.add_argument("--reference-helix", type=Path, help="Compare against full HelixSet under fixed fallback")
     args = parser.parse_args()
     if args.reference_helix and not args.fixed_reference:
@@ -169,7 +173,7 @@ if __name__ == "__main__":
         data = PeptideData(args.data_root) if args.fixed_reference else None
         if args.reference_helix:
             with np.load(args.reference_helix) as full:
-                report = compare(base, helix, data, full)
+                report = compare(base, helix, data, full, args.split)
         else:
-            report = compare(base, helix, data)
+            report = compare(base, helix, data, split=args.split)
         print(json.dumps(report, indent=2))
