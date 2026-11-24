@@ -14,7 +14,7 @@ from mfp_nova.reference_fallback import apply_train_reference, paired_cluster_in
 from probe_duoevidence_helix import compare as three_branch_probe
 
 
-def compare(base, helix, data=None):
+def align(base, helix):
     order = np.argsort(helix["row_id"])
     idx = order[np.searchsorted(helix["row_id"][order], base["row_id"])]
     for key in ("row_id", "targets", "cluster_id"):
@@ -22,6 +22,11 @@ def compare(base, helix, data=None):
     np.testing.assert_array_equal(base["label_names"], helix["label_names"])
     if any(str(export["split"]) != "val" for export in (base, helix)):
         raise ValueError("Use the aligned Fine39 Validation exports")
+    return idx
+
+
+def compare(base, helix, data=None, full_helix=None):
+    idx = align(base, helix)
     y = base["targets"].astype(bool)
     rows = np.arange(len(y))
     old = base["predicted"].astype(bool)
@@ -112,6 +117,36 @@ def compare(base, helix, data=None):
                               "new_zero": int((mask & control_hit & ~candidate_hit).sum())}
                        for name, mask in groups.items()},
         }
+        if full_helix is not None:
+            full_idx = align(base, full_helix)
+            h = full_helix["latent_logits"][full_idx].clip(-limit, limit)
+            full_score = ((logits["theraset"] - a) + (h - offsets["helix"])) / 2
+            full_raw = full_score >= 0
+            full_pred = full_raw.copy()
+            empty = ~full_raw.any(1)
+            full_pred[empty, full_score[empty].argmax(1)] = True
+            _, full_pred = apply_train_reference(data, val, full_raw, full_pred, base["theraset_logits"])
+            full_hit = (full_pred & y).any(1)
+            full_score_j = jaccard(full_pred)
+            delta_full = jaccard(candidate) - full_score_j
+            report["compressed_vs_full_fixed"] = {
+                "full_acc": float(full_score_j.mean()),
+                "candidate_acc": float(jaccard(candidate).mean()),
+                "delta_pp": float(100 * delta_full.mean()),
+                "ci95_pp": paired_cluster_interval(delta_full, clusters),
+                "groups": {},
+            }
+            for name, group in cohorts.items():
+                eligible = group & reference_zero
+                report["compressed_vs_full_fixed"]["groups"][name] = {
+                    "rows": int(group.sum()),
+                    "full_rescued": int((eligible & full_hit).sum()),
+                    "candidate_rescued": int((eligible & candidate_hit).sum()),
+                    "retained": int((eligible & full_hit & candidate_hit).sum()),
+                    "lost": int((eligible & full_hit & ~candidate_hit).sum()),
+                    "gained": int((eligible & ~full_hit & candidate_hit).sum()),
+                    "delta_contribution_pp": float(100 * delta_full[group].sum() / len(y)),
+                }
     return report
 
 
@@ -122,11 +157,19 @@ if __name__ == "__main__":
     parser.add_argument("--member", help="Base prediction member in a tar archive")
     parser.add_argument("--fixed-reference", action="store_true", help="Use the fixed Train fallback on both TheraSet pairs")
     parser.add_argument("--data-root", type=Path, default=Path("data/therapeutic_2025"))
+    parser.add_argument("--reference-helix", type=Path, help="Compare against full HelixSet under fixed fallback")
     args = parser.parse_args()
+    if args.reference_helix and not args.fixed_reference:
+        parser.error("--reference-helix requires --fixed-reference")
     source = args.base
     if args.member:
         with tarfile.open(source) as archive:
             source = io.BytesIO(archive.extractfile(args.member).read())
     with np.load(source) as base, np.load(args.helix) as helix:
         data = PeptideData(args.data_root) if args.fixed_reference else None
-        print(json.dumps(compare(base, helix, data), indent=2))
+        if args.reference_helix:
+            with np.load(args.reference_helix) as full:
+                report = compare(base, helix, data, full)
+        else:
+            report = compare(base, helix, data)
+        print(json.dumps(report, indent=2))

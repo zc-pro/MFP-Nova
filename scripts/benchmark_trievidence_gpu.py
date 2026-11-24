@@ -59,19 +59,30 @@ def benchmark(args):
     inputs = [to_device(batch, device) for batch in loader]
 
     models = []
+    reported_paths = paths
     if args.duo_vs_helix:
-        packed = torch.load(paths[1], map_location="cpu", weights_only=True)
-        if baseline["model_name"] != "duoevidence" or packed["model_name"] != "trievidence":
-            raise ValueError("Use the original DuoEvidence and packed TriEvidence checkpoints")
-        np.testing.assert_array_equal(baseline["labels"], packed["labels"])
-        validate_cache(dataset, packed["config"], packed["encoder"])
+        if baseline["model_name"] != "duoevidence":
+            raise ValueError("Use the original DuoEvidence as the TheraSet anchor")
         duo = DuoEvidence(baseline["model_args"])
         duo.load_state_dict(baseline["model_state"])
-        helix = HelixSet(**packed["model_args"]["helixset_args"], direct_only=True)
-        helix.load_state_dict({k.removeprefix("helixset."): v for k, v in packed["model_state"].items()
-                              if k.startswith("helixset.")})
-        models = [PairForward(duo.theraset, duo.aa34).to(device).eval(),
-                  PairForward(duo.theraset, helix).to(device).eval()]
+
+        def load_helix(path):
+            packed = torch.load(path, map_location="cpu", weights_only=True)
+            if packed["model_name"] != "trievidence":
+                raise ValueError("Use packed TriEvidence checkpoints for the HelixSet weights")
+            np.testing.assert_array_equal(baseline["labels"], packed["labels"])
+            validate_cache(dataset, packed["config"], packed["encoder"])
+            model = HelixSet(**packed["model_args"]["helixset_args"], direct_only=True)
+            model.load_state_dict({k.removeprefix("helixset."): v for k, v in packed["model_state"].items()
+                                   if k.startswith("helixset.")})
+            return model
+
+        reference = duo.aa34
+        if args.full_helix:
+            reference = load_helix(args.full_helix)
+            reported_paths = (args.full_helix, paths[1])
+        models = [PairForward(duo.theraset, reference).to(device).eval(),
+                  PairForward(duo.theraset, load_helix(paths[1])).to(device).eval()]
     for path in (() if args.duo_vs_helix else paths):
         state = torch.load(path, map_location="cpu", weights_only=True) if path != paths[0] else baseline
         if state["model_name"] != "trievidence" or "helixset_args" not in state["model_args"]:
@@ -95,7 +106,7 @@ def benchmark(args):
               "paired_candidate_minus_baseline_p50_ms": float(np.median(difference)),
               "candidate_faster_pairs": int((difference < 0).sum()),
               "paired_measurements": len(full), "models": {}}
-    for name, path, model, values in zip(("baseline", "candidate"), paths, models, (full, candidate)):
+    for name, path, model, values in zip(("baseline", "candidate"), reported_paths, models, (full, candidate)):
         report["models"][name] = {"checkpoint": str(path), "parameters": sum(p.numel() for p in model.parameters()),
                                   "p50_ms": float(np.median(values)), "p95_ms": float(np.quantile(values, .95)),
                                   "samples_ms": values.tolist()}
@@ -145,9 +156,13 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path)
     parser.add_argument("--duo-vs-helix", action="store_true",
                         help="Compare TheraSet plus original AA34 versus TheraSet plus latent-direct")
+    parser.add_argument("--full-helix", type=Path,
+                        help="With --duo-vs-helix, use full latent-direct as the timing reference")
     parser.add_argument("--pack-candidate-esm-projections", action="store_true",
                         help="Pack the candidate's original ESM projections before timing")
     args = parser.parse_args()
     if args.duo_vs_helix and args.pack_candidate_esm_projections:
         parser.error("--pack-candidate-esm-projections is only available for packed three-branch runs")
+    if args.full_helix and not args.duo_vs_helix:
+        parser.error("--full-helix requires --duo-vs-helix")
     benchmark(args)

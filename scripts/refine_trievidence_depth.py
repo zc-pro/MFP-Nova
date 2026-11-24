@@ -72,6 +72,8 @@ def refine(args, output):
             raise ValueError("Ablation compares original-depth weights without recovery training")
         if args.ablate == "multiscale":
             model_args["helixset_args"]["residue_only_motifs"] = True
+        elif args.ablate == "latent_mixing_triangles":
+            model_args["helixset_args"].update(mix_latents=False, triangles=False)
         elif args.ablate == "latent_mixing":
             model_args["helixset_args"]["mix_latents"] = False
         elif args.ablate != "pair_blocks":
@@ -175,7 +177,8 @@ if __name__ == "__main__":
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("--depth", type=int, required=True)
     parser.add_argument("--ffn-rank", type=int, help="SVD rank for the two FFN linear layers in each latent block")
-    parser.add_argument("--ablate", choices=("geometry", "triangles", "pair_blocks", "multiscale", "latent_mixing"),
+    parser.add_argument("--ablate", choices=("geometry", "triangles", "pair_blocks", "multiscale",
+                                               "latent_mixing", "latent_mixing_triangles"),
                         help="Ablate one evidence or interaction path at the original depth")
     parser.add_argument("--epochs", type=int, default=0)
     parser.add_argument("--representation", action="store_true",
