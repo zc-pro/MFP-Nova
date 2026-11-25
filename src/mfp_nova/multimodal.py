@@ -50,6 +50,8 @@ def label_statistics(y, clusters, labels, min_support=20, max_factors=32):
     pair = co / np.sqrt(np.maximum(support[:, None]*support[None, :], 1))
     pair *= co / (co + 20)
     np.fill_diagonal(pair, 0)
+    cond_cooccurrence = co / np.maximum(support[:, None], 1)
+    np.fill_diagonal(cond_cooccurrence, 0)
     counts, components = Counter(), defaultdict(set)
     for target, cluster in zip(y, clusters):
         positive = np.flatnonzero(target)
@@ -67,6 +69,7 @@ def label_statistics(y, clusters, labels, min_support=20, max_factors=32):
     weights /= weights.mean()
     return {"support": support.tolist(), "positive_clusters": independent, "strata": strata,
             "positive_weights": weights.tolist(), "pair_prior": pair.tolist(),
+            "cond_cooccurrence": cond_cooccurrence.tolist(),
             "hyperedges": incidence.tolist(), "hyperedge_clusters": [len(components[k]) for k in selected],
             "prototype_counts": [min(4, max(1, n // 100)) for n in independent],
             "observed_prior": ((support + 1)/(len(y)+2)).tolist(), "labels": labels}

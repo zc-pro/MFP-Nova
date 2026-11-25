@@ -90,6 +90,9 @@ def main(argv=None):
                              help="TheraSet-Bridge training arm with matched cross-cluster batches")
             sub.add_argument("--annotations", help="B0/H1–H8: aligned NPZ of confirmed label and observation states")
             sub.add_argument("--unlabeled-weight", type=float, help="Sequence study: optional weak BCE weight for unannotated zero bits")
+            sub.add_argument("--rank-weight", type=float, help="TheraSet: weight for threshold-anchored PU ranking loss")
+            sub.add_argument("--rank-cooccur-beta", type=float, help="TheraSet: Train co-occurrence protection strength in PU ranking loss")
+            sub.add_argument("--rank-margin", type=float, help="TheraSet: threshold margin for PU ranking loss")
             sub.add_argument("--fold-dir", help="Sequence study: share training-only B0 fold checkpoints")
             sub.add_argument("--head-epochs", type=int, help="Sequence study: frozen head training epochs")
             sub.add_argument("--finetune-epochs", type=int, help="Sequence study: H4/H6 backbone fine-tuning epochs")
@@ -421,6 +424,12 @@ def main(argv=None):
                 if args.model == "sequence":
                     raise ValueError("--metric-suite requires a research model")
                 config["train"]["metric_suite"] = args.metric_suite
+            if args.rank_weight is not None:
+                config.setdefault("loss", {})["rank_weight"] = args.rank_weight
+            if args.rank_cooccur_beta is not None:
+                config.setdefault("loss", {})["rank_cooccur_beta"] = args.rank_cooccur_beta
+            if args.rank_margin is not None:
+                config.setdefault("loss", {})["rank_margin"] = args.rank_margin
             if args.model != "sequence":
                 from .research import train
                 config["model_name"] = args.model

@@ -11,7 +11,8 @@ from torch import nn
 from torch.nn import functional as F
 
 from ..research_layers import (Attention, FeedForward, PropertyEncoder, SequenceEncoder,
-                              TransformerBlock, masked_mean, observed_label_loss, training_views)
+                              TransformerBlock, anchored_pu_ranking_loss, masked_mean,
+                              observed_label_loss, training_views)
 from .helixset import LabelPairRead, QualityRead, structure_strength
 
 
@@ -387,8 +388,15 @@ class TheraSet(nn.Module):
                            for key, (numerator, denominator) in totals.items()}
         output = self(view, **options)
         def supervised(prediction):
-            return self.supervised_terms(prediction, batch["y"], settings.get("unlabeled_weight", .3),
-                                         batch.get("positive_multiplier") if self.training else None)
+            out = self.supervised_terms(prediction, batch["y"], settings.get("unlabeled_weight", .3),
+                                        batch.get("positive_multiplier") if self.training else None)
+            if settings.get("rank_weight", 0.) > 0.:
+                out["rank"] = anchored_pu_ranking_loss(
+                    prediction["logits"], batch["y"], self.statistics,
+                    cooccur_beta=settings.get("rank_cooccur_beta", 0.),
+                    margin=settings.get("rank_margin", 0.),
+                )
+            return out
         terms = supervised(output)
         agreement = output["logits"].sum()*0
         if self.training and settings.get("rdrop", 0)>0:
@@ -401,6 +409,8 @@ class TheraSet(nn.Module):
         for key, default in (("direct", .2), ("evidence", .1), ("views", .2)):
             if key in terms:
                 total = total + settings.get(key, default)*terms[key]
+        if "rank" in terms:
+            total = total + settings.get("rank_weight", 0.) * terms["rank"]
         terms["rdrop"] = agreement
         total = total + settings.get("rdrop", 0)*agreement
         for key, value in order_terms.items():

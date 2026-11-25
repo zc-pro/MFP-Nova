@@ -419,3 +419,36 @@ def observed_label_loss(logits, targets, statistics, unknown_weight=.3, mask=Non
     neg = -negative.clamp_min(1e-8).log()*(1-negative).square().detach()*(1-targets)*weak_weight
     values = pos+neg
     return (values*mask).sum()/mask.sum().clamp_min(1) if mask is not None else values.mean()
+
+
+def anchored_pu_ranking_loss(logits, targets, statistics, cooccur_beta=0.0, margin=0.0):
+    """Threshold-anchored intra-peptide PU ranking loss (ZLPR-style), scaled by 1/C to match ASL.
+
+    Positive term focuses on the lowest-scoring recorded positives (protecting multifunction recall).
+    Negative term focuses on high-scoring unannotated labels above threshold, with optional
+    Train conditional co-occurrence protection so frequent cross-axis co-occurring functions
+    are not over-penalized while zero-co-occurrence wrong classes are suppressed.
+    """
+    logits = logits.float()
+    targets = targets.float()
+    num_labels = logits.shape[-1]
+    pos_mask = targets > 0.5
+    neg_mask = ~pos_mask
+
+    pos_weight = torch.as_tensor(statistics["positive_weights"], device=logits.device, dtype=torch.float32)
+    pos_scores = -(logits - margin) + pos_weight.clamp_min(1e-6).log()
+    pos_scores = pos_scores.masked_fill(~pos_mask, float("-inf"))
+    zeros = torch.zeros((logits.shape[0], 1), device=logits.device, dtype=torch.float32)
+    pos_loss = torch.logsumexp(torch.cat([zeros, pos_scores], dim=-1), dim=-1)
+
+    if cooccur_beta > 0.0 and "cond_cooccurrence" in statistics:
+        cond = torch.as_tensor(statistics["cond_cooccurrence"], device=logits.device, dtype=torch.float32)
+        # Max Train conditional co-occurrence P(j | i) over recorded positives i of each peptide.
+        max_co = (pos_mask.unsqueeze(-1).float() * cond.unsqueeze(0)).amax(dim=1)
+        neg_offset = margin + cooccur_beta * max_co
+    else:
+        neg_offset = margin
+
+    neg_scores = (logits - neg_offset).masked_fill(~neg_mask, float("-inf"))
+    neg_loss = torch.logsumexp(torch.cat([zeros, neg_scores], dim=-1), dim=-1)
+    return ((pos_loss + neg_loss) / num_labels).mean()
