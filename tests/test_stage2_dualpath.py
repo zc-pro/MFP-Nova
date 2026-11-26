@@ -81,11 +81,12 @@ def _make_sample(length, input_dim=32, pep_dim=16, num_labels=8, seed=0, with_au
     return sample
 
 
-def _small_dualpath(stats, input_dim=32, pep_dim=16, num_labels=8):
+def _small_dualpath(stats, input_dim=32, pep_dim=16, num_labels=8, use_aa34_path=False):
     return DualPathMFP(
         input_dim=input_dim, num_labels=num_labels, vocab_size=16, statistics=stats,
         peptide_input_dim=pep_dim, dim=64, heads=4, cnn_channels=16, pair_dim=16,
         b_seq_depth=2, b_prop_depth=1, b_latent_count=8, b_latent_depth=2,
+        use_aa34_path=use_aa34_path,
     )
 
 
@@ -199,3 +200,25 @@ def test_pure_sequence_missing_modality_transfer():
     loss.backward()
     assert torch.isfinite(loss)
     assert torch.isfinite(out["logits"]).all()
+
+
+def test_tripath_aa34_gradient_isolation_and_independent_clipping():
+    stats = _dummy_statistics(8)
+    batch = collate_multimodal([_make_sample(10, seed=12), _make_sample(18, seed=13)])
+    model = _small_dualpath(stats, use_aa34_path=True)
+    model.train()
+    groups = model.branch_parameter_groups()
+    assert len(groups) == 3
+
+    loss, terms, out = model.compute_loss(
+        batch, {"unlabeled_weight": 0.3, "b_unlabeled_weight": 0.45, "direct": 0.2,
+                "evidence": 0.1, "modality_dropout": 0.1, "rdrop": 0.1, "sym_rank": 0.04},
+        return_output=True,
+    )
+    assert "path_c_logits" in out and not out["logits"].requires_grad
+    assert "path_c_cls" in terms
+    loss.backward()
+    for grp in groups:
+        norm = torch.nn.utils.clip_grad_norm_(grp, 5.0)
+        assert torch.isfinite(norm) and norm > 0
+

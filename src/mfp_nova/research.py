@@ -145,7 +145,7 @@ def predict_loader(model, loader, device, precision="fp32", loss_settings=None, 
     if xbridge_outputs is not None:
         xbridge_batches = {key: [] for key in ("auxiliary_logits", "reference_logits")}
     if dualpath_outputs is not None:
-        dualpath_batches = {"path_a_probabilities": [], "path_b_probabilities": []}
+        dualpath_batches = {"path_a_probabilities": [], "path_b_probabilities": [], "path_c_probabilities": []}
     for batch in loader:
         moved = to_device(batch, device)
         with autocast_context(device, precision):
@@ -198,6 +198,8 @@ def predict_loader(model, loader, device, precision="fp32", loss_settings=None, 
         if dualpath_outputs is not None:
             dualpath_batches["path_a_probabilities"].append(output["path_a_logits"].float().sigmoid().cpu().numpy())
             dualpath_batches["path_b_probabilities"].append(output["path_b_logits"].float().sigmoid().cpu().numpy())
+            if "path_c_logits" in output:
+                dualpath_batches["path_c_probabilities"].append(output["path_c_logits"].float().sigmoid().cpu().numpy())
     if dualpath_outputs is not None:
         dualpath_outputs.update({key: np.concatenate(batches) for key, batches in dualpath_batches.items() if batches})
     if xbridge_outputs is not None:
@@ -754,9 +756,7 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         raise ValueError("Reconstruction gradient balancing currently supports TriRelay")
     reference_checkpoint = checkpoint or initial or anchor
     family_supervision = hh_v20 and config["model"]["mode"] in ("auxiliary", "full")
-    localize_terminals = (hh_v20 and config["model"]["mode"] not in HH_V20_CHEMICAL_MODES) or (
-        config["model_name"] == DUALPATH_MFP
-    )
+    localize_terminals = hh_v20 and config["model"]["mode"] not in HH_V20_CHEMICAL_MODES
     sequence_only = setreread or config["model_name"] in SEQUENCE_ONLY_MODELS
     train_indices = held_indices = None
     if inner_fold is not None:
@@ -1199,7 +1199,14 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
                         if parameter.grad is not None:
                             parameter.grad.mul_(group_size/valid_microbatches)
                 scaler.unscale_(optimizer)
-                norm = torch.nn.utils.clip_grad_norm_(model.parameters(), settings.get("gradient_clip", 5), error_if_nonfinite=precision!="fp16")
+                clip_val = settings.get("gradient_clip", 5)
+                nonfinite_check = precision != "fp16"
+                if hasattr(model, "branch_parameter_groups"):
+                    norms = [torch.nn.utils.clip_grad_norm_(grp, clip_val, error_if_nonfinite=nonfinite_check)
+                             for grp in model.branch_parameter_groups()]
+                    norm = sum(float(x) for x in norms)
+                else:
+                    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip_val, error_if_nonfinite=nonfinite_check)
                 old_scale = scaler.get_scale()
                 scaler.step(optimizer)
                 scaler.update()

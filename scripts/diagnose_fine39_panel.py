@@ -21,7 +21,7 @@ def load_export(path):
         "probabilities": probs.astype(np.float64),
         "label_names": [str(x) for x in data["label_names"]],
     }
-    for key in ("path_a_probabilities", "path_b_probabilities"):
+    for key in ("path_a_probabilities", "path_b_probabilities", "path_c_probabilities"):
         if key in data:
             out[key] = data[key].astype(np.float64)
     return out
@@ -117,7 +117,7 @@ def evaluate_panel(export, threshold=0.5, low_mask=None):
         pb_fb = apply_empty_top1(pb_raw, pb)
         a_hit = (pa_fb & y).any(axis=1)
         b_hit = (pb_fb & y).any(axis=1)
-        result["dualpath_branches"] = {
+        branches = {
             "path_a_raw_acc_pct": float(sample_jaccard(y, pa_raw).mean() * 100.0),
             "path_a_fallback_acc_pct": float(sample_jaccard(y, pa_fb).mean() * 100.0),
             "path_b_raw_acc_pct": float(sample_jaccard(y, pb_raw).mean() * 100.0),
@@ -125,6 +125,15 @@ def evaluate_panel(export, threshold=0.5, low_mask=None):
             "path_b_unique_rescues_over_a": int((~a_hit & b_hit).sum()),
             "path_a_unique_rescues_over_b": int((a_hit & ~b_hit).sum()),
         }
+        if "path_c_probabilities" in export:
+            pc = export["path_c_probabilities"]
+            pc_raw = pc >= threshold
+            pc_fb = apply_empty_top1(pc_raw, pc)
+            c_hit = (pc_fb & y).any(axis=1)
+            branches["path_c_raw_acc_pct"] = float(sample_jaccard(y, pc_raw).mean() * 100.0)
+            branches["path_c_fallback_acc_pct"] = float(sample_jaccard(y, pc_fb).mean() * 100.0)
+            branches["path_c_unique_rescues_over_ab"] = int((~(a_hit | b_hit) & c_hit).sum())
+        result["dualpath_branches"] = branches
     return result, raw_j, fb_j, raw_pred, fb_pred
 
 

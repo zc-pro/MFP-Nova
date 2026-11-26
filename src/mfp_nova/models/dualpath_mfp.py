@@ -12,7 +12,7 @@ from ..research_layers import (
     observed_label_loss, symmetric_pu_ranking_loss, training_views,
 )
 from .helixset import LatentFusionBlock, MotifPyramid, structure_strength
-from .theraset import TheraSet, dual_terminal_features, residue_encoding
+from .theraset import MotifCNN, TheraSet, dual_terminal_features, motif_classifier, residue_encoding
 
 
 CORE_PHYS_GROUPS = (
@@ -281,17 +281,36 @@ class GlobalBottleneckPath(nn.Module):
         return {"logits": logits}
 
 
+class PureAA34Path(nn.Module):
+    """Pure sequence AA34+terminal anchor (~2.0M, zero ESM, zero chemistry, zero structure)."""
+
+    def __init__(self, num_labels, statistics, cnn_channels=128, dropout=0.2):
+        super().__init__()
+        self.cnn = MotifCNN(1, cnn_channels, dropout, chemical_evidence=False, terminal_features=True)
+        self.classifier = motif_classifier(self.cnn.output_channels, num_labels, dropout)
+        prior = torch.tensor(statistics["observed_prior"]).clamp(1e-4, 1.0 - 1e-4).logit()
+        with torch.no_grad():
+            self.classifier[-1].bias.copy_(prior)
+
+    def forward(self, batch):
+        _, pooled = self.cnn(batch)
+        return {"logits": self.classifier(pooled)}
+
+
 class DualPathMFP(nn.Module):
-    """Gradient-decoupled local MotifCNN/TheraSet anchor (Path A) + global bottleneck (Path B)."""
+    """Gradient-decoupled local anchor (Path A) + global bottleneck (Path B) + optional pure AA34 (Path C)."""
 
     def __init__(self, input_dim, num_labels, vocab_size, statistics, peptide_input_dim=0,
                  dim=256, heads=8, dropout=0.2, cnn_channels=128, pair_dim=32,
                  b_seq_depth=2, b_prop_depth=2, b_latent_count=24, b_latent_depth=4,
-                 b_dropout=0.25, span_mask_prob=0.15):
+                 b_dropout=0.25, span_mask_prob=0.15, use_aa34_path=False,
+                 fusion_weights=(0.4, 0.4, 0.2)):
         super().__init__()
         self.statistics = statistics
         self.input_dim = input_dim
         self.peptide_input_dim = peptide_input_dim
+        self.use_aa34_path = use_aa34_path
+        self.fusion_weights = tuple(fusion_weights)
         self.path_a = TheraSet(
             input_dim=input_dim, num_labels=num_labels, vocab_size=vocab_size, statistics=statistics,
             dim=dim, heads=heads, dropout=dropout, cnn_channels=cnn_channels,
@@ -305,6 +324,13 @@ class DualPathMFP(nn.Module):
             seq_depth=b_seq_depth, prop_depth=b_prop_depth, latent_count=b_latent_count,
             latent_depth=b_latent_depth, dropout=b_dropout, span_mask_prob=span_mask_prob,
         )
+        self.path_c = PureAA34Path(num_labels, statistics, cnn_channels=cnn_channels, dropout=dropout) if use_aa34_path else None
+
+    def branch_parameter_groups(self):
+        groups = [list(self.path_a.parameters()), list(self.path_b.parameters())]
+        if self.path_c is not None:
+            groups.append(list(self.path_c.parameters()))
+        return groups
 
     def _prepare_shared(self, batch):
         shared = dict(batch)
@@ -330,24 +356,34 @@ class DualPathMFP(nn.Module):
         out_b = self.path_b(shared)
         logits_a = out_a["logits"]
         logits_b = out_b["logits"]
-        # Detach fused output so any external loss on output["logits"] cannot leak across branches.
-        fused = 0.5 * (logits_a.detach() + logits_b.detach())
-        return {
-            "logits": fused,
+        out = {
             "path_a_logits": logits_a,
             "path_b_logits": logits_b,
             "path_a_direct": out_a["direct"],
             "path_a_evidence": out_a["evidence_logits"],
         }
+        if self.path_c is not None:
+            logits_c = self.path_c(shared)["logits"]
+            wa, wb, wc = self.fusion_weights
+            # Detach fused output so any external loss on output["logits"] cannot leak across branches.
+            fused = wa * logits_a.detach() + wb * logits_b.detach() + wc * logits_c.detach()
+            out["path_c_logits"] = logits_c
+        else:
+            fused = 0.5 * (logits_a.detach() + logits_b.detach())
+        out["logits"] = fused
+        return out
 
     def _branch_terms(self, output, targets, settings):
-        weak = settings.get("unlabeled_weight", 0.3)
+        weak_a = settings.get("unlabeled_weight", 0.3)
+        weak_b = settings.get("b_unlabeled_weight", weak_a)
         terms = {
-            "path_a_cls": observed_label_loss(output["path_a_logits"], targets, self.statistics, weak),
-            "direct": observed_label_loss(output["path_a_direct"], targets, self.statistics, weak),
-            "evidence": observed_label_loss(output["path_a_evidence"], targets, self.statistics, weak),
-            "path_b_cls": observed_label_loss(output["path_b_logits"], targets, self.statistics, weak),
+            "path_a_cls": observed_label_loss(output["path_a_logits"], targets, self.statistics, weak_a),
+            "direct": observed_label_loss(output["path_a_direct"], targets, self.statistics, weak_a),
+            "evidence": observed_label_loss(output["path_a_evidence"], targets, self.statistics, weak_a),
+            "path_b_cls": observed_label_loss(output["path_b_logits"], targets, self.statistics, weak_b),
         }
+        if "path_c_logits" in output:
+            terms["path_c_cls"] = observed_label_loss(output["path_c_logits"], targets, self.statistics, weak_a)
         if settings.get("sym_rank", 0.0) > 0.0:
             terms["sym_rank"] = symmetric_pu_ranking_loss(
                 output["path_b_logits"], targets, self.statistics,
@@ -369,15 +405,19 @@ class DualPathMFP(nn.Module):
             second = self(view_a)
             other = self._branch_terms(second, batch["y"], settings)
             terms = {k: 0.5 * (v + other[k]) for k, v in terms.items()}
-            agreement = 0.5 * (
-                bernoulli_rdrop(output["path_a_logits"], second["path_a_logits"])
-                + bernoulli_rdrop(output["path_b_logits"], second["path_b_logits"])
-            )
+            kls = [
+                bernoulli_rdrop(output["path_a_logits"], second["path_a_logits"]),
+                bernoulli_rdrop(output["path_b_logits"], second["path_b_logits"]),
+            ]
+            if "path_c_logits" in output:
+                kls.append(bernoulli_rdrop(output["path_c_logits"], second["path_c_logits"]))
+            agreement = sum(kls) / len(kls)
         loss_a = (terms["path_a_cls"]
                   + settings.get("direct", 0.2) * terms["direct"]
                   + settings.get("evidence", 0.1) * terms["evidence"])
         loss_b = terms["path_b_cls"] + settings.get("sym_rank", 0.0) * terms.get("sym_rank", 0.0)
+        loss_c = terms.get("path_c_cls", 0.0)
         terms["classification"] = 0.5 * (terms["path_a_cls"].detach() + terms["path_b_cls"].detach())
         terms["rdrop"] = agreement
-        total = loss_a + loss_b + rdrop_weight * agreement
+        total = loss_a + loss_b + loss_c + rdrop_weight * agreement
         return (total, terms, output) if return_output else (total, terms)
