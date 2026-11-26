@@ -1,0 +1,64 @@
+model_name: dualpath_mfp
+data:
+  root: data/therapeutic_2025
+  track: fine39
+  features: features/esm2_650m
+  peptide_features: features/esm2_peptide_150m
+  augment: false
+encoder:
+  name: facebook/esm2_t33_650M_UR50D
+  revision: 08e4846e537177426273712802403f7ba8261b6c
+  max_length: 80
+  batch_size: 8
+peptide_encoder:
+  name: jiahuizhang/esm-150m-peptide-fine-tune
+  revision: 6d8cebf74c53b1032b6f5917e75e3253cb70f575
+  max_length: 80
+  batch_size: 8
+model:
+  dim: 256
+  heads: 8
+  dropout: 0.2
+  cnn_channels: 128
+  pair_dim: 32
+  b_seq_depth: 2
+  b_prop_depth: 2
+  b_latent_count: 24
+  b_latent_depth: 4
+  b_dropout: 0.25
+  span_mask_prob: 0.15
+loss:
+  unlabeled_weight: 0.3
+  direct: 0.2
+  evidence: 0.1
+  modality_dropout: 0.1
+  rdrop: 0.1
+  sym_rank: 0.10
+  sym_rank_topk: 3
+  sym_rank_pos_margin: 0.5
+  sym_rank_neg_margin: -0.5
+  sym_rank_gamma: 2.0
+  sym_rank_beta: 1.0
+train:
+  device: cpu
+  seed: 42
+  epochs: 100
+  batch_size: 64
+  accumulation_steps: 1
+  precision: fp32
+  learning_rate: 0.0002
+  weight_decay: 0.01
+  patience: 20
+  warmup_epochs: 5
+  aux_warmup_epochs: 5
+  rdrop_start_epoch: 6
+  rdrop_ramp_epochs: 5
+  gradient_clip: 5
+  num_workers: 0
+  ema_decay: 0.999
+  ema_start_epoch: 6
+  metric_suite: jaccard
+  threshold_strategy: global
+  save_selection_candidates: true
+  export_validation_predictions: true
+  output: runs

@@ -19,7 +19,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
 from .metrics import evaluate_metrics, evaluate_groups, format_epoch, fit_global_threshold, fit_label_thresholds
-from .models import (HH_MODELS, HH_V15_RANKER, HH_V16, HH_V17, HH_V20, HH_V20_CHEMICAL_MODES,
+from .models import (DUALPATH_MFP, HH_MODELS, HH_V15_RANKER, HH_V16, HH_V17, HH_V20, HH_V20_CHEMICAL_MODES,
                      PEPTIDE_V3, PEPTIDE_V6, PEPTIDE_V7, SEQUENCE_ONLY_MODELS, XBRIDGE, THERASET_BRIDGE, UNIFIED_EVIDENCE)
 from .multimodal import BackbonePeptides, MultimodalData, MultimodalPeptides, backbone_inputs, collate_multimodal
 from .research_layers import observed_label_loss
@@ -91,6 +91,9 @@ def make_model(name, arguments):
     if name == UNIFIED_EVIDENCE:
         from .models.unified_evidence import UnifiedEvidence
         return UnifiedEvidence(**arguments)
+    if name == DUALPATH_MFP:
+        from .models.dualpath_mfp import DualPathMFP
+        return DualPathMFP(**arguments)
     if name == "helixset":
         from .models.helixset import HelixSet
         return HelixSet(**arguments)
@@ -125,7 +128,7 @@ def autocast_context(device, precision="fp32"):
 @torch.inference_mode()
 def predict_loader(model, loader, device, precision="fp32", loss_settings=None, decode_sets=False,
                    include_auxiliary=False, residue_nll=None, view_outputs=None, v5_forward=None,
-                   v6_outputs=None, v7_outputs=None, xbridge_outputs=None):
+                   v6_outputs=None, v7_outputs=None, xbridge_outputs=None, dualpath_outputs=None):
     model.eval()
     targets, probabilities, decisions, count_decisions = [], [], [], []
     component_weights, component_counts = [], []
@@ -141,6 +144,8 @@ def predict_loader(model, loader, device, precision="fp32", loss_settings=None, 
         state_probabilities = []
     if xbridge_outputs is not None:
         xbridge_batches = {key: [] for key in ("auxiliary_logits", "reference_logits")}
+    if dualpath_outputs is not None:
+        dualpath_batches = {"path_a_probabilities": [], "path_b_probabilities": []}
     for batch in loader:
         moved = to_device(batch, device)
         with autocast_context(device, precision):
@@ -190,6 +195,11 @@ def predict_loader(model, loader, device, precision="fp32", loss_settings=None, 
             for key, batches in xbridge_batches.items():
                 if key in output:
                     batches.append(output[key].float().cpu().numpy())
+        if dualpath_outputs is not None:
+            dualpath_batches["path_a_probabilities"].append(output["path_a_logits"].float().sigmoid().cpu().numpy())
+            dualpath_batches["path_b_probabilities"].append(output["path_b_logits"].float().sigmoid().cpu().numpy())
+    if dualpath_outputs is not None:
+        dualpath_outputs.update({key: np.concatenate(batches) for key, batches in dualpath_batches.items() if batches})
     if xbridge_outputs is not None:
         xbridge_outputs.update({key: np.concatenate(batches) for key, batches in xbridge_batches.items() if batches})
     if v7_outputs is not None:
@@ -315,7 +325,7 @@ def validate_cache(dataset, config, reference=None):
     if peptide is not None:
         if config["model_name"] not in (
                 "helixset", "theraset", "privilegedbridge", *SEQUENCE_ONLY_MODELS,
-                *HH_MODELS, HH_V16, HH_V17, XBRIDGE, THERASET_BRIDGE, UNIFIED_EVIDENCE):
+                *HH_MODELS, HH_V16, HH_V17, XBRIDGE, THERASET_BRIDGE, UNIFIED_EVIDENCE, DUALPATH_MFP):
             raise ValueError("This architecture does not support dual frozen encoders")
         if peptide["name"] != settings["name"] or peptide["max_length"] != settings["max_length"]:
             raise ValueError("Configured peptide encoder differs from cache")
@@ -342,7 +352,7 @@ def epoch_loss_settings(config, epoch):
         loss['branch_supervision'] = settings['branch_supervision']
     ramp = min(1, epoch/max(1, settings.get('aux_warmup_epochs', 5)))
     for key in ('direct', 'branch', 'reconstruction', 'prototype', 'diversity', 'balance', 'factor',
-                'evidence', 'annotation_set'):
+                'evidence', 'annotation_set', 'sym_rank', 'rank_weight'):
         if key in loss:
             if key == "branch" and config.get("model_name") == "privilegedbridge" and config["model"].get("stage") == "B":
                 continue  # PB's specified teacher objective uses a fixed 0.2 branch term.
@@ -688,7 +698,8 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         raise ValueError("R-Drop weight must be finite and nonnegative")
     if rdrop:
         if config["model_name"] not in ("helixset", "theraset", "termiscale", "motifspan", "privilegedbridge",
-                                       "hh_setreread", PEPTIDE_V3, PEPTIDE_V6, PEPTIDE_V7, THERASET_BRIDGE):
+                                       "hh_setreread", PEPTIDE_V3, PEPTIDE_V6, PEPTIDE_V7, THERASET_BRIDGE,
+                                       DUALPATH_MFP):
             raise ValueError("This model does not support R-Drop")
         if settings.get("rdrop_start_epoch", 6) < 1 or settings.get("rdrop_ramp_epochs", 5) < 1:
             raise ValueError("R-Drop start epoch and ramp length must be positive")
@@ -743,7 +754,9 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         raise ValueError("Reconstruction gradient balancing currently supports TriRelay")
     reference_checkpoint = checkpoint or initial or anchor
     family_supervision = hh_v20 and config["model"]["mode"] in ("auxiliary", "full")
-    localize_terminals = hh_v20 and config["model"]["mode"] not in HH_V20_CHEMICAL_MODES
+    localize_terminals = (hh_v20 and config["model"]["mode"] not in HH_V20_CHEMICAL_MODES) or (
+        config["model_name"] == DUALPATH_MFP
+    )
     sequence_only = setreread or config["model_name"] in SEQUENCE_ONLY_MODELS
     train_indices = held_indices = None
     if inner_fold is not None:
@@ -1068,11 +1081,11 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     validation_groups = (source.groups(datasets[1].indices, source.data.y[datasets[1].indices])
                          if primary and fold is None else {})
 
-    def collect_validation(candidate, view_outputs=None, xbridge_outputs=None):
+    def collect_validation(candidate, view_outputs=None, xbridge_outputs=None, dualpath_outputs=None):
         residue_nll = {} if getattr(candidate, "order_evidence", None) is not None else None
         values = predict_loader(candidate, loaders[1], device, precision, config["loss"],
                                 decode_sets=hh_v16, residue_nll=residue_nll, view_outputs=view_outputs,
-                                xbridge_outputs=xbridge_outputs)
+                                xbridge_outputs=xbridge_outputs, dualpath_outputs=dualpath_outputs)
         return values if hh_v16 else (*values, None, None, residue_nll)
 
     epoch = checkpoint["epoch"] if checkpoint else 0
@@ -1125,7 +1138,7 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
         online_targets, online_probabilities = [], []
-        buffer_metrics = config["model_name"] == UNIFIED_EVIDENCE
+        buffer_metrics = config["model_name"] in (UNIFIED_EVIDENCE, DUALPATH_MFP)
         batch_losses, batch_sizes = [], []
         loss_settings = epoch_loss_settings(config, phase_epoch)
         if hh:
@@ -1466,7 +1479,9 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     restore_model_state(model, best_state)
     view_outputs = {} if getattr(model, "v5_readout", None) is not None else None
     xbridge_outputs = {} if xbridge else None
-    y, probabilities, validation_loss, predicted, count_predicted, components = collect_validation(model, view_outputs, xbridge_outputs)
+    dualpath_outputs = {} if config["model_name"] == DUALPATH_MFP else None
+    y, probabilities, validation_loss, predicted, count_predicted, components = collect_validation(
+        model, view_outputs, xbridge_outputs, dualpath_outputs)
     threshold = final_threshold(y, probabilities, suite, settings.get("threshold_strategy", "global"), fixed_threshold)
     torch.save({**static, "model_state": best_state, "best_epoch": best_epoch, "threshold": threshold,
                 "weight_source": best_weights}, run/"best.pt")
@@ -1524,13 +1539,14 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
 
         key = "xbridge_diagnostics" if xbridge else "theraset_bridge_diagnostics"
         result[key] = evidence_report(y, probabilities, xbridge_outputs or {}, source.statistics)
-    if config["model_name"] == UNIFIED_EVIDENCE:
+    if config["model_name"] in (UNIFIED_EVIDENCE, DUALPATH_MFP):
         result["empty_top1"] = unified_fallback_report(y, probabilities, source.statistics, threshold)
     export_predictions = settings.get("export_validation_predictions", False)
     if export_predictions:
         result["validation_predictions"] = export_validation(
             run, "best", source, datasets[1], y, probabilities, threshold, best_epoch, best_weights, suite,
-            predicted=predicted, count_predicted=count_predicted, view_outputs=xbridge_outputs or view_outputs,
+            predicted=predicted, count_predicted=count_predicted,
+            view_outputs=xbridge_outputs or view_outputs or dualpath_outputs,
             split=validation_split)
     if save_candidates and alternate_best is not None:
         candidate = alternate_best
@@ -1775,7 +1791,7 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
               "metrics": evaluate_metrics(y, probabilities, threshold, source.statistics['labels']['support'],
                   source.statistics['function_projection'], predicted), "groups": grouped,
               "annotation_based_metrics": True, "experimental_structure_group": None}
-    if checkpoint["model_name"] == UNIFIED_EVIDENCE:
+    if checkpoint["model_name"] in (UNIFIED_EVIDENCE, DUALPATH_MFP):
         result["empty_top1"] = unified_fallback_report(y, probabilities, source.statistics, threshold)
         extra_outputs["cluster_id"] = source.data.clusters[dataset.indices]
     if residue_nll is not None:

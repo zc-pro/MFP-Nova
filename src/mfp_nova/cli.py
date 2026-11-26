@@ -93,6 +93,8 @@ def main(argv=None):
             sub.add_argument("--rank-weight", type=float, help="TheraSet: weight for threshold-anchored PU ranking loss")
             sub.add_argument("--rank-cooccur-beta", type=float, help="TheraSet: Train co-occurrence protection strength in PU ranking loss")
             sub.add_argument("--rank-margin", type=float, help="TheraSet: threshold margin for PU ranking loss")
+            sub.add_argument("--sym-rank-weight", type=float, help="DualPath-MFP: Path B symmetric PU ranking loss weight")
+            sub.add_argument("--sym-rank-beta", type=float, help="DualPath-MFP: Path B Train co-occurrence protection beta")
             sub.add_argument("--fold-dir", help="Sequence study: share training-only B0 fold checkpoints")
             sub.add_argument("--head-epochs", type=int, help="Sequence study: frozen head training epochs")
             sub.add_argument("--finetune-epochs", type=int, help="Sequence study: H4/H6 backbone fine-tuning epochs")
@@ -430,6 +432,10 @@ def main(argv=None):
                 config.setdefault("loss", {})["rank_cooccur_beta"] = args.rank_cooccur_beta
             if args.rank_margin is not None:
                 config.setdefault("loss", {})["rank_margin"] = args.rank_margin
+            if args.sym_rank_weight is not None:
+                config.setdefault("loss", {})["sym_rank"] = args.sym_rank_weight
+            if args.sym_rank_beta is not None:
+                config.setdefault("loss", {})["sym_rank_beta"] = args.sym_rank_beta
             if args.model != "sequence":
                 from .research import train
                 config["model_name"] = args.model

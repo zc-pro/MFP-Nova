@@ -44,10 +44,33 @@ def residue_encoding():
     return F.pad(torch.cat([torch.eye(20), properties], -1), (0, 0, 1, 0))
 
 
+def dual_terminal_features(batch):
+    """Padding-invariant N/C-terminal relative position and localized cap indicators [B, L, 7]."""
+    mask = batch["mask"]
+    bsz, width = mask.shape
+    lengths = mask.sum(dim=1, keepdim=True).clamp_min(1).float()
+    denom = (lengths - 1.0).clamp_min(1.0)
+    idx = torch.arange(width, device=mask.device, dtype=torch.float32).unsqueeze(0).expand(bsz, -1)
+    rel_n = (idx / denom).clamp(0.0, 1.0)
+    rel_c = ((lengths - 1.0 - idx) / denom).clamp(0.0, 1.0)
+    near_n = (idx < 3.0).float()
+    near_c = ((lengths - 1.0 - idx) < 3.0).float()
+    log_len = ((lengths + 1.0).log() / math.log(75.0)).expand(bsz, width)
+    if "terminal_chemical" in batch:
+        term = batch["terminal_chemical"].float()
+        n_cap = term[:, 0:1] * (idx == 0).float()
+        c_cap = term[:, 1:2] * (idx == (lengths - 1.0)).float()
+    else:
+        n_cap = torch.zeros_like(idx)
+        c_cap = torch.zeros_like(idx)
+    feats = torch.stack([rel_n, rel_c, near_n, near_c, log_len, n_cap, c_cap], dim=-1)
+    return feats * mask.unsqueeze(-1).float()
+
+
 class MotifCNN(nn.Module):
     """Two parallel 3/5/7/9 CNN stages; retain stage-two maps before max pooling."""
 
-    def __init__(self, vocab_size, channels, dropout, chemical_evidence, short_only=False):
+    def __init__(self, vocab_size, channels, dropout, chemical_evidence, short_only=False, terminal_features=False):
         super().__init__()
         self.chemical_evidence = chemical_evidence
         kernels = (3,) if short_only else (3, 5, 7, 9)
@@ -56,6 +79,10 @@ class MotifCNN(nn.Module):
         self.input = nn.Linear(34, 64)
         self.d = nn.Embedding(2, 64)
         self.chem = nn.Embedding(vocab_size, 64, padding_idx=0)
+        self.terminal_proj = nn.Linear(7, 64) if terminal_features else None
+        if self.terminal_proj is not None:
+            nn.init.zeros_(self.terminal_proj.weight)
+            nn.init.zeros_(self.terminal_proj.bias)
         self.convs1 = nn.ModuleList([nn.Conv1d(64, channels, k, padding=k//2) for k in kernels])
         self.convs2 = nn.ModuleList([] if short_only else
                                     [nn.Conv1d(self.output_channels, channels, k, padding=k//2) for k in kernels])
@@ -69,6 +96,8 @@ class MotifCNN(nn.Module):
         if self.chemical_evidence:
             global_chem = masked_mean(self.chem(batch["chemical"]), batch["chemical"] != 0)
             x = x + self.d(batch["d"]) + self.chem(batch["residue_chem"]) + global_chem[:, None]
+        if self.terminal_proj is not None:
+            x = x + self.terminal_proj(dual_terminal_features(batch))
         return x.masked_fill(~batch["mask"][..., None], 0)
 
     def first_maps(self, batch, inputs=None):
@@ -123,7 +152,9 @@ class FactorizedPairs(nn.Module):
         observed = observed & ~torch.eye(mask.shape[1], dtype=torch.bool, device=mask.device)[None]
         coords = batch["coords"].float().masked_fill(~structural[..., None], 0)
         with torch.autocast(device_type=coords.device.type, enabled=False):
-            distance = torch.cdist(coords, coords)
+            distance = batch.get("_shared_distances")
+            if distance is None:
+                distance = torch.cdist(coords, coords)
             centers = torch.linspace(0, 30, 16, device=coords.device)
             rbf = torch.exp(-((distance[..., None]-centers)/2).square())
         kind = batch["edge_type"].masked_fill(~observed, 0)
@@ -199,7 +230,7 @@ class TheraSet(nn.Module):
                  contextual_evidence=True, property_evidence=True, structure_evidence=True,
                  chemical_evidence=True, pair_readout=True, prototype_readout=True,
                  label_context=True, b0_backbone=False, b0_local_max=False, b0_local_cnn=False,
-                 order_evidence=False, v5_mode=None):
+                 order_evidence=False, v5_mode=None, terminal_features=False):
         super().__init__()
         self.statistics = statistics
         self.evidence_decoder = evidence_decoder
@@ -225,7 +256,8 @@ class TheraSet(nn.Module):
             with torch.no_grad():
                 self.b0_backbone.label_bias.copy_(prior)
             return
-        self.cnn = MotifCNN(vocab_size, cnn_channels, dropout, chemical_evidence)
+        self.cnn = MotifCNN(vocab_size, cnn_channels, dropout, chemical_evidence,
+                            terminal_features=terminal_features)
         if v5_mode is None:
             self.direct = motif_classifier(self.cnn.output_channels, num_labels, dropout)
             with torch.no_grad():

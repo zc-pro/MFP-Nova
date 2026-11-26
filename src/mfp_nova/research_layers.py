@@ -96,9 +96,12 @@ class SequenceEncoder(nn.Module):
         mask = batch["mask"]
         chemical = self.chem(batch["residue_chem"])
         annotated = self.aa(batch["aa"])+self.d(batch["d"])+chemical
-        features = batch["esm"]
-        if hasattr(self, "peptide_norm"):
-            features = torch.cat([self.plm_norm(features), self.peptide_norm(batch["esm_peptide"])], -1)
+        if "_shared_dual_esm" in batch:
+            features = batch["_shared_dual_esm"]
+        else:
+            features = batch["esm"]
+            if hasattr(self, "peptide_norm"):
+                features = torch.cat([self.plm_norm(features), self.peptide_norm(batch["esm_peptide"])], -1)
         plm = self.plm(features)
         x = plm+torch.sigmoid(self.input_gate(torch.cat([plm, annotated], -1)))*annotated
         x = (x+self.position(torch.arange(x.shape[1], device=x.device)))*mask[..., None]
@@ -451,4 +454,43 @@ def anchored_pu_ranking_loss(logits, targets, statistics, cooccur_beta=0.0, marg
 
     neg_scores = (logits - neg_offset).masked_fill(~neg_mask, float("-inf"))
     neg_loss = torch.logsumexp(torch.cat([zeros, neg_scores], dim=-1), dim=-1)
+    return ((pos_loss + neg_loss) / num_labels).mean()
+
+
+def symmetric_pu_ranking_loss(logits, targets, statistics, top_k=3, pos_margin=0.5, neg_margin=-0.5,
+                              gamma=2.0, cooccur_beta=1.0):
+    """Zero-centered symmetric Top-K PU ranking loss with overflow-safe logsumexp.
+
+    - Mean over recorded positives |P| and top-K hardest unannotated candidates balances
+      upward and downward gradient mass at s_pos = pos_margin, s_neg = neg_margin (midpoint 0 -> p=0.50).
+    - Labels outside the top-K unannotated pool receive exact zero gradient, preserving tail Macro-AP.
+    """
+    logits = logits.float()
+    targets = targets.float()
+    bsz, num_labels = logits.shape
+    pos_mask = targets > 0.5
+    neg_mask = ~pos_mask
+    zeros = torch.zeros((bsz, 1), device=logits.device, dtype=torch.float32)
+
+    pos_count = pos_mask.sum(dim=-1, keepdim=True).clamp_min(1).float()
+    pos_terms = (-gamma * (logits - pos_margin) - pos_count.log()).masked_fill(~pos_mask, float("-inf"))
+    pos_loss = torch.logsumexp(torch.cat([zeros, pos_terms], dim=-1), dim=-1) / gamma
+    pos_loss = pos_loss * pos_mask.any(dim=-1).float()
+
+    if cooccur_beta > 0.0 and "cond_cooccurrence" in statistics:
+        cond = torch.as_tensor(statistics["cond_cooccurrence"], device=logits.device, dtype=torch.float32)
+        max_co = (pos_mask.unsqueeze(-1).float() * cond.unsqueeze(0)).amax(dim=1)
+        adjusted_neg = logits - cooccur_beta * max_co
+    else:
+        adjusted_neg = logits
+
+    k_max = min(int(top_k), num_labels)
+    masked_neg = adjusted_neg.masked_fill(~neg_mask, float("-inf"))
+    top_vals = masked_neg.topk(k_max, dim=-1).values
+    valid_top = torch.isfinite(top_vals)
+    k_eff = valid_top.sum(dim=-1, keepdim=True).clamp_min(1).float()
+    neg_terms = (gamma * (top_vals - neg_margin) - k_eff.log()).masked_fill(~valid_top, float("-inf"))
+    neg_loss = torch.logsumexp(torch.cat([zeros, neg_terms], dim=-1), dim=-1) / gamma
+    neg_loss = neg_loss * valid_top.any(dim=-1).float()
+
     return ((pos_loss + neg_loss) / num_labels).mean()

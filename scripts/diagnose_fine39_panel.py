@@ -14,13 +14,17 @@ def load_export(path):
     with np.load(path, allow_pickle=False) as z:
         data = {k: z[k] for k in z.files}
     probs = data["probabilities"] if "probabilities" in data else 1.0 / (1.0 + np.exp(-data["logits"]))
-    return {
+    out = {
         "row_id": data["row_id"],
         "cluster_id": data["cluster_id"],
         "targets": data["targets"].astype(bool),
         "probabilities": probs.astype(np.float64),
         "label_names": [str(x) for x in data["label_names"]],
     }
+    for key in ("path_a_probabilities", "path_b_probabilities"):
+        if key in data:
+            out[key] = data[key].astype(np.float64)
+    return out
 
 
 def sample_jaccard(y, pred):
@@ -105,6 +109,22 @@ def evaluate_panel(export, threshold=0.5, low_mask=None):
         result["low_sim_rows"] = int(low_mask.sum())
         result["low_sim_raw_acc_pct"] = float(raw_j[low_mask].mean() * 100.0)
         result["low_sim_fallback_acc_pct"] = float(fb_j[low_mask].mean() * 100.0)
+    if "path_a_probabilities" in export and "path_b_probabilities" in export:
+        pa, pb = export["path_a_probabilities"], export["path_b_probabilities"]
+        pa_raw = pa >= threshold
+        pb_raw = pb >= threshold
+        pa_fb = apply_empty_top1(pa_raw, pa)
+        pb_fb = apply_empty_top1(pb_raw, pb)
+        a_hit = (pa_fb & y).any(axis=1)
+        b_hit = (pb_fb & y).any(axis=1)
+        result["dualpath_branches"] = {
+            "path_a_raw_acc_pct": float(sample_jaccard(y, pa_raw).mean() * 100.0),
+            "path_a_fallback_acc_pct": float(sample_jaccard(y, pa_fb).mean() * 100.0),
+            "path_b_raw_acc_pct": float(sample_jaccard(y, pb_raw).mean() * 100.0),
+            "path_b_fallback_acc_pct": float(sample_jaccard(y, pb_fb).mean() * 100.0),
+            "path_b_unique_rescues_over_a": int((~a_hit & b_hit).sum()),
+            "path_a_unique_rescues_over_b": int((a_hit & ~b_hit).sum()),
+        }
     return result, raw_j, fb_j, raw_pred, fb_pred
 
 
