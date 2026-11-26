@@ -59,6 +59,10 @@ def parse_arm(name: str, model_dir: Path):
 
     done = res_path.is_file()
     if not lines:
+        init_elapsed = None
+        log_path = model_dir.parent / "train.log"
+        if log_path.is_file():
+            init_elapsed = max(0.0, time.time() - log_path.stat().st_mtime)
         return {
             "name": name, "status": "DONE" if done else "INIT",
             "epoch": 0, "planned": planned, "lr": None,
@@ -66,6 +70,7 @@ def parse_arm(name: str, model_dir: Path):
             "val_acc": None, "val_f1": None, "val_ap": None,
             "best_acc": None, "best_ep": None,
             "stale": 0, "patience_lim": patience_lim, "mem_gb": None,
+            "ep_sec": None, "elapsed_sec": init_elapsed, "eta_sec": None,
         }
 
     last = lines[-1]
@@ -75,10 +80,22 @@ def parse_arm(name: str, model_dir: Path):
     best_acc = max((h.get("validation", {}).get("sample_jaccard", 0.0) for h in lines), default=0.0)
     peak_bytes = max(((h.get("peak_cuda_memory_bytes") or 0) for h in lines), default=0)
 
+    recent_secs = [h["seconds"] for h in lines[1:] if "seconds" in h][-5:]
+    if not recent_secs:
+        recent_secs = [h["seconds"] for h in lines if "seconds" in h][-5:]
+    ep_sec = sum(recent_secs) / len(recent_secs) if recent_secs else None
+    elapsed_sec = last.get("elapsed_seconds")
+    if not done and elapsed_sec is not None and hist_path.is_file():
+        elapsed_sec += max(0.0, time.time() - hist_path.stat().st_mtime)
+    cur_ep = last.get("epoch", len(lines))
+    eta_sec = 0.0 if done else (
+        max(0, planned - cur_ep) * ep_sec if (planned and ep_sec is not None) else None
+    )
+
     return {
         "name": name,
         "status": "DONE" if done else "RUN",
-        "epoch": last.get("epoch", len(lines)),
+        "epoch": cur_ep,
         "planned": planned,
         "lr": last.get("lr"),
         "tr_loss": tr_loss,
@@ -91,6 +108,9 @@ def parse_arm(name: str, model_dir: Path):
         "stale": last.get("early_stopping_count", 0),
         "patience_lim": patience_lim,
         "mem_gb": peak_bytes / (1024 ** 3) if peak_bytes else None,
+        "ep_sec": ep_sec,
+        "elapsed_sec": elapsed_sec,
+        "eta_sec": eta_sec,
     }
 
 
@@ -102,11 +122,27 @@ def _fmt_num(v, fmt=".4f"):
     return "-" if v is None else format(v, fmt)
 
 
+def _fmt_dur(sec):
+    if sec is None:
+        return "-"
+    sec = int(max(0, round(sec)))
+    if sec < 60:
+        return f"{sec}s"
+    mins, s = divmod(sec, 60)
+    if mins < 60:
+        return f"{mins}m{s:02d}s" if mins < 10 else f"{mins}m"
+    hrs, m = divmod(mins, 60)
+    return f"{hrs}h{m:02d}m"
+
+
 def build_rich_view(run_dir: Path, rows: list):
     table = Table(box=box.ROUNDED, expand=True, header_style="bold cyan")
     table.add_column("Arm", style="bold white", no_wrap=True)
     table.add_column("State", justify="center")
     table.add_column("Epoch", justify="right")
+    table.add_column("EpTime", justify="right")
+    table.add_column("Elapsed", justify="right")
+    table.add_column("ETA", justify="right", style="cyan")
     table.add_column("LR", justify="right")
     table.add_column("TrLoss", justify="right")
     table.add_column("ValLoss", justify="right")
@@ -130,6 +166,9 @@ def build_rich_view(run_dir: Path, rows: list):
             best_acc_str = f"* {best_acc_str}"
         table.add_row(
             r["name"], st_text, ep_str,
+            _fmt_dur(r["ep_sec"]),
+            _fmt_dur(r["elapsed_sec"]),
+            _fmt_dur(r["eta_sec"]),
             _fmt_num(r["lr"], ".1e"),
             _fmt_num(r["tr_loss"], ".4f"),
             _fmt_num(r["val_loss"], ".4f"),
@@ -149,14 +188,18 @@ def build_rich_view(run_dir: Path, rows: list):
 
 def render_plain(run_dir: Path, rows: list):
     header = f"=== MFP-Nova Monitor | {run_dir.name} | {time.strftime('%H:%M:%S')} (install rich for live color UI) ==="
-    cols = f"{'Arm':<22} {'State':<5} {'Epoch':>7} {'LR':>8} {'TrLoss':>7} {'ValLoss':>7} {'ValAcc':>7} {'BestAcc':>8} {'ValF1':>7} {'ValAP':>7} {'Best':>5} {'VRAM':>6}"
+    cols = (
+        f"{'Arm':<20} {'State':<5} {'Epoch':>7} {'EpTime':>7} {'Elapsed':>8} {'ETA':>7} "
+        f"{'LR':>8} {'TrLoss':>7} {'ValLoss':>7} {'ValAcc':>7} {'BestAcc':>8} {'ValF1':>7} {'ValAP':>7} {'Best':>5} {'VRAM':>6}"
+    )
     out = [header, cols, "-" * len(cols)]
     for r in rows:
         ep = f"{r['epoch']}/{r['planned']}" if r["planned"] else str(r["epoch"])
         mem = "-" if r["mem_gb"] is None else f"{r['mem_gb']:.1f}G"
         best_ep_s = "-" if r["best_ep"] is None else f"@{r['best_ep']}"
         out.append(
-            f"{r['name']:<22} {r['status']:<5} {ep:>7} {_fmt_num(r['lr'], '.1e'):>8} "
+            f"{r['name']:<20} {r['status']:<5} {ep:>7} {_fmt_dur(r['ep_sec']):>7} "
+            f"{_fmt_dur(r['elapsed_sec']):>8} {_fmt_dur(r['eta_sec']):>7} {_fmt_num(r['lr'], '.1e'):>8} "
             f"{_fmt_num(r['tr_loss']):>7} {_fmt_num(r['val_loss']):>7} {_fmt_pct(r['val_acc']):>7} "
             f"{_fmt_pct(r['best_acc']):>8} {_fmt_pct(r['val_f1']):>7} {_fmt_pct(r['val_ap']):>7} "
             f"{best_ep_s:>5} {mem:>6}"
