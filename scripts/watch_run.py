@@ -229,7 +229,7 @@ def main():
         console.print(build_rich_view(args.run_dir, collect()))
         return
 
-    with Live(build_rich_view(args.run_dir, collect()), console=console, refresh_per_second=1) as live:
+    with Live(build_rich_view(args.run_dir, collect()), console=console, refresh_per_second=1, screen=True) as live:
         try:
             while True:
                 time.sleep(args.interval)
