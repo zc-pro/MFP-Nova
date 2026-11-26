@@ -152,6 +152,7 @@ def main(argv=None):
             sub.add_argument("--name")
             sub.add_argument("--seed", type=int)
             sub.add_argument("--epochs", type=int)
+            sub.add_argument("--patience", type=int, help="Early stopping patience epochs")
             sub.add_argument("--loss", choices=("asl", "bce"))
             sub.add_argument("--global-only", action="store_true", help="Disable the local CNN branch")
     evaluate = commands.add_parser("evaluate")
@@ -436,6 +437,8 @@ def main(argv=None):
                 config.setdefault("loss", {})["sym_rank"] = args.sym_rank_weight
             if args.sym_rank_beta is not None:
                 config.setdefault("loss", {})["sym_rank_beta"] = args.sym_rank_beta
+            if args.patience is not None:
+                config["train"]["patience"] = args.patience
             if args.model != "sequence":
                 from .research import train
                 config["model_name"] = args.model
