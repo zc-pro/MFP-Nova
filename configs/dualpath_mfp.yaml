@@ -7,14 +7,14 @@ data:
   augment: false
 encoder:
   name: facebook/esm2_t33_650M_UR50D
-  revision: 08e4846e537177426273712802403f7ba8261b6c
+  revision: main
   max_length: 80
   batch_size: 8
 peptide_encoder:
   name: jiahuizhang/esm-150m-peptide-fine-tune
   revision: 6d8cebf74c53b1032b6f5917e75e3253cb70f575
   max_length: 80
-  batch_size: 8
+  batch_size: 32
 model:
   dim: 256
   heads: 8
@@ -25,15 +25,18 @@ model:
   b_prop_depth: 2
   b_latent_count: 24
   b_latent_depth: 4
+  b_decoder_depth: 2
   b_dropout: 0.25
   span_mask_prob: 0.15
   use_aa34_path: false
+  full_branch_rdrop: true
   fusion_weights: [0.4, 0.4, 0.2]
 loss:
   unlabeled_weight: 0.3
   b_unlabeled_weight: 0.45
   direct: 0.2
   evidence: 0.1
+  b_latent: 0.15
   modality_dropout: 0.1
   rdrop: 0.1
   sym_rank: 0.04
@@ -46,20 +49,21 @@ train:
   device: cpu
   seed: 42
   epochs: 100
+  lr_decay_epochs: 100
+  patience: 22
   batch_size: 64
   accumulation_steps: 1
   precision: fp32
   learning_rate: 0.0002
-  weight_decay: 0.01
-  patience: 20
   warmup_epochs: 5
   aux_warmup_epochs: 5
   rdrop_start_epoch: 6
   rdrop_ramp_epochs: 5
-  gradient_clip: 5
-  num_workers: 0
   ema_decay: 0.999
   ema_start_epoch: 6
+  weight_decay: 0.01
+  gradient_clip: 5
+  num_workers: 0
   metric_suite: jaccard
   threshold_strategy: global
   save_selection_candidates: true

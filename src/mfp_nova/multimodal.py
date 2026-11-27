@@ -162,6 +162,11 @@ def localize_terminal_chemistry(tokens):
     return remaining, terminal
 
 
+def extract_terminal_caps(tokens):
+    """Read-only N-acetyl / C-amide cap indicators without mutating global chemical tokens."""
+    return localize_terminal_chemistry(tokens)[1]
+
+
 class MultimodalData:
     def __init__(self, root, track, statistics=None, min_support=20, max_factors=32, sequence_only=False,
                  sequence_chemistry=False, train_indices=None, localize_terminals=False):
@@ -244,6 +249,7 @@ class MultimodalData:
         if [int(r["row_id"]) for r in records] != self.data.rows.tolist():
             raise ValueError("Chemical records differ from array row_id order")
         self.chemical, self.residue_chemical = [], []
+        self.terminal_caps = []
         if self.localize_terminals:
             self.terminal_chemical = []
         self.source = []
@@ -259,6 +265,7 @@ class MultimodalData:
             parts = record["HELM notation"].split("$")
             if len(parts)>1 and parts[1]:
                 global_tokens.append("connection:"+parts[1])
+            self.terminal_caps.append(extract_terminal_caps(global_tokens))
             if self.localize_terminals:
                 global_tokens, terminal = localize_terminal_chemistry(global_tokens)
                 self.terminal_chemical.append(terminal)
@@ -272,7 +279,8 @@ class MultimodalData:
     def chemical_inputs(self, i, length):
         vocab = self.statistics["chemical_vocab"]
         inputs = {"chemical": torch.tensor([vocab.get(t, 1) for t in self.chemical[i]] or [0]),
-                  "residue_chem": torch.tensor([vocab.get(t, 1) for t in self.residue_chemical[i]] or [0]*length)}
+                  "residue_chem": torch.tensor([vocab.get(t, 1) for t in self.residue_chemical[i]] or [0]*length),
+                  "terminal_caps": torch.tensor(self.terminal_caps[i], dtype=torch.bool)}
         if self.localize_terminals:
             inputs["terminal_chemical"] = torch.tensor(self.terminal_chemical[i], dtype=torch.bool)
         return inputs
@@ -421,7 +429,8 @@ class BackbonePeptides(Dataset):
 
 
 class MultimodalPeptides(Dataset):
-    def __init__(self, source, feature_root, split, limit=None, peptide_feature_root=None, sequence_only=False, indices=None):
+    def __init__(self, source, feature_root, split, limit=None, peptide_feature_root=None, sequence_only=False,
+                 indices=None, orth_feature_root=None):
         self.source = source
         self.positive_multipliers = None
         self.sequence_only = sequence_only
@@ -437,6 +446,10 @@ class MultimodalPeptides(Dataset):
             # IDs/backbones; its physical storage order may differ from the other cache.
             self.peptide_cache = CachedPeptides(source.data, peptide_feature_root, split)
             self.meta["peptide_encoder"] = self.peptide_cache.meta
+        self.orth_cache = None
+        if orth_feature_root is not None:
+            self.orth_cache = CachedPeptides(source.data, orth_feature_root, split)
+            self.meta["orth_encoder"] = self.orth_cache.meta
 
     def __len__(self):
         return len(self.indices)
@@ -451,6 +464,11 @@ class MultimodalPeptides(Dataset):
             if peptide.shape[0] != esm.shape[0]:
                 raise ValueError("Primary and peptide cache residue lengths differ")
             sample["esm_peptide"] = peptide
+        if self.orth_cache is not None:
+            orth, _ = self.orth_cache[self.cache_indices[index]]
+            if orth.shape[0] != esm.shape[0]:
+                raise ValueError("Primary and orth cache residue lengths differ")
+            sample["esm_orth"] = orth
         if self.cache.special_tokens is not None:
             position = self.cache.positions[self.cache_indices[index]]
             special = torch.from_numpy(np.array(self.cache.special_tokens[position], dtype=np.float32))
@@ -495,7 +513,7 @@ def collate_multimodal(samples):
     for key in samples[0]:
         if key == "edge_type":
             result[key] = torch.stack([torch.nn.functional.pad(s[key], (0, length-len(s["aa"]), 0, length-len(s["aa"]))) for s in samples])
-        elif key in ("esm", "esm_peptide", "aa", "d", "residue_chem", "mask", "coords", "geometry", "struct_mask", "dssp", "confidence_known", "chemical"):
+        elif key in ("esm", "esm_peptide", "esm_orth", "aa", "d", "residue_chem", "mask", "coords", "geometry", "struct_mask", "dssp", "confidence_known", "chemical"):
             padding = 9 if key == "dssp" else 0
             result[key] = torch.nn.utils.rnn.pad_sequence([s[key] for s in samples], batch_first=True, padding_value=padding)
         else:
@@ -510,10 +528,12 @@ def prepare_sequence_inputs(raw, statistics):
     def chemical_ids(values):
         return np.array([[0 if not str(t) else vocabulary.get(str(t), 1) for t in row] for row in values], np.int64)
 
-    chemistry = raw.get("chemical_tokens", np.full((b, 1), ""))
+    raw_chemistry = raw.get("chemical_tokens", np.full((b, 1), ""))
+    caps = [extract_terminal_caps([str(t) for t in row if str(t)]) for row in raw_chemistry]
+    chemistry = raw_chemistry
     localized = statistics.get("localized_terminal_chemistry")
     if localized:
-        localized_rows = [localize_terminal_chemistry([str(t) for t in row if str(t)]) for row in chemistry]
+        localized_rows = [localize_terminal_chemistry([str(t) for t in row if str(t)]) for row in raw_chemistry]
         width = max(1, max((len(tokens) for tokens, _ in localized_rows), default=0))
         chemistry = [tokens + [""] * (width - len(tokens)) for tokens, _ in localized_rows]
     arrays = {
@@ -521,10 +541,11 @@ def prepare_sequence_inputs(raw, statistics):
         "d": (raw["d"] * (raw["aa"] != 6)).astype(np.int64), "mask": raw["mask"].astype(bool),
         "chemical": chemical_ids(chemistry),
         "residue_chem": chemical_ids(raw.get("residue_chem_tokens", np.full((b, length), ""))),
+        "terminal_caps": np.asarray(caps, dtype=bool).reshape(b, 2),
     }
     if localized:
         arrays["terminal_chemical"] = np.asarray([terminal for _, terminal in localized_rows], dtype=bool).reshape(b, 2)
-    for key in ("esm_cls", "esm_eos", "esm_peptide"):
+    for key in ("esm_cls", "esm_eos", "esm_peptide", "esm_orth"):
         if key in raw:
             arrays[key] = raw[key].astype(np.float32)
     return {key: torch.from_numpy(value) for key, value in arrays.items()}

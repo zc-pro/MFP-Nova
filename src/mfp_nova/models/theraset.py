@@ -56,8 +56,11 @@ def dual_terminal_features(batch):
     near_n = (idx < 3.0).float()
     near_c = ((lengths - 1.0 - idx) < 3.0).float()
     log_len = ((lengths + 1.0).log() / math.log(75.0)).expand(bsz, width)
-    if "terminal_chemical" in batch:
-        term = batch["terminal_chemical"].float()
+    cap_source = batch.get("terminal_chemical")
+    if cap_source is None:
+        cap_source = batch.get("terminal_caps")
+    if cap_source is not None:
+        term = cap_source.float()
         n_cap = term[:, 0:1] * (idx == 0).float()
         c_cap = term[:, 1:2] * (idx == (lengths - 1.0)).float()
     else:

@@ -1,4 +1,4 @@
-"""DualPath-MFP: gradient-decoupled local precision and global bottleneck paths without O(L^3) triangles."""
+"""DualPath-MFP: gradient-decoupled local precision and global/heterogeneous bottleneck paths without O(L^3) triangles."""
 
 import math
 
@@ -11,7 +11,7 @@ from ..research_layers import (
     Attention, FeedForward, TransformerBlock, masked_mean,
     observed_label_loss, symmetric_pu_ranking_loss, training_views,
 )
-from .helixset import LatentFusionBlock, MotifPyramid, structure_strength
+from .helixset import LatentFusionBlock, MotifPyramid, SetDecoderBlock
 from .theraset import MotifCNN, TheraSet, dual_terminal_features, motif_classifier, residue_encoding
 
 
@@ -112,38 +112,39 @@ class PairBiasedSequenceBlock(nn.Module):
         return residues, pairs
 
 
-def _sample_span_drop(mask, drop_prob):
+def _sample_span_drop(mask, drop_prob, exact_rate=False):
     """Sample contiguous 1-3 residue span masks while guaranteeing >=1 surviving residue per peptide."""
     if drop_prob <= 0.0:
         return torch.zeros_like(mask)
     bsz, width = mask.shape
-    # Seed triggers with rate ~ drop_prob / 2 and expand to radius 1 (average span ~2-3).
-    triggers = (torch.rand((bsz, width), device=mask.device) < (drop_prob * 0.5)) & mask
+    seed_prob = (1.0 - (1.0 - min(drop_prob, 0.95)) ** (1.0 / 3.0)) if exact_rate else (drop_prob * 0.5)
+    triggers = (torch.rand((bsz, width), device=mask.device) < seed_prob) & mask
     expanded = F.max_pool1d(triggers.float().unsqueeze(1), kernel_size=3, stride=1, padding=1).squeeze(1) > 0
     drop = expanded & mask
     surviving = mask & ~drop
     all_dropped = mask.any(dim=1) & ~surviving.any(dim=1)
     if all_dropped.any():
-        # Deterministically keep the first valid residue on very short peptides if all were masked.
         first_valid = mask.float().argmax(dim=1)
         drop[all_dropped, first_valid[all_dropped]] = False
     return drop
 
 
 class GlobalBottleneckPath(nn.Module):
-    """Lightweight global bottleneck (~7.5M, zero O(L^3)) targeting low-homology cross-cluster generalization."""
+    """Global bottleneck + optional multi-resolution SetDecoder (zero O(L^3)) targeting low-homology transfer."""
 
     def __init__(self, input_dim, num_labels, vocab_size, statistics, peptide_input_dim=0,
                  dim=256, heads=8, pair_dim=32, seq_depth=2, prop_depth=2, latent_count=24,
-                 latent_depth=4, dropout=0.25, span_mask_prob=0.15):
+                 latent_depth=4, decoder_depth=0, dropout=0.25, span_mask_prob=0.15):
         super().__init__()
         self.span_mask_prob = span_mask_prob
+        self.decoder_depth = decoder_depth
         self.plm_proj = nn.Linear(input_dim + peptide_input_dim, dim)
         self.aa_emb = nn.Embedding(21, dim, padding_idx=0)
         self.d_emb = nn.Embedding(2, dim)
         self.chem_emb = nn.Embedding(vocab_size, dim, padding_idx=0)
         self.term_proj = nn.Linear(7, dim)
         self.input_gate = nn.Linear(2 * dim, dim)
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, dim)) if decoder_depth > 0 else None
         self.global_chem_layer = nn.Sequential(nn.Linear(2 * dim, dim), nn.GELU(), nn.LayerNorm(dim))
 
         self.properties = InvariantPropertyEncoder(dim, heads, dropout, depth=prop_depth)
@@ -164,11 +165,21 @@ class GlobalBottleneckPath(nn.Module):
         ])
 
         self.label_queries = nn.Parameter(torch.randn(num_labels, dim) * 0.02)
-        self.read_latent = Attention(dim, heads, dropout)
-        self.read_prop = Attention(dim, heads, dropout)
+        prior = torch.tensor(statistics["observed_prior"]).clamp(1e-4, 1.0 - 1e-4).logit()
+        if decoder_depth > 0:
+            self.decoder = nn.ModuleList([
+                SetDecoderBlock(dim, heads, dropout, pair_dim) for _ in range(decoder_depth)
+            ])
+            self.latent_head = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, num_labels))
+            with torch.no_grad():
+                self.latent_head[-1].bias.copy_(prior)
+        else:
+            self.decoder = None
+            self.latent_head = None
+            self.read_latent = Attention(dim, heads, dropout)
+            self.read_prop = Attention(dim, heads, dropout)
         self.out_norm = nn.LayerNorm(dim)
         self.label_weights = nn.Parameter(torch.randn(num_labels, dim) / math.sqrt(dim))
-        prior = torch.tensor(statistics["observed_prior"]).clamp(1e-4, 1.0 - 1e-4).logit()
         self.label_bias = nn.Parameter(prior)
 
     def _pair_inputs(self, batch, structural, reliability):
@@ -208,23 +219,37 @@ class GlobalBottleneckPath(nn.Module):
         mask = batch["mask"]
         bsz, width = mask.shape
         clean_aa = batch["aa"]
-        aa = clean_aa
-        d_tok = batch.get("d", torch.zeros_like(aa))
-        res_chem = batch.get("residue_chem", torch.zeros_like(aa))
-        chem = batch.get("chemical", aa.new_zeros((bsz, 1)))
-        dual_esm = batch["_shared_dual_esm"]
+        d_tok = batch.get("d", torch.zeros_like(clean_aa))
+        res_chem = batch.get("residue_chem", torch.zeros_like(clean_aa))
+        chem = batch.get("chemical", clean_aa.new_zeros((bsz, 1)))
+        plm_source = batch.get("_path_b_plm", batch["_shared_dual_esm"])
 
-        if self.training and self.span_mask_prob > 0.0:
-            drop = _sample_span_drop(mask, self.span_mask_prob)
-            keep_scale = (~drop).unsqueeze(-1).float() / max(1.0 - self.span_mask_prob, 1e-4)
-            aa = aa.masked_fill(drop, 0)
-            d_tok = d_tok.masked_fill(drop, 0)
-            res_chem = res_chem.masked_fill(drop, 0)
-            dual_esm = dual_esm * keep_scale * mask.unsqueeze(-1).float()
+        if self.mask_token is not None:
+            # Stage 3: clean unscaled fusion followed by learnable [MASK] replacement (zero train/eval norm shift).
+            plm = self.plm_proj(plm_source)
+            annotated = (self.aa_emb(clean_aa) + self.d_emb(d_tok)
+                         + self.chem_emb(res_chem) + self.term_proj(dual_terminal_features(batch)))
+            residues = plm + torch.sigmoid(self.input_gate(torch.cat([plm, annotated], dim=-1))) * annotated
+            if self.training and self.span_mask_prob > 0.0:
+                drop = _sample_span_drop(mask, self.span_mask_prob, exact_rate=True)
+                residues = torch.where(drop.unsqueeze(-1), self.mask_token.to(residues.dtype), residues)
+            residues = residues * mask.unsqueeze(-1)
+        else:
+            # Legacy Stage 2/2b checkpoint compatibility path.
+            aa = clean_aa
+            dual_esm = plm_source
+            if self.training and self.span_mask_prob > 0.0:
+                drop = _sample_span_drop(mask, self.span_mask_prob, exact_rate=False)
+                keep_scale = (~drop).unsqueeze(-1).float() / max(1.0 - self.span_mask_prob, 1e-4)
+                aa = aa.masked_fill(drop, 0)
+                d_tok = d_tok.masked_fill(drop, 0)
+                res_chem = res_chem.masked_fill(drop, 0)
+                dual_esm = dual_esm * keep_scale * mask.unsqueeze(-1).float()
+            plm = self.plm_proj(dual_esm)
+            annotated = (self.aa_emb(aa) + self.d_emb(d_tok)
+                         + self.chem_emb(res_chem) + self.term_proj(dual_terminal_features(batch)))
+            residues = (plm + torch.sigmoid(self.input_gate(torch.cat([plm, annotated], dim=-1))) * annotated) * mask.unsqueeze(-1)
 
-        plm = self.plm_proj(dual_esm)
-        annotated = self.aa_emb(aa) + self.d_emb(d_tok) + self.chem_emb(res_chem) + self.term_proj(dual_terminal_features(batch))
-        residues = (plm + torch.sigmoid(self.input_gate(torch.cat([plm, annotated], dim=-1))) * annotated) * mask.unsqueeze(-1)
         global_chem = masked_mean(self.chem_emb(chem), chem != 0)
         seq_global = self.global_chem_layer(torch.cat([masked_mean(residues, mask), global_chem], dim=-1))
 
@@ -274,6 +299,17 @@ class GlobalBottleneckPath(nn.Module):
 
         queries = self.label_queries.unsqueeze(0).expand(bsz, -1, -1)
         q_mask = torch.ones((bsz, queries.shape[1]), dtype=torch.bool, device=mask.device)
+        if self.decoder is not None:
+            for dec in self.decoder:
+                queries, _ = dec(
+                    queries, q_mask, latent, latent_mask, memories, masks, geom_rel,
+                    residues, seq_pairs, mask, geom_pairs, pair_quality, motif_weights,
+                    label_context=False, pair_readout=False, fine_evidence=True, pair_interactions=False,
+                )
+            pooled = self.out_norm(queries)
+            logits = (pooled * self.label_weights.unsqueeze(0)).sum(dim=-1) + self.label_bias
+            return {"logits": logits, "latent_logits": self.latent_head(latent.mean(dim=1))}
+
         ev_lat = self.read_latent(queries, latent, q_mask, latent_mask)
         ev_prop = self.read_prop(queries, prop_tokens, q_mask, prop_mask)
         pooled = self.out_norm(queries + ev_lat + ev_prop)
@@ -298,18 +334,20 @@ class PureAA34Path(nn.Module):
 
 
 class DualPathMFP(nn.Module):
-    """Gradient-decoupled local anchor (Path A) + global bottleneck (Path B) + optional pure AA34 (Path C)."""
+    """Gradient-decoupled local anchor (Path A) + global/heterogeneous bottleneck (Path B) + optional Path C."""
 
     def __init__(self, input_dim, num_labels, vocab_size, statistics, peptide_input_dim=0,
-                 dim=256, heads=8, dropout=0.2, cnn_channels=128, pair_dim=32,
+                 orth_input_dim=0, dim=256, heads=8, dropout=0.2, cnn_channels=128, pair_dim=32,
                  b_seq_depth=2, b_prop_depth=2, b_latent_count=24, b_latent_depth=4,
-                 b_dropout=0.25, span_mask_prob=0.15, use_aa34_path=False,
-                 fusion_weights=(0.4, 0.4, 0.2)):
+                 b_decoder_depth=0, b_dropout=0.25, span_mask_prob=0.15, use_aa34_path=False,
+                 full_branch_rdrop=False, fusion_weights=(0.4, 0.4, 0.2)):
         super().__init__()
         self.statistics = statistics
         self.input_dim = input_dim
         self.peptide_input_dim = peptide_input_dim
+        self.orth_input_dim = orth_input_dim
         self.use_aa34_path = use_aa34_path
+        self.full_branch_rdrop = full_branch_rdrop
         self.fusion_weights = tuple(fusion_weights)
         self.path_a = TheraSet(
             input_dim=input_dim, num_labels=num_labels, vocab_size=vocab_size, statistics=statistics,
@@ -318,11 +356,13 @@ class DualPathMFP(nn.Module):
             peptide_input_dim=peptide_input_dim, label_context=False, prototype_readout=False,
             terminal_features=True,
         )
+        b_in_dim = orth_input_dim if orth_input_dim > 0 else input_dim
         self.path_b = GlobalBottleneckPath(
-            input_dim=input_dim, num_labels=num_labels, vocab_size=vocab_size, statistics=statistics,
+            input_dim=b_in_dim, num_labels=num_labels, vocab_size=vocab_size, statistics=statistics,
             peptide_input_dim=peptide_input_dim, dim=dim, heads=heads, pair_dim=pair_dim,
             seq_depth=b_seq_depth, prop_depth=b_prop_depth, latent_count=b_latent_count,
-            latent_depth=b_latent_depth, dropout=b_dropout, span_mask_prob=span_mask_prob,
+            latent_depth=b_latent_depth, decoder_depth=b_decoder_depth,
+            dropout=b_dropout, span_mask_prob=span_mask_prob,
         )
         self.path_c = PureAA34Path(num_labels, statistics, cnn_channels=cnn_channels, dropout=dropout) if use_aa34_path else None
 
@@ -336,12 +376,21 @@ class DualPathMFP(nn.Module):
         shared = dict(batch)
         mask = batch["mask"].unsqueeze(-1)
         esm = F.layer_norm(batch["esm"].masked_fill(~mask, 0.0), (self.input_dim,))
+        pep = None
         if self.peptide_input_dim and "esm_peptide" in batch:
             pep = F.layer_norm(batch["esm_peptide"].masked_fill(~mask, 0.0), (self.peptide_input_dim,))
             dual = torch.cat([esm, pep], dim=-1)
         else:
             dual = esm
         shared["_shared_dual_esm"] = dual.masked_fill(~mask, 0.0)
+        if self.orth_input_dim > 0:
+            if "esm_orth" not in batch:
+                raise ValueError("DualPathMFP configured with orth_input_dim requires 'esm_orth' in batch")
+            orth = F.layer_norm(batch["esm_orth"].masked_fill(~mask, 0.0), (self.orth_input_dim,))
+            b_plm = torch.cat([orth, pep], dim=-1) if pep is not None else orth
+            shared["_path_b_plm"] = b_plm.masked_fill(~mask, 0.0)
+        else:
+            shared["_path_b_plm"] = shared["_shared_dual_esm"]
         if "struct_mask" in batch and "coords" in batch:
             structural = batch["struct_mask"] & batch["mask"]
             if structural.any():
@@ -362,6 +411,8 @@ class DualPathMFP(nn.Module):
             "path_a_direct": out_a["direct"],
             "path_a_evidence": out_a["evidence_logits"],
         }
+        if "latent_logits" in out_b:
+            out["path_b_latent"] = out_b["latent_logits"]
         if self.path_c is not None:
             logits_c = self.path_c(shared)["logits"]
             wa, wb, wc = self.fusion_weights
@@ -382,6 +433,8 @@ class DualPathMFP(nn.Module):
             "evidence": observed_label_loss(output["path_a_evidence"], targets, self.statistics, weak_a),
             "path_b_cls": observed_label_loss(output["path_b_logits"], targets, self.statistics, weak_b),
         }
+        if "path_b_latent" in output:
+            terms["b_latent"] = observed_label_loss(output["path_b_latent"], targets, self.statistics, weak_b)
         if "path_c_logits" in output:
             terms["path_c_cls"] = observed_label_loss(output["path_c_logits"], targets, self.statistics, weak_a)
         if settings.get("sym_rank", 0.0) > 0.0:
@@ -400,7 +453,8 @@ class DualPathMFP(nn.Module):
         output = self(view_a)
         terms = self._branch_terms(output, batch["y"], settings)
         rdrop_weight = settings.get("rdrop", 0.0)
-        agreement = output["path_a_logits"].new_zeros(())
+        agreement_mean = output["path_a_logits"].new_zeros(())
+        agreement_loss = agreement_mean
         if self.training and rdrop_weight > 0.0:
             second = self(view_a)
             other = self._branch_terms(second, batch["y"], settings)
@@ -411,13 +465,17 @@ class DualPathMFP(nn.Module):
             ]
             if "path_c_logits" in output:
                 kls.append(bernoulli_rdrop(output["path_c_logits"], second["path_c_logits"]))
-            agreement = sum(kls) / len(kls)
+            kl_sum = sum(kls)
+            agreement_mean = kl_sum / len(kls)
+            agreement_loss = kl_sum if self.full_branch_rdrop else agreement_mean
         loss_a = (terms["path_a_cls"]
                   + settings.get("direct", 0.2) * terms["direct"]
                   + settings.get("evidence", 0.1) * terms["evidence"])
-        loss_b = terms["path_b_cls"] + settings.get("sym_rank", 0.0) * terms.get("sym_rank", 0.0)
+        loss_b = (terms["path_b_cls"]
+                  + settings.get("b_latent", 0.15) * terms.get("b_latent", 0.0)
+                  + settings.get("sym_rank", 0.0) * terms.get("sym_rank", 0.0))
         loss_c = terms.get("path_c_cls", 0.0)
         terms["classification"] = 0.5 * (terms["path_a_cls"].detach() + terms["path_b_cls"].detach())
-        terms["rdrop"] = agreement
-        total = loss_a + loss_b + loss_c + rdrop_weight * agreement
+        terms["rdrop"] = agreement_mean.detach() if self.full_branch_rdrop else agreement_mean
+        total = loss_a + loss_b + loss_c + rdrop_weight * agreement_loss
         return (total, terms, output) if return_output else (total, terms)

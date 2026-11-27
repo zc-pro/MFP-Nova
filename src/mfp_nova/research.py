@@ -344,6 +344,28 @@ def validate_cache(dataset, config, reference=None):
         if peptide is not None and any(peptide[key] != other[key] for key in (
                 "name", "resolved_revision", "input_dim", "max_length", "dataset", "extraction_dtype", "storage_dtype")):
             raise ValueError("Peptide feature definitions differ across splits/checkpoint")
+    orth = meta.get("orth_encoder")
+    orth_settings = config.get("orth_encoder")
+    if (orth is None) != (orth_settings is None):
+        raise ValueError("Orthogonal encoder configuration and cache must be supplied together")
+    if orth is not None:
+        if config["model_name"] != DUALPATH_MFP:
+            raise ValueError("Only dualpath_mfp supports an orthogonal Path B encoder cache")
+        if orth["name"] != orth_settings["name"] or orth["max_length"] != orth_settings["max_length"]:
+            raise ValueError("Configured orthogonal encoder differs from cache")
+        if orth_settings["revision"] not in (orth["requested_revision"], orth["resolved_revision"]):
+            raise ValueError("Configured orthogonal encoder revision differs from cache")
+        if orth.get("representation_layer") is not None:
+            raise ValueError("Orthogonal encoder view requires final-layer features")
+        if orth["dataset"] != meta["dataset"]:
+            raise ValueError("Primary and orthogonal caches use different datasets")
+    if reference is not None:
+        other_orth = reference.get("orth_encoder")
+        if (orth is None) != (other_orth is None):
+            raise ValueError("Checkpoint/splits differ in orthogonal encoder use")
+        if orth is not None and any(orth[key] != other_orth[key] for key in (
+                "name", "resolved_revision", "input_dim", "max_length", "dataset", "extraction_dtype", "storage_dtype")):
+            raise ValueError("Orthogonal feature definitions differ across splits/checkpoint")
 
 
 def epoch_loss_settings(config, epoch):
@@ -354,7 +376,7 @@ def epoch_loss_settings(config, epoch):
         loss['branch_supervision'] = settings['branch_supervision']
     ramp = min(1, epoch/max(1, settings.get('aux_warmup_epochs', 5)))
     for key in ('direct', 'branch', 'reconstruction', 'prototype', 'diversity', 'balance', 'factor',
-                'evidence', 'annotation_set', 'sym_rank', 'rank_weight'):
+                'evidence', 'b_latent', 'annotation_set', 'sym_rank', 'rank_weight'):
         if key in loss:
             if key == "branch" and config.get("model_name") == "privilegedbridge" and config["model"].get("stage") == "B":
                 continue  # PB's specified teacher objective uses a fixed 0.2 branch term.
@@ -641,6 +663,12 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         else:
             config.pop("peptide_encoder", None)
             config["data"].pop("peptide_features", None)
+        if "orth_encoder" in original:
+            config["orth_encoder"] = original["orth_encoder"]
+            config["data"].setdefault("orth_features", original["data"]["orth_features"])
+        else:
+            config.pop("orth_encoder", None)
+            config["data"].pop("orth_features", None)
         for key, value in original["train"].items():
             if key not in ("device", "output", "epochs", "num_workers", "max_steps"):
                 settings[key] = value
@@ -804,7 +832,8 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         datasets = [MultimodalPeptides(source, config["data"]["features"], "train" if (fold is not None or inner_fold is not None) else split, limit,
                                        config["data"].get("peptide_features"),
                                        sequence_only=sequence_only or (pb and config["model"].get("stage", "A") == "A"),
-                                       indices=indices) for split, indices in (("train", train_indices), ("val", held_indices))]
+                                       indices=indices,
+                                       orth_feature_root=config["data"].get("orth_features")) for split, indices in (("train", train_indices), ("val", held_indices))]
         validate_cache(datasets[0], config, reference_checkpoint["encoder"] if reference_checkpoint else None)
         validate_cache(datasets[1], config, datasets[0].meta)
         if datasets[0].meta["dataset"] != source.statistics["dataset"]:
@@ -862,6 +891,8 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         args["axis_statistics"] = checkpoint["model_args"]["axis_statistics"] if checkpoint else axis_statistics(source)
     if "peptide_encoder" in datasets[0].meta:
         args["peptide_input_dim"] = datasets[0].meta["peptide_encoder"]["input_dim"]
+    if "orth_encoder" in datasets[0].meta:
+        args["orth_input_dim"] = datasets[0].meta["orth_encoder"]["input_dim"]
     if function_aux:
         args["function_aux_statistics"] = source.statistics["function_auxiliary"]
     if family_supervision:
@@ -957,6 +988,8 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     best_selection_threshold = None
     global_step = 0
     phase_best = -float("inf")
+    track_branch_best = config["model_name"] == DUALPATH_MFP and suite == "jaccard" and fold is None
+    branch_best = {}
     if checkpoint:
         restore_model_state(model, checkpoint["model_state"])
         optimizer.load_state_dict(checkpoint["optimizer_state"])
@@ -971,6 +1004,7 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         best_selection_threshold = checkpoint.get("best_selection_threshold")
         best_weights = checkpoint.get("best_weights", "online")
         phase_best = checkpoint.get("phase_best", best_key[0])
+        branch_best = checkpoint.get("dualpath_branch_best", {})
         if ema is not None:
             restore_model_state(ema, checkpoint["ema_state"])
             online_best_state = checkpoint["online_best_state"]
@@ -1275,7 +1309,8 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
                                fixed_threshold)
         del online_targets, online_probabilities
         validation_start = time.perf_counter()
-        y, probabilities, validation_loss, predicted, _, components = collect_validation(model)
+        epoch_dp = {} if track_branch_best and ema is None else None
+        y, probabilities, validation_loss, predicted, _, components = collect_validation(model, dualpath_outputs=epoch_dp)
         report = metrics(y, probabilities, source.statistics, fixed_threshold, predicted=predicted)
         selected_model, validation_weights = model, "online"
         online_report, online_loss = report, validation_loss
@@ -1288,11 +1323,32 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
             validation_weights = "online_warmup"
             if int(ema.n_averaged) > 0:
                 selected_model, validation_weights = ema.module, "ema"
+                epoch_dp = {} if track_branch_best else None
                 # An extra DataLoader iterator consumes a CPU base seed, even with
                 # zero workers. Preserve it so this observation does not change Train RNG.
                 with torch.random.fork_rng(devices=[]):
-                    y, probabilities, validation_loss, predicted, _, components = collect_validation(selected_model)
+                    y, probabilities, validation_loss, predicted, _, components = collect_validation(
+                        selected_model, dualpath_outputs=epoch_dp)
                 report = metrics(y, probabilities, source.statistics, fixed_threshold, predicted=predicted)
+        if track_branch_best and epoch_dp:
+            y_bool = y.astype(bool)
+            src_state = selected_model.state_dict()
+            for br in ("a", "b", "c"):
+                pkey = f"path_{br}_probabilities"
+                if pkey not in epoch_dp:
+                    continue
+                pred_b = epoch_dp[pkey] >= fixed_threshold
+                union_b = (y_bool | pred_b).sum(axis=1)
+                j_b = float(np.where(union_b > 0, (y_bool & pred_b).sum(axis=1) / np.maximum(union_b, 1), 0.0).mean())
+                prev_b = branch_best.get(br)
+                if prev_b is None or j_b > prev_b["jaccard"]:
+                    prefix_b = f"path_{br}."
+                    branch_best[br] = {
+                        "jaccard": j_b,
+                        "epoch": epoch,
+                        "weight_source": validation_weights,
+                        "state": {k: v.detach().cpu().clone() for k, v in src_state.items() if k.startswith(prefix_b)},
+                    }
         groups = evaluate_groups(y, probabilities, validation_groups, fixed_threshold, source.statistics["labels"]["support"],
                                  source.statistics["function_projection"], predicted)
         validation_seconds = time.perf_counter() - validation_start
@@ -1395,8 +1451,9 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         history.update(seconds=time.perf_counter()-epoch_start, elapsed_seconds=elapsed_before+time.perf_counter()-started,
                        train_seconds=train_seconds, data_wait_seconds=data_wait_seconds, validation_seconds=validation_seconds)
         phase_checkpoint = {"phase_best": phase_best} if suite == "jaccard" else {}
+        branch_checkpoint = {"dualpath_branch_best": branch_best} if track_branch_best else {}
         distributed_checkpoint = {"ddp_rng": ddp_rng} if distributed else {}
-        save_last_checkpoint({**static, **distributed_checkpoint, **ema_checkpoint, **candidate_checkpoint, **phase_checkpoint, "history_record": history,
+        save_last_checkpoint({**static, **distributed_checkpoint, **ema_checkpoint, **candidate_checkpoint, **phase_checkpoint, **branch_checkpoint, "history_record": history,
                     "best_weights": best_weights, "model_state": checkpoint_state(model), "optimizer_state": optimizer.state_dict(),
                     "scheduler_state": scheduler.state_dict(), "best_model_state": best_state,
                     "scaler_state": scaler.state_dict(), "global_step": global_step,
@@ -1489,6 +1546,38 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     dualpath_outputs = {} if config["model_name"] == DUALPATH_MFP else None
     y, probabilities, validation_loss, predicted, count_predicted, components = collect_validation(
         model, view_outputs, xbridge_outputs, dualpath_outputs)
+    async_selection_info = None
+    required_branches = ("a", "b", "c") if getattr(model, "path_c", None) is not None else ("a", "b")
+    if track_branch_best and all(br in branch_best for br in required_branches):
+        branch_epochs = {f"path_{br}": branch_best[br]["epoch"] for br in required_branches}
+        if any(ep != best_epoch for ep in branch_epochs.values()):
+            sync_report = metrics(y, probabilities, source.statistics, fixed_threshold, predicted)
+            sync_threshold = final_threshold(y, probabilities, suite, settings.get("threshold_strategy", "global"), fixed_threshold)
+            torch.save({**static, "model_state": best_state, "best_epoch": best_epoch, "threshold": sync_threshold,
+                        "weight_source": best_weights}, run/"best_sync.pt")
+            stitched_state = dict(best_state)
+            for br in required_branches:
+                stitched_state.update(branch_best[br]["state"])
+            restore_model_state(model, stitched_state)
+            async_dp = {}
+            ay, ap, aloss, apred, acount, acomp = collect_validation(model, None, None, async_dp)
+            async_report = metrics(ay, ap, source.statistics, fixed_threshold, apred)
+            async_selection_info = {
+                "adopted": bool(async_report["sample_jaccard"] > sync_report["sample_jaccard"]),
+                "branch_epochs": branch_epochs,
+                "branch_jaccards": {f"path_{br}": branch_best[br]["jaccard"] for br in required_branches},
+                "sync_best_epoch": best_epoch,
+                "sync_sample_jaccard": sync_report["sample_jaccard"],
+                "async_sample_jaccard": async_report["sample_jaccard"],
+            }
+            if async_selection_info["adopted"]:
+                best_state = stitched_state
+                y, probabilities, validation_loss = ay, ap, aloss
+                predicted, count_predicted, components = apred, acount, acomp
+                dualpath_outputs = async_dp
+                best_weights = "ema_async_stitched" if best_weights == "ema" else "online_async_stitched"
+            else:
+                restore_model_state(model, best_state)
     threshold = final_threshold(y, probabilities, suite, settings.get("threshold_strategy", "global"), fixed_threshold)
     torch.save({**static, "model_state": best_state, "best_epoch": best_epoch, "threshold": threshold,
                 "weight_source": best_weights}, run/"best.pt")
@@ -1548,6 +1637,8 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         result[key] = evidence_report(y, probabilities, xbridge_outputs or {}, source.statistics)
     if config["model_name"] in (UNIFIED_EVIDENCE, DUALPATH_MFP):
         result["empty_top1"] = unified_fallback_report(y, probabilities, source.statistics, threshold)
+        if async_selection_info is not None:
+            result["async_branch_selection"] = async_selection_info
     export_predictions = settings.get("export_validation_predictions", False)
     if export_predictions:
         result["validation_predictions"] = export_validation(
@@ -1715,7 +1806,7 @@ def hh_v12_validation_report(y, arrays, statistics):
 
 def evaluate(checkpoint_path, data_root, feature_root, split, device, output, predictions=None, batch_size=32, decision_path=None,
              without_private_evidence=False, peptide_feature_root=None, hh_diagnostics=False, v5_forward=None,
-             v6_diagnostics=False):
+             v6_diagnostics=False, orth_feature_root=None):
     model, checkpoint = load_model(checkpoint_path, device)
     if v6_diagnostics and (checkpoint["model_name"] != PEPTIDE_V6 or model.mode != "interaction"
                            or split != "val" or decision_path):
@@ -1749,7 +1840,8 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
     else:
         dataset = MultimodalPeptides(source, feature_root, split,
                                       peptide_feature_root=peptide_feature_root or checkpoint["config"]["data"].get("peptide_features"),
-                                      sequence_only=sequence_only or (checkpoint["model_name"] == "privilegedbridge" and model.stage == "A"))
+                                      sequence_only=sequence_only or (checkpoint["model_name"] == "privilegedbridge" and model.stage == "A"),
+                                      orth_feature_root=orth_feature_root or checkpoint["config"]["data"].get("orth_features"))
         validate_cache(dataset, checkpoint["config"], checkpoint["encoder"])
     loader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_multimodal)
     decision, predicted = None, None
@@ -1781,7 +1873,8 @@ def evaluate(checkpoint_path, data_root, feature_root, split, device, output, pr
                                           view_outputs=view_outputs, v5_forward=v5_forward,
                                           v6_outputs=extra_outputs if v6_diagnostics else None,
                                           v7_outputs=v7_outputs,
-                                          xbridge_outputs=extra_outputs if checkpoint["model_name"] == XBRIDGE else None)
+                                          xbridge_outputs=extra_outputs if checkpoint["model_name"] == XBRIDGE else None,
+                                          dualpath_outputs=extra_outputs if predictions and checkpoint["model_name"] == DUALPATH_MFP else None)
     threshold = checkpoint["threshold"]
     if decision_path:
         from .decisions import apply_decision
@@ -2016,6 +2109,9 @@ def predict_sequences(checkpoint_path, sequences, device="cpu", decision_path=No
     peptide = info.get("peptide_encoder")
     peptide_encoder = (FrozenEncoder(peptide["name"], peptide["resolved_revision"], peptide["max_length"], device)
                        if peptide is not None else None)
+    orth = info.get("orth_encoder")
+    orth_encoder = (FrozenEncoder(orth["name"], orth["resolved_revision"], orth["max_length"], device)
+                    if orth is not None else None)
     alphabet = "ACDEFGHIKLMNPQRSTVWY"
     output = []
     size = checkpoint["config"]["encoder"].get("batch_size", 8 if info["input_dim"]==1280 else 32)
@@ -2041,6 +2137,10 @@ def predict_sequences(checkpoint_path, sequences, device="cpu", decision_path=No
             peptide_states, peptide_mask = peptide_encoder.encode(selected)
             peptide_residues = [peptide_states[i, peptide_mask[i]].half().float().cpu() for i in range(len(selected))]
             raw["esm_peptide"] = torch.nn.utils.rnn.pad_sequence(peptide_residues, batch_first=True).numpy()
+        if orth_encoder is not None:
+            orth_states, orth_mask = orth_encoder.encode(selected)
+            orth_residues = [orth_states[i, orth_mask[i]].half().float().cpu() for i in range(len(selected))]
+            raw["esm_orth"] = torch.nn.utils.rnn.pad_sequence(orth_residues, batch_first=True).numpy()
         if prefix is not None:
             raw["esm_cls"] = states[:, 0].half().float().cpu().numpy()
             raw["esm_eos"] = torch.stack([states[i, len(s) + 1] for i, s in enumerate(selected)]).half().float().cpu().numpy()
@@ -2076,6 +2176,9 @@ def summarize_results(runs, split="val"):
         if "peptide_encoder" in metadata["encoder"]:
             protocol["peptide_encoder"] = {key: metadata["encoder"]["peptide_encoder"][key]
                                             for key in ("name", "resolved_revision")}
+        if "orth_encoder" in metadata["encoder"]:
+            protocol["orth_encoder"] = {key: metadata["encoder"]["orth_encoder"][key]
+                                         for key in ("name", "resolved_revision")}
         buckets[json.dumps(protocol, sort_keys=True)].append({"run": str(directory), "seed": metadata["seed"], "metrics": score,
             "trainable_parameters": result["trainable_parameters"], "elapsed_seconds": result["elapsed_seconds"],
             "peak_cuda_memory_bytes": result["peak_cuda_memory_bytes"]})

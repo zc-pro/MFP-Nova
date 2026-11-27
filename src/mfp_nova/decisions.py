@@ -32,10 +32,48 @@ def function_decisions(probabilities, projection, label_threshold, secondary_thr
     return predicted & (keep.astype(int) @ projection.T > 0)
 
 
+def expected_jaccard_decode(probabilities, top_m=8):
+    """Exact Bayes-optimal Expected Sample Jaccard over top-M calibrated candidates per sample."""
+    probs = np.asarray(probabilities, dtype=np.float64)
+    n, c = probs.shape
+    m = min(int(top_m), c)
+    order = np.argsort(-probs, axis=1)
+    top_idx = order[:, :m]
+    p_top = np.take_along_axis(probs, top_idx, axis=1)
+
+    states = np.array([[(s >> j) & 1 for j in range(m)] for s in range(1 << m)], dtype=np.float32)
+    cand_s = states[1:]
+    inter = states @ cand_s.T
+    union_base = states.sum(axis=1, keepdims=True) + cand_s.sum(axis=1, keepdims=True).T - inter
+    j_mat = np.where(union_base > 0, inter / np.maximum(union_base, 1.0), 0.0).astype(np.float32)
+
+    pred = np.zeros((n, c), dtype=bool)
+    for start in range(0, n, 1024):
+        end = min(start + 1024, n)
+        pb = p_top[start:end].astype(np.float32)
+        log_p = np.log(np.clip(pb, 1e-6, 1.0 - 1e-6))
+        log_1mp = np.log(np.clip(1.0 - pb, 1e-6, 1.0 - 1e-6))
+        py = np.exp(log_p @ states.T + log_1mp @ (1.0 - states).T)
+        exp_j = py @ j_mat
+        best_s = cand_s[exp_j.argmax(axis=1)] > 0.5
+        rows = np.arange(start, end)[:, None]
+        pred[rows, top_idx[start:end]] = best_s
+    return pred
+
+
 def apply_decision(probabilities, labels, task, decision):
     if decision['task'] != task or decision['labels'] != list(labels):
         raise ValueError('Decision task/label order differs from model')
-    return function_decisions(np.asarray(probabilities), function_projection(labels, task),
+    probs = np.asarray(probabilities, dtype=np.float64)
+    rule = decision.get('rule', 'function')
+    if rule == 'prior_calibrated_expected_jaccard':
+        p_clip = np.clip(probs, 1e-6, 1.0 - 1e-6)
+        z = np.log(p_clip / (1.0 - p_clip))
+        log_w = np.asarray(decision['log_positive_weights'], dtype=np.float64)[None, :]
+        z_cal = float(decision['alpha']) * z + float(decision['beta0']) - float(decision['beta1']) * log_w
+        q = 1.0 / (1.0 + np.exp(-np.clip(z_cal, -30.0, 30.0)))
+        return expected_jaccard_decode(q, top_m=decision.get('top_m', 8))
+    return function_decisions(probs, function_projection(labels, task),
                               decision['label_threshold'], decision.get('secondary_threshold'))
 
 

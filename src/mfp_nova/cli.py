@@ -6,7 +6,7 @@ from pathlib import Path
 import yaml
 
 from .models import RESEARCH_MODELS, LEGACY_MODELS, HH_MODELS, HH_V15_RANKER, HH_V16, HH_V17, HH_V20, HH_V20_CHEMICAL_MODES
-from .models import PEPTIDE_V3, PEPTIDE_V6, PEPTIDE_V7, V3_MODES, V7_HEADS, XBRIDGE, THERASET_BRIDGE, UNIFIED_EVIDENCE
+from .models import PEPTIDE_V3, PEPTIDE_V6, PEPTIDE_V7, V3_MODES, V7_HEADS, XBRIDGE, THERASET_BRIDGE, UNIFIED_EVIDENCE, DUALPATH_MFP
 from .metric_protocol import SUITES
 from .models.hypotheses import MODELS as HYPOTHESIS_MODELS
 from .data import TRACKS
@@ -34,13 +34,18 @@ def main(argv=None):
         sub.add_argument("--data-root")
         sub.add_argument("--feature-root")
         sub.add_argument("--peptide-feature-root", help="Short-peptide cache directory for HelixSet/TheraSet")
+        sub.add_argument("--orth-feature-root", help="Orthogonal Path B cache directory for DualPath-MFP")
+        sub.add_argument("--orth-model", choices=("prost_t5", "prot_t5"),
+                         help="Select orthogonal T5 preset (Rostlab/ProstT5 or Rostlab/prot_t5_xl_half_uniref50-enc)")
+        sub.add_argument("--orth-name", help="Custom HuggingFace repo or local path for orthogonal Path B encoder")
+        sub.add_argument("--orth-revision", default="main", help="Revision for --orth-name / --orth-model")
         sub.add_argument("--track", choices=TRACKS)
         sub.add_argument("--device")
         sub.add_argument("--batch-size", type=int, help="Encoder batch for features; head batch for train")
         sub.add_argument("--esm", choices=("35m", "650m"), help="Select ESM size and matching feature directory")
         if command == "features":
-            sub.add_argument("--encoder-view", choices=("primary", "peptide"), default="primary",
-                             help="Extract primary ESM or the configured short-peptide encoder")
+            sub.add_argument("--encoder-view", choices=("primary", "peptide", "orth"), default="primary",
+                             help="Extract primary ESM, short-peptide encoder, or orthogonal Path B encoder")
             sub.add_argument("--splits", nargs="+", choices=("train", "val", "test"), default=["train", "val"])
             sub.add_argument("--resume-from", type=int, default=0,
                              help="Completed rows in the first split, from the interrupted extraction log")
@@ -162,6 +167,7 @@ def main(argv=None):
     evaluate.add_argument("--data-root", help="Defaults to the checkpoint's data root")
     evaluate.add_argument("--feature-root")
     evaluate.add_argument("--peptide-feature-root")
+    evaluate.add_argument("--orth-feature-root")
     evaluate.add_argument("--split", choices=("val", "test"), default="test")
     evaluate.add_argument("--device", default="cpu")
     evaluate.add_argument("--output", required=True)
@@ -384,8 +390,25 @@ def main(argv=None):
         configure_task(config, (args.task if args.command == "train" else None)
                        or args.track or config["data"]["track"])
         peptide_view = args.command == "features" and args.encoder_view == "peptide"
-        if peptide_view and args.esm:
-            raise ValueError("--encoder-view peptide uses peptide_encoder; omit --esm")
+        orth_view = args.command == "features" and args.encoder_view == "orth"
+        if (peptide_view or orth_view) and args.esm:
+            raise ValueError("--encoder-view peptide/orth uses its own encoder config; omit --esm")
+        if args.orth_model or args.orth_name:
+            presets = {
+                "prost_t5": ("Rostlab/ProstT5", "features/prost_t5"),
+                "prot_t5": ("Rostlab/prot_t5_xl_half_uniref50-enc", "features/prot_t5"),
+            }
+            default_name, default_feat = presets[args.orth_model] if args.orth_model else (args.orth_name, "features/orth_custom")
+            orth_name = args.orth_name or default_name
+            config["orth_encoder"] = {
+                "name": orth_name,
+                "revision": args.orth_revision,
+                "max_length": 80,
+                "batch_size": 32,
+            }
+            config["data"].setdefault("orth_features", default_feat)
+        if orth_view and "orth_encoder" not in config:
+            raise ValueError("--encoder-view orth requires --orth-model, --orth-name, or orth_encoder in config")
         if args.esm and model_name in (*HH_MODELS, HH_V16, HH_V17) and args.esm != "650m":
             parser.error("HH-SetReread uses the initializing TheraSet's ESM650M cache")
         if args.esm and model_name == HH_V20:
@@ -403,16 +426,21 @@ def main(argv=None):
                 config["data"]["features"] += f"_layer{layer}"
             if args.command == "features":
                 config["encoder"]["batch_size"] = 8 if args.esm=="650m" else 32
-        feature_key = "peptide_features" if peptide_view else "features"
+        feature_key = "peptide_features" if peptide_view else ("orth_features" if orth_view else "features")
         for arg, key in ((args.data_root, "root"), (args.feature_root, feature_key), (args.track, "track")):
             if arg is not None:
                 config["data"][key] = arg
         if args.peptide_feature_root is not None:
             config["data"]["peptide_features"] = args.peptide_feature_root
+        if args.orth_feature_root is not None:
+            config["data"]["orth_features"] = args.orth_feature_root
         if args.device is not None:
             config["train"]["device"] = args.device
         if args.batch_size is not None:
-            section = ("peptide_encoder" if peptide_view else "encoder") if args.command == "features" else "train"
+            if args.command == "features":
+                section = "peptide_encoder" if peptide_view else ("orth_encoder" if orth_view else "encoder")
+            else:
+                section = "train"
             config[section]["batch_size"] = args.batch_size
         if args.command == "features":
             from .encoder import prepare_features
@@ -518,7 +546,7 @@ def main(argv=None):
                     config["train"][key] = value
             if args.rdrop_weight is not None:
                 if model_name not in ("helixset", "theraset", "termiscale", "motifspan", "privilegedbridge",
-                                       "hh_setreread", PEPTIDE_V3, PEPTIDE_V6, PEPTIDE_V7, THERASET_BRIDGE):
+                                       "hh_setreread", PEPTIDE_V3, PEPTIDE_V6, PEPTIDE_V7, THERASET_BRIDGE, DUALPATH_MFP):
                     raise ValueError("This model does not support R-Drop")
                 config["loss"]["rdrop"] = args.rdrop_weight
             if args.loss is not None:
@@ -608,6 +636,10 @@ def main(argv=None):
             if "model_name" not in checkpoint:
                 raise ValueError("Peptide cache requires a research model checkpoint")
             extra['peptide_feature_root'] = args.peptide_feature_root
+        if args.orth_feature_root:
+            if checkpoint.get("model_name") != DUALPATH_MFP:
+                raise ValueError("Orthogonal Path B cache requires a dualpath_mfp checkpoint")
+            extra['orth_feature_root'] = args.orth_feature_root
         if args.without_private_evidence:
             extra['without_private_evidence'] = True
         if args.decision:
