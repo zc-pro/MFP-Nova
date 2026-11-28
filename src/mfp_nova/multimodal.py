@@ -303,6 +303,21 @@ class MultimodalData:
         if self.statistics["function_auxiliary"]["labels"] != other.labels:
             raise ValueError("Auxiliary checkpoint label order differs from data")
 
+    def enable_bio_targets(self):
+        if self.data.track != "fine39":
+            raise ValueError("Fine39-Bio targets require track fine39")
+        from .bio_taxonomy import build_fine39_bio_targets
+        bio = build_fine39_bio_targets(self.root, include_omitted_parent_positives=True)
+        if not np.array_equal(bio["row_id"], self.data.rows):
+            raise ValueError("Fine39-Bio row_id order differs")
+        train = self.data.indices("train")
+        self.bio_y = bio["y_bio"]
+        self.bio_m_obs = bio["m_obs"]
+        if "bio_labels" not in self.statistics:
+            self.statistics["bio_labels"] = label_statistics(
+                self.bio_y[train], self.data.clusters[train], self.data.labels,
+            )
+
     def sample(self, i, esm):
         if self.sequence_only:
             sample = sequence_inputs(self.data, i, esm)
@@ -476,6 +491,9 @@ class MultimodalPeptides(Dataset):
         if hasattr(self.source, "aux_mask"):
             sample["aux_y"] = torch.from_numpy(self.source.aux_y[i].astype(np.float32))
             sample["aux_mask"] = torch.tensor(bool(self.source.aux_mask[i]))
+        if hasattr(self.source, "bio_y"):
+            sample["y_bio"] = torch.from_numpy(self.source.bio_y[i].astype(np.float32))
+            sample["m_obs"] = torch.from_numpy(self.source.bio_m_obs[i].astype(np.float32))
         if self.positive_multipliers is not None:
             sample["positive_multiplier"] = self.positive_multipliers[index]
         return sample

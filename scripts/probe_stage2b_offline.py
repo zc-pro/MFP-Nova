@@ -8,6 +8,7 @@ import numpy as np
 import torch
 from torch.nn import functional as F
 
+from mfp_nova.bio_taxonomy import granularity_mutex_matrix, partial_label_bio_eval
 from mfp_nova.data import PeptideData
 from mfp_nova.decisions import apply_decision, expected_jaccard_decode
 from mfp_nova.multimodal import label_statistics
@@ -71,7 +72,7 @@ def fit_prior_aware_bce(logits, y_true, log_pos_weights):
     return a, b0, b1
 
 
-def evaluate_logits(name, logits, y_true, clusters, log_pos_weights):
+def evaluate_logits(name, logits, y_true, clusters, log_pos_weights, labels=None):
     p_raw = sigmoid(logits)
     r50, f50, l50, e50 = eval_threshold(y_true, p_raw, 0.50)
     folds = cluster_folds(clusters, k=5, seed=42)
@@ -84,11 +85,20 @@ def evaluate_logits(name, logits, y_true, clusters, log_pos_weights):
     ej_pred = expected_jaccard_decode(p_bce, top_m=8)
     ej_acc = sample_jaccard(y_true, ej_pred)
     ej_lps = float(ej_pred.sum(axis=1).mean())
-    a_all, b0_all, b1_all = fit_prior_aware_bce(logits, y_true, log_pos_weights)
     print(f"[{name}]")
     print(f"  @0.50 Raw={r50:.4f}% | Fallback={f50:.4f}% (lps={l50:.3f}, empty={e50})")
     print(f"  5-Fold Cluster-CV 3-Param BCE @0.50 -> Raw={rbce:.4f}% | Fallback={fbce:.4f}% (lps={lbce:.3f})")
     print(f"  5-Fold Cluster-CV 3-Param BCE + Top-8 Expected Jaccard -> ACC={ej_acc:.4f}% (lps={ej_lps:.3f})")
+    if labels is not None:
+        mutex_mat = granularity_mutex_matrix(labels)
+        mej_pred = expected_jaccard_decode(p_bce, top_m=8, mutex_matrix=mutex_mat)
+        mej_acc = sample_jaccard(y_true, mej_pred)
+        mej_lps = float(mej_pred.sum(axis=1).mean())
+        bio = partial_label_bio_eval(y_true, mej_pred, labels)
+        print(f"  5-Fold Cluster-CV + Mutex Top-8 Expected Jaccard -> ACC={mej_acc:.4f}% (lps={mej_lps:.3f}) | "
+              f"BioAxis={bio['bio_axis_jaccard_pct']:.2f}% | PartialLabel={bio['partial_label_jaccard_pct']:.2f}% | "
+              f"GranOnlyZero={bio['granularity_only_zero_rows']}")
+    a_all, b0_all, b1_all = fit_prior_aware_bce(logits, y_true, log_pos_weights)
     print(f"  Full-Val 3-Param Fit: alpha={a_all:.4f}, beta0={b0_all:.4f}, beta1={b1_all:.4f}")
     return a_all, b0_all, b1_all
 
@@ -113,7 +123,7 @@ def main():
     log_pos_w = np.log(np.maximum(np.asarray(stats["positive_weights"], dtype=np.float64), 1e-6))
 
     z_main = logit(s04["probabilities"])
-    a, b0, b1 = evaluate_logits("Primary Candidate", z_main, y, clusters, log_pos_w)
+    a, b0, b1 = evaluate_logits("Primary Candidate", z_main, y, clusters, log_pos_w, labels=labels)
 
     if args.export_decision:
         decision = {
@@ -125,6 +135,7 @@ def main():
             "beta1": b1,
             "log_positive_weights": log_pos_w.tolist(),
             "top_m": 8,
+            "granularity_mutex": True,
         }
         out_path = Path(args.export_decision)
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -137,12 +148,12 @@ def main():
         assert np.array_equal(s04["row_id"], th["row_id"]), "row_id mismatch"
         evaluate_logits("TheraSet + Candidate-PathB [Undiluted PathA Proxy]",
                         0.5 * (logit(th["probabilities"]) + logit(s04["path_b_probabilities"])),
-                        y, clusters, log_pos_w)
+                        y, clusters, log_pos_w, labels=labels)
 
     if args.asl:
         asl = np.load(args.asl, allow_pickle=False)
         assert np.array_equal(s04["row_id"], asl["row_id"]), "row_id mismatch with asl"
-        evaluate_logits("Comparison Arm", logit(asl["probabilities"]), y, clusters, log_pos_w)
+        evaluate_logits("Comparison Arm", logit(asl["probabilities"]), y, clusters, log_pos_w, labels=labels)
 
 
 if __name__ == "__main__":

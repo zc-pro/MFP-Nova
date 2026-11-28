@@ -376,7 +376,7 @@ def epoch_loss_settings(config, epoch):
         loss['branch_supervision'] = settings['branch_supervision']
     ramp = min(1, epoch/max(1, settings.get('aux_warmup_epochs', 5)))
     for key in ('direct', 'branch', 'reconstruction', 'prototype', 'diversity', 'balance', 'factor',
-                'evidence', 'b_latent', 'annotation_set', 'sym_rank', 'rank_weight'):
+                'evidence', 'b_latent', 'annotation_set', 'sym_rank', 'rank_weight', 'bio_weight'):
         if key in loss:
             if key == "branch" and config.get("model_name") == "privilegedbridge" and config["model"].get("stage") == "B":
                 continue  # PB's specified teacher objective uses a fixed 0.2 branch term.
@@ -811,6 +811,9 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         raise ValueError("PB B/C need observed auxiliary inputs; use rich48 or stage A for author sequence tasks")
     if function_aux or family_supervision:
         source.enable_function_auxiliary()
+    bio_supervision = config["model_name"] == DUALPATH_MFP and config["model"].get("use_bio_head", False)
+    if bio_supervision:
+        source.enable_bio_targets()
     if anchor is not None and list(anchor["labels"]) != list(source.data.labels):
         raise ValueError("Reference label order differs from Fine39")
     limit = settings.get("limit_samples")
@@ -848,6 +851,16 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         multipliers, gram_weight_summary = gram_positive_multipliers(source.data, gram_weighting)
         training_data.positive_multipliers = torch.from_numpy(multipliers[training_data.indices])
         print(f"Gram positive weighting | {gram_weighting} | {json.dumps(gram_weight_summary)}", flush=True)
+    cluster_balance_alpha = float(settings.get("cluster_balance_alpha", 0.0) or 0.0)
+    if cluster_balance_alpha > 0.0:
+        from .bio_taxonomy import cluster_balanced_positive_multipliers
+        cb_mult = cluster_balanced_positive_multipliers(source.data, alpha=cluster_balance_alpha)
+        cb_tensor = torch.from_numpy(cb_mult[training_data.indices])
+        training_data.positive_multipliers = (
+            cb_tensor if training_data.positive_multipliers is None
+            else training_data.positive_multipliers * cb_tensor
+        )
+        print(f"Cluster-balanced positive risk | alpha={cluster_balance_alpha:.3f}", flush=True)
     if use_oof:
         training_data = ScoredPeptides(training_data, oof_scores[np.searchsorted(train_indices, training_data.indices)])
     loader_settings = dict(num_workers=num_workers, pin_memory=pin_memory, collate_fn=collate_multimodal)
@@ -895,6 +908,8 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         args["orth_input_dim"] = datasets[0].meta["orth_encoder"]["input_dim"]
     if function_aux:
         args["function_aux_statistics"] = source.statistics["function_auxiliary"]
+    if bio_supervision:
+        args["bio_statistics"] = source.statistics["bio_labels"]
     if family_supervision:
         args["family_statistics"] = source.statistics["function_auxiliary"]
     model = make_model(config["model_name"], args).to(device)
@@ -1342,12 +1357,12 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
                 j_b = float(np.where(union_b > 0, (y_bool & pred_b).sum(axis=1) / np.maximum(union_b, 1), 0.0).mean())
                 prev_b = branch_best.get(br)
                 if prev_b is None or j_b > prev_b["jaccard"]:
-                    prefix_b = f"path_{br}."
+                    prefixes = ("path_a.", "path_a_gran.") if br == "a" else (f"path_{br}.",)
                     branch_best[br] = {
                         "jaccard": j_b,
                         "epoch": epoch,
                         "weight_source": validation_weights,
-                        "state": {k: v.detach().cpu().clone() for k, v in src_state.items() if k.startswith(prefix_b)},
+                        "state": {k: v.detach().cpu().clone() for k, v in src_state.items() if k.startswith(prefixes)},
                     }
         groups = evaluate_groups(y, probabilities, validation_groups, fixed_threshold, source.statistics["labels"]["support"],
                                  source.statistics["function_projection"], predicted)

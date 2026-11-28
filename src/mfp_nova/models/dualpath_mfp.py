@@ -7,6 +7,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from ..consistency import bernoulli_rdrop
+from ..pharmafield_probe import BioGranularityAdapter, BioGranularityResidualHead, fine39_bio_supervision_loss
 from ..research_layers import (
     Attention, FeedForward, TransformerBlock, masked_mean,
     observed_label_loss, symmetric_pu_ranking_loss, training_views,
@@ -24,18 +25,42 @@ CORE_PHYS_GROUPS = (
     list(range(502, 515)),  # RDKit molecular descriptors (LogP, TPSA, HBD/HBA, rings)
 )
 DPC_SLICES = (list(range(37, 237)), list(range(237, 437)))
+# Eisenberg consensus hydrophobicity scale in project ACDEFGHIKLMNPQRSTVWY order (0 = pad).
+EISENBERG_HYDRO = (
+    0.0, 0.62, 0.29, -0.90, -0.74, 1.19, 0.48, -0.40, 1.38, -1.50, 1.06,
+    0.64, -0.78, 0.12, -0.85, -2.53, -0.18, -0.05, 1.08, 0.81, 0.26,
+)
+
+
+def _residue_ph_charges(ph):
+    """Henderson-Hasselbalch residue side-chain charges in ACDEFGHIKLMNPQRSTVWY order (0=pad)."""
+    # Indices: C=2(8.3), D=3(3.9), E=4(4.1), H=7(6.0), K=9(10.5), R=15(12.5), Y=20(10.1)
+    q = [0.0] * 21
+    for idx, pka in ((3, 3.9), (4, 4.1), (2, 8.3), (20, 10.1)):
+        q[idx] = -1.0 / (1.0 + 10.0 ** (pka - ph))
+    for idx, pka in ((7, 6.0), (9, 10.5), (15, 12.5)):
+        q[idx] = 1.0 / (1.0 + 10.0 ** (ph - pka))
+    return torch.tensor(q, dtype=torch.float32)
 
 
 class InvariantPropertyEncoder(nn.Module):
-    """1 always-available intrinsic sequence biophysics token + 8 high-purity external property tokens."""
+    """1 always-available intrinsic sequence biophysics token + 8 high-purity external property tokens (+2 v2 tokens)."""
 
-    def __init__(self, dim, heads, dropout, depth=2):
+    def __init__(self, dim, heads, dropout, depth=2, biophysics_v2=False):
         super().__init__()
+        self.biophysics_v2 = biophysics_v2
         self.register_buffer("aa_props", residue_encoding())
         self.intrinsic = nn.Sequential(nn.Linear(70, dim), nn.GELU(), nn.LayerNorm(dim))
         self.core_proj = nn.ModuleList([nn.Linear(2 * len(g), dim) for g in CORE_PHYS_GROUPS])
         self.dpc_proj = nn.ModuleList([nn.Linear(2 * len(g), dim) for g in DPC_SLICES])
         self.group_embed = nn.Parameter(torch.randn(1 + len(CORE_PHYS_GROUPS) + len(DPC_SLICES), dim) * 0.02)
+        if biophysics_v2:
+            self.register_buffer("q_74", _residue_ph_charges(7.4))
+            self.register_buffer("q_55", _residue_ph_charges(5.5))
+            self.register_buffer("eisenberg", torch.tensor(EISENBERG_HYDRO, dtype=torch.float32))
+            self.ph_cap_proj = nn.Sequential(nn.Linear(8, dim), nn.GELU(), nn.LayerNorm(dim))
+            self.amphipathic_proj = nn.Sequential(nn.Linear(18, dim), nn.GELU(), nn.LayerNorm(dim))
+            self.v2_group_embed = nn.Parameter(torch.randn(2, dim) * 0.02)
         self.layers = nn.ModuleList([TransformerBlock(dim, heads, dropout) for _ in range(depth)])
 
     def _intrinsic_token(self, aa, mask):
@@ -48,6 +73,48 @@ class InvariantPropertyEncoder(nn.Module):
         net_charge = enc[:, :, 20].sum(dim=1, keepdim=True) / 10.0
         log_len = (length + 1.0).log() / math.log(75.0)
         return self.intrinsic(torch.cat([mean, std, net_charge, log_len], dim=-1))
+
+    def _biophysics_v2_tokens(self, aa, batch):
+        mask = batch["mask"]
+        valid = mask.float()
+        length = valid.sum(dim=1, keepdim=True).clamp_min(1.0)
+        caps = batch["terminal_caps"].float() if "terminal_caps" in batch else aa.new_zeros((aa.shape[0], 2), dtype=torch.float32)
+        n_free = 1.0 - caps[:, 0:1]
+        c_free = 1.0 - caps[:, 1:2]
+
+        q74_res = (self.q_74[aa] * valid).sum(dim=1, keepdim=True)
+        q55_res = (self.q_55[aa] * valid).sum(dim=1, keepdim=True)
+        q74 = q74_res + n_free / (1.0 + 10.0 ** (7.4 - 8.0)) - c_free / (1.0 + 10.0 ** (3.6 - 7.4))
+        q55 = q55_res + n_free / (1.0 + 10.0 ** (5.5 - 8.0)) - c_free / (1.0 + 10.0 ** (3.6 - 5.5))
+        dq = q55 - q74
+        d_tok = batch["d"].float() if "d" in batch else valid.new_zeros(aa.shape)
+        frac_d = (d_tok * valid).sum(dim=1, keepdim=True) / length
+        ph_feats = torch.cat([
+            q74 / 10.0, q55 / 10.0, dq / 5.0, frac_d, caps[:, 0:1], caps[:, 1:2],
+            q74 / length, q55 / length,
+        ], dim=-1)
+        ph_tok = self.ph_cap_proj(ph_feats)
+
+        h_seq = (self.eisenberg[aa] * valid).unsqueeze(1)  # [B, 1, L]
+        m_seq = valid.unsqueeze(1)
+        moments = []
+        for win in (7, 11, 15):
+            ones = torch.ones((1, 1, win), device=aa.device, dtype=torch.float32)
+            denom = F.conv1d(m_seq, ones, padding=win // 2).clamp_min(1.0)
+            rel = torch.arange(win, device=aa.device, dtype=torch.float32) - (win // 2)
+            for deg in (100.0, 120.0, 180.0):
+                omega = math.radians(deg)
+                k_cos = torch.cos(omega * rel).view(1, 1, win)
+                k_sin = torch.sin(omega * rel).view(1, 1, win)
+                re = F.conv1d(h_seq, k_cos, padding=win // 2)
+                im = F.conv1d(h_seq, k_sin, padding=win // 2)
+                mu = torch.sqrt(re.square() + im.square() + 1e-8) / denom
+                mu = mu.squeeze(1)
+                mu_mean = (mu * valid).sum(dim=1, keepdim=True) / length
+                mu_max = mu.masked_fill(~mask, 0.0).amax(dim=1, keepdim=True)
+                moments.extend([mu_max, mu_mean])
+        amphi_tok = self.amphipathic_proj(torch.cat(moments, dim=-1))
+        return ph_tok, amphi_tok
 
     def forward(self, batch, clean_aa):
         mask = batch["mask"]
@@ -72,6 +139,12 @@ class InvariantPropertyEncoder(nn.Module):
         x = torch.stack(tokens, dim=1)
         m = torch.stack(token_masks, dim=1)
         x = (x + self.group_embed.unsqueeze(0)) * m.unsqueeze(-1)
+        if self.biophysics_v2:
+            ph_tok, amphi_tok = self._biophysics_v2_tokens(clean_aa, batch)
+            v2_x = torch.stack([ph_tok, amphi_tok], dim=1) + self.v2_group_embed.unsqueeze(0)
+            v2_m = mask.any(dim=1, keepdim=True).expand(-1, 2)
+            x = torch.cat([x, v2_x * v2_m.unsqueeze(-1)], dim=1)
+            m = torch.cat([m, v2_m], dim=1)
         for layer in self.layers:
             x = layer(x, m)
         return x, m
@@ -134,10 +207,12 @@ class GlobalBottleneckPath(nn.Module):
 
     def __init__(self, input_dim, num_labels, vocab_size, statistics, peptide_input_dim=0,
                  dim=256, heads=8, pair_dim=32, seq_depth=2, prop_depth=2, latent_count=24,
-                 latent_depth=4, decoder_depth=0, dropout=0.25, span_mask_prob=0.15):
+                 latent_depth=4, decoder_depth=0, dropout=0.25, span_mask_prob=0.15,
+                 biophysics_v2=False, use_bio_head=False, bio_statistics=None):
         super().__init__()
         self.span_mask_prob = span_mask_prob
         self.decoder_depth = decoder_depth
+        self.use_bio_head = use_bio_head
         self.plm_proj = nn.Linear(input_dim + peptide_input_dim, dim)
         self.aa_emb = nn.Embedding(21, dim, padding_idx=0)
         self.d_emb = nn.Embedding(2, dim)
@@ -147,7 +222,7 @@ class GlobalBottleneckPath(nn.Module):
         self.mask_token = nn.Parameter(torch.zeros(1, 1, dim)) if decoder_depth > 0 else None
         self.global_chem_layer = nn.Sequential(nn.Linear(2 * dim, dim), nn.GELU(), nn.LayerNorm(dim))
 
-        self.properties = InvariantPropertyEncoder(dim, heads, dropout, depth=prop_depth)
+        self.properties = InvariantPropertyEncoder(dim, heads, dropout, depth=prop_depth, biophysics_v2=biophysics_v2)
         self.geom_node = nn.Sequential(nn.Linear(16, dim), nn.GELU(), nn.LayerNorm(dim))
         self.dssp_emb = nn.Embedding(10, dim)
         self.geom_global = nn.Sequential(nn.Linear(50, dim), nn.GELU(), nn.LayerNorm(dim))
@@ -179,8 +254,13 @@ class GlobalBottleneckPath(nn.Module):
             self.read_latent = Attention(dim, heads, dropout)
             self.read_prop = Attention(dim, heads, dropout)
         self.out_norm = nn.LayerNorm(dim)
-        self.label_weights = nn.Parameter(torch.randn(num_labels, dim) / math.sqrt(dim))
-        self.label_bias = nn.Parameter(prior)
+        if use_bio_head:
+            b_prior = torch.tensor((bio_statistics or statistics)["observed_prior"]).clamp(1e-4, 1.0 - 1e-4).logit()
+            self.bio_head = BioGranularityResidualHead(dim, statistics["labels"], b_prior)
+        else:
+            self.bio_head = None
+            self.label_weights = nn.Parameter(torch.randn(num_labels, dim) / math.sqrt(dim))
+            self.label_bias = nn.Parameter(prior)
 
     def _pair_inputs(self, batch, structural, reliability):
         mask = batch["mask"]
@@ -307,12 +387,22 @@ class GlobalBottleneckPath(nn.Module):
                     label_context=False, pair_readout=False, fine_evidence=True, pair_interactions=False,
                 )
             pooled = self.out_norm(queries)
+            if self.bio_head is not None:
+                bio_out = self.bio_head(pooled)
+                return {
+                    "logits": bio_out["obs_logits"],
+                    "bio_logits": bio_out["bio_logits"],
+                    "latent_logits": self.latent_head(latent.mean(dim=1)),
+                }
             logits = (pooled * self.label_weights.unsqueeze(0)).sum(dim=-1) + self.label_bias
             return {"logits": logits, "latent_logits": self.latent_head(latent.mean(dim=1))}
 
         ev_lat = self.read_latent(queries, latent, q_mask, latent_mask)
         ev_prop = self.read_prop(queries, prop_tokens, q_mask, prop_mask)
         pooled = self.out_norm(queries + ev_lat + ev_prop)
+        if self.bio_head is not None:
+            bio_out = self.bio_head(pooled)
+            return {"logits": bio_out["obs_logits"], "bio_logits": bio_out["bio_logits"]}
         logits = (pooled * self.label_weights.unsqueeze(0)).sum(dim=-1) + self.label_bias
         return {"logits": logits}
 
@@ -340,15 +430,18 @@ class DualPathMFP(nn.Module):
                  orth_input_dim=0, dim=256, heads=8, dropout=0.2, cnn_channels=128, pair_dim=32,
                  b_seq_depth=2, b_prop_depth=2, b_latent_count=24, b_latent_depth=4,
                  b_decoder_depth=0, b_dropout=0.25, span_mask_prob=0.15, use_aa34_path=False,
-                 full_branch_rdrop=False, fusion_weights=(0.4, 0.4, 0.2)):
+                 full_branch_rdrop=False, fusion_weights=(0.4, 0.4, 0.2),
+                 biophysics_v2=False, use_bio_head=False, bio_statistics=None):
         super().__init__()
         self.statistics = statistics
+        self.bio_statistics = bio_statistics
         self.input_dim = input_dim
         self.peptide_input_dim = peptide_input_dim
         self.orth_input_dim = orth_input_dim
         self.use_aa34_path = use_aa34_path
         self.full_branch_rdrop = full_branch_rdrop
         self.fusion_weights = tuple(fusion_weights)
+        self.use_bio_head = use_bio_head
         self.path_a = TheraSet(
             input_dim=input_dim, num_labels=num_labels, vocab_size=vocab_size, statistics=statistics,
             dim=dim, heads=heads, dropout=dropout, cnn_channels=cnn_channels,
@@ -356,6 +449,7 @@ class DualPathMFP(nn.Module):
             peptide_input_dim=peptide_input_dim, label_context=False, prototype_readout=False,
             terminal_features=True,
         )
+        self.path_a_gran = BioGranularityAdapter(dim, statistics["labels"]) if use_bio_head else None
         b_in_dim = orth_input_dim if orth_input_dim > 0 else input_dim
         self.path_b = GlobalBottleneckPath(
             input_dim=b_in_dim, num_labels=num_labels, vocab_size=vocab_size, statistics=statistics,
@@ -363,11 +457,15 @@ class DualPathMFP(nn.Module):
             seq_depth=b_seq_depth, prop_depth=b_prop_depth, latent_count=b_latent_count,
             latent_depth=b_latent_depth, decoder_depth=b_decoder_depth,
             dropout=b_dropout, span_mask_prob=span_mask_prob,
+            biophysics_v2=biophysics_v2, use_bio_head=use_bio_head, bio_statistics=bio_statistics,
         )
         self.path_c = PureAA34Path(num_labels, statistics, cnn_channels=cnn_channels, dropout=dropout) if use_aa34_path else None
 
     def branch_parameter_groups(self):
-        groups = [list(self.path_a.parameters()), list(self.path_b.parameters())]
+        group_a = list(self.path_a.parameters())
+        if self.path_a_gran is not None:
+            group_a.extend(self.path_a_gran.parameters())
+        groups = [group_a, list(self.path_b.parameters())]
         if self.path_c is not None:
             groups.append(list(self.path_c.parameters()))
         return groups
@@ -401,9 +499,12 @@ class DualPathMFP(nn.Module):
 
     def forward(self, batch):
         shared = self._prepare_shared(batch)
-        out_a = self.path_a(shared)
+        out_a = self.path_a(shared, return_states=self.use_bio_head)
         out_b = self.path_b(shared)
-        logits_a = out_a["logits"]
+        if self.path_a_gran is not None:
+            logits_a = self.path_a_gran(out_a["evidence_state"], out_a["global_state"], out_a["logits"])
+        else:
+            logits_a = out_a["logits"]
         logits_b = out_b["logits"]
         out = {
             "path_a_logits": logits_a,
@@ -411,6 +512,9 @@ class DualPathMFP(nn.Module):
             "path_a_direct": out_a["direct"],
             "path_a_evidence": out_a["evidence_logits"],
         }
+        if self.use_bio_head:
+            out["path_a_bio_logits"] = out_a["logits"]
+            out["path_b_bio_logits"] = out_b["bio_logits"]
         if "latent_logits" in out_b:
             out["path_b_latent"] = out_b["latent_logits"]
         if self.path_c is not None:
@@ -424,19 +528,47 @@ class DualPathMFP(nn.Module):
         out["logits"] = fused
         return out
 
-    def _branch_terms(self, output, targets, settings):
+    def _branch_terms(self, output, targets, settings, batch=None):
         weak_a = settings.get("unlabeled_weight", 0.3)
         weak_b = settings.get("b_unlabeled_weight", weak_a)
+        pos_mult = batch.get("positive_multiplier") if (batch is not None and self.training) else None
+        has_bio = (
+            self.use_bio_head
+            and batch is not None
+            and "y_bio" in batch
+            and "m_obs" in batch
+        )
+        bio_stats = self.bio_statistics or self.statistics
+        bio_target = batch["y_bio"] if has_bio else targets
+        bio_mask = batch["m_obs"] if has_bio else None
+
         terms = {
-            "path_a_cls": observed_label_loss(output["path_a_logits"], targets, self.statistics, weak_a),
-            "direct": observed_label_loss(output["path_a_direct"], targets, self.statistics, weak_a),
-            "evidence": observed_label_loss(output["path_a_evidence"], targets, self.statistics, weak_a),
-            "path_b_cls": observed_label_loss(output["path_b_logits"], targets, self.statistics, weak_b),
+            "path_a_cls": observed_label_loss(output["path_a_logits"], targets, self.statistics, weak_a,
+                                              positive_multiplier=pos_mult),
+            "direct": observed_label_loss(output["path_a_direct"], bio_target,
+                                          bio_stats if has_bio else self.statistics, weak_a,
+                                          mask=bio_mask, positive_multiplier=pos_mult),
+            "evidence": observed_label_loss(output["path_a_evidence"], bio_target,
+                                            bio_stats if has_bio else self.statistics, weak_a,
+                                            mask=bio_mask, positive_multiplier=pos_mult),
+            "path_b_cls": observed_label_loss(output["path_b_logits"], targets, self.statistics, weak_b,
+                                              positive_multiplier=pos_mult),
         }
+        if has_bio:
+            terms["path_a_bio"] = fine39_bio_supervision_loss(
+                output["path_a_bio_logits"], bio_target, bio_mask, bio_stats, weak_a, positive_multiplier=pos_mult,
+            )
+            terms["path_b_bio"] = fine39_bio_supervision_loss(
+                output["path_b_bio_logits"], bio_target, bio_mask, bio_stats, weak_b, positive_multiplier=pos_mult,
+            )
         if "path_b_latent" in output:
-            terms["b_latent"] = observed_label_loss(output["path_b_latent"], targets, self.statistics, weak_b)
+            terms["b_latent"] = observed_label_loss(
+                output["path_b_latent"], bio_target, bio_stats if has_bio else self.statistics,
+                weak_b, mask=bio_mask, positive_multiplier=pos_mult,
+            )
         if "path_c_logits" in output:
-            terms["path_c_cls"] = observed_label_loss(output["path_c_logits"], targets, self.statistics, weak_a)
+            terms["path_c_cls"] = observed_label_loss(output["path_c_logits"], targets, self.statistics, weak_a,
+                                                      positive_multiplier=pos_mult)
         if settings.get("sym_rank", 0.0) > 0.0:
             terms["sym_rank"] = symmetric_pu_ranking_loss(
                 output["path_b_logits"], targets, self.statistics,
@@ -451,13 +583,13 @@ class DualPathMFP(nn.Module):
     def compute_loss(self, batch, settings, return_output=False):
         view_a = training_views(batch, settings.get("modality_dropout", 0.1), 0.0)[0] if self.training else batch
         output = self(view_a)
-        terms = self._branch_terms(output, batch["y"], settings)
+        terms = self._branch_terms(output, batch["y"], settings, batch=batch)
         rdrop_weight = settings.get("rdrop", 0.0)
         agreement_mean = output["path_a_logits"].new_zeros(())
         agreement_loss = agreement_mean
         if self.training and rdrop_weight > 0.0:
             second = self(view_a)
-            other = self._branch_terms(second, batch["y"], settings)
+            other = self._branch_terms(second, batch["y"], settings, batch=batch)
             terms = {k: 0.5 * (v + other[k]) for k, v in terms.items()}
             kls = [
                 bernoulli_rdrop(output["path_a_logits"], second["path_a_logits"]),
@@ -468,10 +600,13 @@ class DualPathMFP(nn.Module):
             kl_sum = sum(kls)
             agreement_mean = kl_sum / len(kls)
             agreement_loss = kl_sum if self.full_branch_rdrop else agreement_mean
+        bio_w = settings.get("bio_weight", 0.5)
         loss_a = (terms["path_a_cls"]
+                  + bio_w * terms.get("path_a_bio", 0.0)
                   + settings.get("direct", 0.2) * terms["direct"]
                   + settings.get("evidence", 0.1) * terms["evidence"])
         loss_b = (terms["path_b_cls"]
+                  + bio_w * terms.get("path_b_bio", 0.0)
                   + settings.get("b_latent", 0.15) * terms.get("b_latent", 0.0)
                   + settings.get("sym_rank", 0.0) * terms.get("sym_rank", 0.0))
         loss_c = terms.get("path_c_cls", 0.0)

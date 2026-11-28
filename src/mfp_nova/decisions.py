@@ -32,7 +32,7 @@ def function_decisions(probabilities, projection, label_threshold, secondary_thr
     return predicted & (keep.astype(int) @ projection.T > 0)
 
 
-def expected_jaccard_decode(probabilities, top_m=8):
+def expected_jaccard_decode(probabilities, top_m=8, mutex_matrix=None):
     """Exact Bayes-optimal Expected Sample Jaccard over top-M calibrated candidates per sample."""
     probs = np.asarray(probabilities, dtype=np.float64)
     n, c = probs.shape
@@ -46,6 +46,8 @@ def expected_jaccard_decode(probabilities, top_m=8):
     inter = states @ cand_s.T
     union_base = states.sum(axis=1, keepdims=True) + cand_s.sum(axis=1, keepdims=True).T - inter
     j_mat = np.where(union_base > 0, inter / np.maximum(union_base, 1.0), 0.0).astype(np.float32)
+    mutex = np.asarray(mutex_matrix, dtype=bool) if mutex_matrix is not None else None
+    pair_in_c = (cand_s[:, :, None] * cand_s[:, None, :]) > 0.5 if mutex is not None else None
 
     pred = np.zeros((n, c), dtype=bool)
     for start in range(0, n, 1024):
@@ -55,6 +57,11 @@ def expected_jaccard_decode(probabilities, top_m=8):
         log_1mp = np.log(np.clip(1.0 - pb, 1e-6, 1.0 - 1e-6))
         py = np.exp(log_p @ states.T + log_1mp @ (1.0 - states).T)
         exp_j = py @ j_mat
+        if mutex is not None:
+            idx_b = top_idx[start:end]
+            sub_m = mutex[idx_b[:, :, None], idx_b[:, None, :]]
+            illegal = np.einsum("bmn,smn->bs", sub_m, pair_in_c) > 0
+            exp_j[illegal] = -1.0
         best_s = cand_s[exp_j.argmax(axis=1)] > 0.5
         rows = np.arange(start, end)[:, None]
         pred[rows, top_idx[start:end]] = best_s
@@ -72,7 +79,11 @@ def apply_decision(probabilities, labels, task, decision):
         log_w = np.asarray(decision['log_positive_weights'], dtype=np.float64)[None, :]
         z_cal = float(decision['alpha']) * z + float(decision['beta0']) - float(decision['beta1']) * log_w
         q = 1.0 / (1.0 + np.exp(-np.clip(z_cal, -30.0, 30.0)))
-        return expected_jaccard_decode(q, top_m=decision.get('top_m', 8))
+        mutex_mat = None
+        if decision.get('granularity_mutex', False) and task == 'fine39':
+            from .bio_taxonomy import granularity_mutex_matrix
+            mutex_mat = granularity_mutex_matrix(labels)
+        return expected_jaccard_decode(q, top_m=decision.get('top_m', 8), mutex_matrix=mutex_mat)
     return function_decisions(probs, function_projection(labels, task),
                               decision['label_threshold'], decision.get('secondary_threshold'))
 

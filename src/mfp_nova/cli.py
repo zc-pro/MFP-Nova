@@ -102,6 +102,13 @@ def main(argv=None):
             sub.add_argument("--sym-rank-beta", type=float, help="DualPath-MFP: Path B Train co-occurrence protection beta")
             sub.add_argument("--b-unlabeled-weight", type=float, help="DualPath-MFP: Path B ASL unlabeled negative weight")
             sub.add_argument("--use-aa34-path", action="store_true", help="DualPath-MFP: enable pure AA34 Path C anchor")
+            sub.add_argument("--bio-supervision", action="store_true",
+                             help="DualPath-MFP: enable Fine39-Bio latent biological supervision and additive granularity head")
+            sub.add_argument("--bio-weight", type=float, help="DualPath-MFP: Fine39-Bio loss weight (default 0.5)")
+            sub.add_argument("--biophysics-v2", action="store_true",
+                             help="DualPath-MFP: enable dual-pH charge shift and sliding amphipathic moment tokens")
+            sub.add_argument("--cluster-balance-alpha", type=float,
+                             help="Train cluster power-law positive risk exponent (e.g. 0.35)")
             sub.add_argument("--fold-dir", help="Sequence study: share training-only B0 fold checkpoints")
             sub.add_argument("--head-epochs", type=int, help="Sequence study: frozen head training epochs")
             sub.add_argument("--finetune-epochs", type=int, help="Sequence study: H4/H6 backbone fine-tuning epochs")
@@ -471,6 +478,19 @@ def main(argv=None):
                 config.setdefault("loss", {})["b_unlabeled_weight"] = args.b_unlabeled_weight
             if args.use_aa34_path:
                 config.setdefault("model", {})["use_aa34_path"] = True
+            if args.bio_supervision:
+                if args.model != DUALPATH_MFP:
+                    parser.error("--bio-supervision requires --model dualpath_mfp")
+                config.setdefault("model", {})["use_bio_head"] = True
+                config.setdefault("loss", {}).setdefault("bio_weight", 0.5)
+            if args.bio_weight is not None:
+                config.setdefault("loss", {})["bio_weight"] = args.bio_weight
+            if args.biophysics_v2:
+                if args.model != DUALPATH_MFP:
+                    parser.error("--biophysics-v2 requires --model dualpath_mfp")
+                config.setdefault("model", {})["biophysics_v2"] = True
+            if args.cluster_balance_alpha is not None:
+                config["train"]["cluster_balance_alpha"] = args.cluster_balance_alpha
             if args.patience is not None:
                 config["train"]["patience"] = args.patience
             if args.model != "sequence":

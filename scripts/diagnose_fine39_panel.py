@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 from sklearn.metrics import average_precision_score, f1_score
 
+from mfp_nova.bio_taxonomy import partial_label_bio_eval
 from mfp_nova.multimodal import function_projection, independent_functions
 
 
@@ -104,6 +105,7 @@ def evaluate_panel(export, threshold=0.5, low_mask=None):
         "multifunction_acc_pct": multi_jaccard * 100.0,
         "mfp_detection_f1_pct": mfp_det_f1 * 100.0,
         "ge2_axes_recovered_pct": ge2_recovered * 100.0,
+        "bio_hierarchy": partial_label_bio_eval(y, raw_pred, labels),
     }
     if low_mask is not None and low_mask.any():
         result["low_sim_rows"] = int(low_mask.sum())
