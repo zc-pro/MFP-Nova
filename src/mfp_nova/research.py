@@ -963,6 +963,8 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
     alternate_suite = {"traditional5": "task_specific", "jaccard": "micro_f1"}.get(suite, "traditional5")
     alternate_stem = {"traditional5": "best_ap", "jaccard": "best_micro_f1"}.get(suite, "best_accuracy")
     alternate_best = checkpoint.get("alternate_best") if checkpoint and save_candidates else None
+    track_macro_ap_best = config["model_name"] == DUALPATH_MFP and save_candidates and fold is None
+    macro_ap_best = checkpoint.get("macro_ap_best") if checkpoint and track_macro_ap_best else None
     candidate_start = (checkpoint.get("selection_tracking_start_epoch", checkpoint["epoch"]+1)
                        if checkpoint else 1)
     ema_decay = settings.get("ema_decay")
@@ -1406,6 +1408,15 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
                     "targets": torch.from_numpy(y.copy()),
                     "probabilities": torch.from_numpy(probabilities.copy()),
                 }
+        if track_macro_ap_best and (macro_ap_best is None or report["macro_ap"] > macro_ap_best["macro_ap"]):
+            macro_ap_best = {
+                "macro_ap": float(report["macro_ap"]), "epoch": epoch, "threshold": fixed_threshold,
+                "weight_source": validation_weights, "validation_loss": validation_loss,
+                "model_state": checkpoint_state(selected_model, cpu=True),
+                "targets": torch.from_numpy(y.copy()),
+                "probabilities": torch.from_numpy(probabilities.copy()),
+                "view_outputs": ({k: v.copy() for k, v in epoch_dp.items()} if epoch_dp else None),
+            }
         epoch_peak = torch.cuda.max_memory_allocated(device) if device.type=="cuda" else None
         peak_memory = max(peak_memory, epoch_peak or 0)
         history = {"epoch": epoch, "losses": {k: v/count for k, v in totals.items()}, "loss_settings": loss_settings,
@@ -1463,6 +1474,8 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
         numpy_rng = np.random.get_state()
         candidate_checkpoint = ({"alternate_best": alternate_best, "selection_tracking_start_epoch": candidate_start}
                                 if save_candidates else {})
+        if track_macro_ap_best and macro_ap_best is not None:
+            candidate_checkpoint["macro_ap_best"] = macro_ap_best
         history.update(seconds=time.perf_counter()-epoch_start, elapsed_seconds=elapsed_before+time.perf_counter()-started,
                        train_seconds=train_seconds, data_wait_seconds=data_wait_seconds, validation_seconds=validation_seconds)
         phase_checkpoint = {"phase_best": phase_best} if suite == "jaccard" else {}
@@ -1683,6 +1696,23 @@ def train(config, name, resume=None, resume_in_place=False, stop_file=None):
             result["alternate_selection"]["validation_predictions"] = export_validation(
                 run, alternate_stem, source, datasets[1], alternate_y, alternate_p, candidate["threshold"],
                 candidate["epoch"], candidate["weight_source"], alternate_suite, split=validation_split)
+    if track_macro_ap_best and macro_ap_best is not None:
+        ap_path = run / "best_macro_ap.pt"
+        torch.save({**static, "model_state": macro_ap_best["model_state"], "best_epoch": macro_ap_best["epoch"],
+                    "threshold": macro_ap_best["threshold"], "weight_source": macro_ap_best["weight_source"],
+                    "selection_suite": "macro_ap"}, ap_path)
+        ap_y, ap_p = macro_ap_best["targets"].numpy(), macro_ap_best["probabilities"].numpy()
+        result["macro_ap_selection"] = {
+            "best_epoch": macro_ap_best["epoch"], "macro_ap": macro_ap_best["macro_ap"],
+            "weight_source": macro_ap_best["weight_source"], "validation_loss": macro_ap_best["validation_loss"],
+            "validation": metrics(ap_y, ap_p, source.statistics, macro_ap_best["threshold"]),
+            "checkpoint": str(ap_path),
+        }
+        if export_predictions:
+            result["macro_ap_selection"]["validation_predictions"] = export_validation(
+                run, "best_macro_ap", source, datasets[1], ap_y, ap_p, macro_ap_best["threshold"],
+                macro_ap_best["epoch"], macro_ap_best["weight_source"], "macro_ap",
+                view_outputs=macro_ap_best.get("view_outputs"), split=validation_split)
     if ema is not None:
         restore_model_state(model, online_best_state)
         raw_y, raw_p, raw_loss = predict_loader(model, loaders[1], device, precision, config["loss"])

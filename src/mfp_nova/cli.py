@@ -102,6 +102,11 @@ def main(argv=None):
             sub.add_argument("--sym-rank-beta", type=float, help="DualPath-MFP: Path B Train co-occurrence protection beta")
             sub.add_argument("--b-unlabeled-weight", type=float, help="DualPath-MFP: Path B ASL unlabeled negative weight")
             sub.add_argument("--use-aa34-path", action="store_true", help="DualPath-MFP: enable pure AA34 Path C anchor")
+            sub.add_argument("--b-decoder-depth", type=int, help="DualPath-MFP: override Path B SetDecoder depth (e.g. 0)")
+            sub.add_argument("--clean-span-mask", action="store_true",
+                             help="DualPath-MFP: use zero-shift learnable [MASK] span replacement even when b_decoder_depth=0")
+            sub.add_argument("--b-no-peptide-esm", action="store_true",
+                             help="DualPath-MFP: exclude Peptide-ESM-150M from Path B when orth encoder is active")
             sub.add_argument("--bio-supervision", action="store_true",
                              help="DualPath-MFP: enable Fine39-Bio latent biological supervision and additive granularity head")
             sub.add_argument("--bio-weight", type=float, help="DualPath-MFP: Fine39-Bio loss weight (default 0.5)")
@@ -478,6 +483,18 @@ def main(argv=None):
                 config.setdefault("loss", {})["b_unlabeled_weight"] = args.b_unlabeled_weight
             if args.use_aa34_path:
                 config.setdefault("model", {})["use_aa34_path"] = True
+            if args.b_decoder_depth is not None:
+                if args.model != DUALPATH_MFP:
+                    parser.error("--b-decoder-depth requires --model dualpath_mfp")
+                config.setdefault("model", {})["b_decoder_depth"] = args.b_decoder_depth
+            if args.clean_span_mask:
+                if args.model != DUALPATH_MFP:
+                    parser.error("--clean-span-mask requires --model dualpath_mfp")
+                config.setdefault("model", {})["clean_span_mask"] = True
+            if args.b_no_peptide_esm:
+                if args.model != DUALPATH_MFP:
+                    parser.error("--b-no-peptide-esm requires --model dualpath_mfp")
+                config.setdefault("model", {})["b_use_peptide_esm"] = False
             if args.bio_supervision:
                 if args.model != DUALPATH_MFP:
                     parser.error("--bio-supervision requires --model dualpath_mfp")

@@ -208,7 +208,7 @@ class GlobalBottleneckPath(nn.Module):
     def __init__(self, input_dim, num_labels, vocab_size, statistics, peptide_input_dim=0,
                  dim=256, heads=8, pair_dim=32, seq_depth=2, prop_depth=2, latent_count=24,
                  latent_depth=4, decoder_depth=0, dropout=0.25, span_mask_prob=0.15,
-                 biophysics_v2=False, use_bio_head=False, bio_statistics=None):
+                 clean_span_mask=False, biophysics_v2=False, use_bio_head=False, bio_statistics=None):
         super().__init__()
         self.span_mask_prob = span_mask_prob
         self.decoder_depth = decoder_depth
@@ -219,7 +219,7 @@ class GlobalBottleneckPath(nn.Module):
         self.chem_emb = nn.Embedding(vocab_size, dim, padding_idx=0)
         self.term_proj = nn.Linear(7, dim)
         self.input_gate = nn.Linear(2 * dim, dim)
-        self.mask_token = nn.Parameter(torch.zeros(1, 1, dim)) if decoder_depth > 0 else None
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, dim)) if (decoder_depth > 0 or clean_span_mask) else None
         self.global_chem_layer = nn.Sequential(nn.Linear(2 * dim, dim), nn.GELU(), nn.LayerNorm(dim))
 
         self.properties = InvariantPropertyEncoder(dim, heads, dropout, depth=prop_depth, biophysics_v2=biophysics_v2)
@@ -431,6 +431,7 @@ class DualPathMFP(nn.Module):
                  b_seq_depth=2, b_prop_depth=2, b_latent_count=24, b_latent_depth=4,
                  b_decoder_depth=0, b_dropout=0.25, span_mask_prob=0.15, use_aa34_path=False,
                  full_branch_rdrop=False, fusion_weights=(0.4, 0.4, 0.2),
+                 clean_span_mask=False, b_use_peptide_esm=True,
                  biophysics_v2=False, use_bio_head=False, bio_statistics=None):
         super().__init__()
         self.statistics = statistics
@@ -441,6 +442,7 @@ class DualPathMFP(nn.Module):
         self.use_aa34_path = use_aa34_path
         self.full_branch_rdrop = full_branch_rdrop
         self.fusion_weights = tuple(fusion_weights)
+        self.b_use_peptide_esm = b_use_peptide_esm
         self.use_bio_head = use_bio_head
         self.path_a = TheraSet(
             input_dim=input_dim, num_labels=num_labels, vocab_size=vocab_size, statistics=statistics,
@@ -451,12 +453,14 @@ class DualPathMFP(nn.Module):
         )
         self.path_a_gran = BioGranularityAdapter(dim, statistics["labels"]) if use_bio_head else None
         b_in_dim = orth_input_dim if orth_input_dim > 0 else input_dim
+        b_pep_dim = peptide_input_dim if (b_use_peptide_esm or orth_input_dim <= 0) else 0
         self.path_b = GlobalBottleneckPath(
             input_dim=b_in_dim, num_labels=num_labels, vocab_size=vocab_size, statistics=statistics,
-            peptide_input_dim=peptide_input_dim, dim=dim, heads=heads, pair_dim=pair_dim,
+            peptide_input_dim=b_pep_dim, dim=dim, heads=heads, pair_dim=pair_dim,
             seq_depth=b_seq_depth, prop_depth=b_prop_depth, latent_count=b_latent_count,
             latent_depth=b_latent_depth, decoder_depth=b_decoder_depth,
             dropout=b_dropout, span_mask_prob=span_mask_prob,
+            clean_span_mask=clean_span_mask,
             biophysics_v2=biophysics_v2, use_bio_head=use_bio_head, bio_statistics=bio_statistics,
         )
         self.path_c = PureAA34Path(num_labels, statistics, cnn_channels=cnn_channels, dropout=dropout) if use_aa34_path else None
@@ -485,7 +489,7 @@ class DualPathMFP(nn.Module):
             if "esm_orth" not in batch:
                 raise ValueError("DualPathMFP configured with orth_input_dim requires 'esm_orth' in batch")
             orth = F.layer_norm(batch["esm_orth"].masked_fill(~mask, 0.0), (self.orth_input_dim,))
-            b_plm = torch.cat([orth, pep], dim=-1) if pep is not None else orth
+            b_plm = torch.cat([orth, pep], dim=-1) if (pep is not None and self.b_use_peptide_esm) else orth
             shared["_path_b_plm"] = b_plm.masked_fill(~mask, 0.0)
         else:
             shared["_path_b_plm"] = shared["_shared_dual_esm"]

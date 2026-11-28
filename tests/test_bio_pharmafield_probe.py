@@ -208,3 +208,39 @@ def test_stage4_dualpath_bio_head_and_biophysics_v2_invariance_and_isolation():
     decoded = ehead.decode(out_mixed["logits"])
     assert decoded.shape == (2, 39)
     assert not ((decoded[:, :, None] & decoded[:, None, :]) & granularity_mutex_matrix(labels)[None, :, :]).any()
+
+
+def test_stage35_clean_bottleneck_pure_orth_and_mask_token():
+    labels = PeptideData(DATA_ROOT, "fine39").labels
+    rng = np.random.default_rng(13)
+    y = (rng.random((32, 39)) < 0.15).astype(np.float32)
+    y[:, 0] = 1.0
+    stats = label_statistics(y, np.arange(32), labels)
+
+    model = DualPathMFP(
+        input_dim=32, num_labels=39, vocab_size=16, statistics=stats,
+        peptide_input_dim=16, orth_input_dim=24, dim=64, heads=4, cnn_channels=16, pair_dim=16,
+        b_seq_depth=2, b_prop_depth=1, b_latent_count=8, b_latent_depth=2,
+        b_decoder_depth=0, full_branch_rdrop=True,
+        clean_span_mask=True, b_use_peptide_esm=False,
+    )
+    assert model.path_b.mask_token is not None
+    assert model.path_b.plm_proj.in_features == 24
+
+    s1 = {**_make_sample(9, seed=5), "esm_orth": torch.randn(9, 24)}
+    s2 = {**_make_sample(30, seed=6), "esm_orth": torch.randn(30, 24)}
+    model.eval()
+    with torch.no_grad():
+        o1 = model(collate_multimodal([s1]))
+        o2 = model(collate_multimodal([s1, s2]))
+    assert (o1["path_b_logits"][0] - o2["path_b_logits"][0]).abs().max().item() < 1e-5
+
+    model.train()
+    loss, _ = model.compute_loss(
+        collate_multimodal([s1, s2]),
+        {"unlabeled_weight": 0.3, "b_unlabeled_weight": 0.45, "direct": 0.2, "evidence": 0.1,
+         "modality_dropout": 0.0, "rdrop": 0.1, "sym_rank": 0.04},
+    )
+    loss.backward()
+    assert model.path_b.mask_token.grad is not None
+
